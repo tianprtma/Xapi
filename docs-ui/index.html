@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Xapi — X (Twitter) Cookie API · Reference</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<meta name="description" content="Mirror endpoint X API v2 lewat cookie auth_token. Reference + try-it console untuk Xapi (FastAPI)." />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="styles.css" />
+<style>
+  html, body, #root {
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    background: #0b0d12;
+    color: #dde2ec;
+    font-family: "IBM Plex Sans", system-ui, sans-serif;
+    overflow: hidden;
+  }
+  #root { display: flex; }
+  /* DocsApp owns the whole viewport */
+  .docs-host { flex: 1 1 auto; display: flex; min-width: 0; min-height: 0; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" crossorigin="anonymous"></script>
+
+<script src="data.js"></script>
+<script type="text/babel" src="design-canvas.jsx"></script>
+<script type="text/babel" src="tweaks-panel.jsx"></script>
+<script type="text/babel" src="docs-app.jsx"></script>
+
+<script type="text/babel">
+const { DocsApp } = window;
+
+const TWEAKS = {
+  accent: '#5ef38c',
+  fontPair: 'plex',
+  codeTheme: 'neutral',
+  density: 'comfortable',
+  sidebar: 'tree',
+  hero: 'prompt',
+};
+
+function App() {
+  return (
+    <div className="docs-host">
+      <DocsApp variant="console" tweaks={TWEAKS} />
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>

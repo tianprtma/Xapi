@@ -30,7 +30,9 @@ ul { margin: 0; padding: 0; list-style: none; }
 .main {
   flex: 1 1 0; min-width: 0;
   padding: 28px 36px 60px;
-  overflow: hidden;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
   position: relative;
 }
 
@@ -262,7 +264,9 @@ ul { margin: 0; padding: 0; list-style: none; }
 .sidebar-nav {
   flex: 1 1 0;
   padding: 10px 0 16px;
-  overflow: hidden;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
 }
 
 .sidebar-section { padding: 4px 0; }

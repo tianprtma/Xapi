@@ -31,10 +31,11 @@ SECURITY_HEADERS: dict[str, str] = {
     "Content-Security-Policy": (
         "default-src 'self'; "
         "script-src 'self' 'unsafe-inline' https://unpkg.com; "
-        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+        "style-src 'self' 'unsafe-inline' https://unpkg.com https://fonts.googleapis.com; "
         "font-src 'self' https://fonts.gstatic.com; "
-        "img-src 'self' data:; "
+        "img-src 'self' data: https://fastapi.tiangolo.com https://cdn.redoc.ly; "
         "connect-src 'self'; "
+        "worker-src 'self' blob:; "
         "frame-ancestors 'none'"
     ),
 }

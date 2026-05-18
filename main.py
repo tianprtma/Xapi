@@ -27,6 +27,7 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.exception_handlers import http_exception_handler
+from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -86,7 +87,35 @@ app = FastAPI(
     version="2.3.0",
     lifespan=lifespan,
     openapi_tags=OPENAPI_TAGS,
+    docs_url=None,
+    redoc_url=None,
 )
+
+
+# Custom Swagger/ReDoc HTML — pakai unpkg.com (sudah whitelisted di CSP),
+# bukan default cdn.jsdelivr.net. Pin versi mayor supaya cache stabil.
+_SWAGGER_JS = "https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"
+_SWAGGER_CSS = "https://unpkg.com/swagger-ui-dist@5/swagger-ui.css"
+_REDOC_JS = "https://unpkg.com/redoc@2/bundles/redoc.standalone.js"
+
+
+@app.get("/docs", include_in_schema=False)
+async def _swagger_ui():
+    return get_swagger_ui_html(
+        openapi_url=app.openapi_url,
+        title=f"{app.title} - Swagger UI",
+        swagger_js_url=_SWAGGER_JS,
+        swagger_css_url=_SWAGGER_CSS,
+    )
+
+
+@app.get("/redoc", include_in_schema=False)
+async def _redoc_ui():
+    return get_redoc_html(
+        openapi_url=app.openapi_url,
+        title=f"{app.title} - ReDoc",
+        redoc_js_url=_REDOC_JS,
+    )
 
 # Mount routers — order doesn't matter, but listed by tag priority.
 app.include_router(infra.router)

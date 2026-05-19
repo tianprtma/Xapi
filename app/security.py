@@ -12,8 +12,9 @@ import os
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.datastructures import Headers
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.types import ASGIApp
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .config import ALLOWED_ORIGINS, ENABLE_RAW, MAX_BODY_SIZE
 
@@ -51,59 +52,77 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         return response
 
 
-class BodySizeLimitMiddleware(BaseHTTPMiddleware):
-    """Reject request body > MAX_BODY_SIZE.
+class BodySizeLimitMiddleware:
+    """Pure ASGI middleware: reject request body > MAX_BODY_SIZE.
 
-    Strategi double-guard:
-        1. Cek Content-Length header — reject early kalau declared > max.
-        2. Stream-baca body, count bytes, abort kalau exceed (catch chunked
-           transfer-encoding yang tidak set Content-Length).
+    Implemented as raw ASGI (not BaseHTTPMiddleware) karena BaseHTTPMiddleware
+    punya known issue: stream consumption di dispatch() tidak ke-propagate ke
+    downstream FastAPI body parser. Pure ASGI wraps receive callable di scope,
+    sehingga downstream handler bisa baca body normal.
 
-    Path media upload (`/2/media/upload`) di-skip dari buffer step ke-2 —
-    biarin handler stream langsung ke X (multipart upload). Tetap ada cap
-    via Content-Length dengan limit terpisah `MEDIA_UPLOAD_MAX_BYTES`.
+    Strategi:
+        1. Cek Content-Length header — reject early kalau declared > cap.
+        2. Wrap receive() untuk count bytes saat downstream consume body.
+
+    Path media upload (`/2/media/upload`) pakai cap terpisah `MEDIA_UPLOAD_MAX_BYTES`.
     """
 
     SKIP_BUFFER_PREFIXES = (
         "/2/media/upload",
         "/2/chat/media/upload",
     )
-    # Per-path max bytes (Content-Length cap). Default 50MB untuk media.
     MEDIA_MAX_BYTES = int(os.environ.get("MEDIA_UPLOAD_MAX_BYTES", str(50 * 1024 * 1024)))
 
     def __init__(self, app: ASGIApp, max_bytes: int = MAX_BODY_SIZE) -> None:
-        super().__init__(app)
+        self.app = app
         self.max_bytes = max_bytes
 
-    async def dispatch(self, request: Request, call_next):
-        path = request.url.path
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        path = scope.get("path", "")
         is_media = any(path.startswith(p) for p in self.SKIP_BUFFER_PREFIXES)
         cap = self.MEDIA_MAX_BYTES if is_media else self.max_bytes
 
-        content_length = request.headers.get("content-length")
+        headers = Headers(scope=scope)
+        content_length = headers.get("content-length")
         if content_length and content_length.isdigit() and int(content_length) > cap:
-            return _too_large(cap)
+            await _send_too_large(send, cap)
+            return
 
-        # Media path: skip stream-buffer (handler bakal consume body langsung).
-        if is_media:
-            return await call_next(request)
+        method = scope.get("method", "GET")
+        if method not in ("POST", "PUT", "PATCH") or is_media:
+            await self.app(scope, receive, send)
+            return
 
-        # Chunked or no Content-Length: stream-count.
-        if request.method in ("POST", "PUT", "PATCH"):
-            received = 0
-            chunks: list[bytes] = []
-            async for chunk in request.stream():
-                received += len(chunk)
+        received = 0
+        too_large = False
+
+        async def wrapped_receive() -> Message:
+            nonlocal received, too_large
+            msg = await receive()
+            if msg["type"] == "http.request":
+                body = msg.get("body", b"") or b""
+                received += len(body)
                 if received > cap:
-                    return _too_large(cap)
-                chunks.append(chunk)
-            body = b"".join(chunks)
+                    too_large = True
+            return msg
 
-            # Replay body untuk downstream consumer (FastAPI body parser).
-            async def _receive():
-                return {"type": "http.request", "body": body, "more_body": False}
-            request = Request(request.scope, _receive)
-        return await call_next(request)
+        response_started = False
+
+        async def wrapped_send(msg: Message) -> None:
+            nonlocal response_started
+            if too_large and not response_started:
+                response_started = True
+                await _send_too_large(send, cap)
+                return
+            if msg["type"] == "http.response.start":
+                response_started = True
+            await send(msg)
+
+        await self.app(scope, wrapped_receive, wrapped_send)
 
 
 def _too_large(max_bytes: int) -> JSONResponse:
@@ -118,6 +137,25 @@ def _too_large(max_bytes: int) -> JSONResponse:
             }]
         },
     )
+
+
+async def _send_too_large(send: Send, max_bytes: int) -> None:
+    """ASGI-level 413 response (no Request object available)."""
+    import json as _json
+    body = _json.dumps({
+        "errors": [{
+            "title": "Payload Too Large",
+            "detail": f"request body exceeds {max_bytes} bytes",
+            "type": "payload_too_large",
+            "status": 413,
+        }]
+    }).encode()
+    await send({
+        "type": "http.response.start",
+        "status": 413,
+        "headers": [(b"content-type", b"application/json")],
+    })
+    await send({"type": "http.response.body", "body": body, "more_body": False})
 
 
 class RawModeKillSwitchMiddleware(BaseHTTPMiddleware):

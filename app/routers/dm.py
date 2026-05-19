@@ -263,9 +263,11 @@ async def v2_dm_send(
     media_id = body.media_id
     if not media_id and body.attachments:
         media_id = (body.attachments[0] or {}).get("media_id")
+    # X dm/new2.json — kalau pakai conversation_id + recipient_ids bersamaan,
+    # X balas code 214 "Bad request." Pakai recipient_ids only (auto-create).
     payload = build_dm_new2_payload(
         me=me,
-        conv_id=dm_conv_id_for(me, participant_id),
+        conv_id=None,
         recipient_ids=[participant_id],
         text=body.text,
         media_id=media_id,

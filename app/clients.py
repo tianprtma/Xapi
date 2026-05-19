@@ -370,7 +370,9 @@ def build_dm_new2_payload(
     if conv_id:
         payload["conversation_id"] = conv_id
     if recipient_ids:
-        payload["recipient_ids"] = recipient_ids
+        # X dm/new2.json expects recipient_ids sebagai CSV string, bukan list.
+        # Kalau list yg dikirim, X balas: "recipient_ids: '' is not a valid String".
+        payload["recipient_ids"] = ",".join(str(r) for r in recipient_ids)
     if media_id:
         payload["media_id"] = media_id
     if reply_to:

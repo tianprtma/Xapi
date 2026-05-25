@@ -30,7 +30,7 @@ window.XDOC_DATA = (function () {
     {
       id: 'infra', label: 'Infra', icon: '~',
       items: [
-        { id: 'root',          label: 'Service root', method: 'GET',  path: '/' },
+        { id: 'root',          label: 'Service root', method: 'GET',  path: '/info' },
         { id: 'login',         label: 'Validate token', method: 'GET', path: '/login' },
         { id: 'search-legacy', label: 'Search (legacy)', method: 'POST', path: '/search' },
       ],
@@ -128,16 +128,18 @@ window.XDOC_DATA = (function () {
     {
       id: 'dm', label: 'Direct messages', icon: '>',
       items: [
-        { id: 'dm-send',          label: 'Send message',        method: 'POST', path: '/2/dm_conversations/with/:participant_id/messages' },
+        { id: 'dm-send',          label: 'Send DM (by user)',  method: 'POST', path: '/2/dm_conversations/with/:participant_id/messages' },
+        { id: 'dm-send-conv',     label: 'Send DM (by conv)',  method: 'POST', path: '/2/dm_conversations/:id/messages' },
         { id: 'dm-conv-create',   label: 'Create conversation', method: 'POST', path: '/2/dm_conversations' },
         { id: 'dm-events',        label: 'List events',         method: 'GET',  path: '/2/dm_events' },
         { id: 'dm-events-conv',   label: 'Conversation events', method: 'GET',  path: '/2/dm_conversations/:id/dm_events' },
         { id: 'dm-events-with',   label: 'Events with user',    method: 'GET',  path: '/2/dm_conversations/with/:participant_id/dm_events' },
         { id: 'dm-event-get',     label: 'Get event',           method: 'GET',  path: '/2/dm_events/:event_id' },
         { id: 'dm-event-delete',  label: 'Delete event',        method: 'DEL',  path: '/2/dm_events/:event_id' },
+        { id: 'dm-media',         label: 'Download media',      method: 'GET',  path: '/2/dm_conversations/media/:dm_id/:media_id/:resource_id' },
         { id: 'dm-block',         label: 'Block from DM',       method: 'POST', path: '/2/users/:id/dm/block' },
         { id: 'dm-unblock',       label: 'Unblock from DM',     method: 'POST', path: '/2/users/:id/dm/unblock' },
-        { id: 'chat-conv-list',   label: 'Chat conversations',  method: 'GET',  path: '/2/chat/conversations' },
+        { id: 'chat-conv-list',   label: 'Chat conversations (501)', method: 'GET',  path: '/2/chat/conversations' },
       ],
     },
     {
@@ -151,9 +153,9 @@ window.XDOC_DATA = (function () {
       id: 'spaces', label: 'Spaces', icon: '^',
       items: [
         { id: 'spaces-bulk',     label: 'Bulk lookup',     method: 'GET', path: '/2/spaces' },
-        { id: 'spaces-creator',  label: 'By creator',      method: 'GET', path: '/2/spaces/by/creator_ids' },
-        { id: 'spaces-search',   label: 'Search spaces',   method: 'GET', path: '/2/spaces/search' },
+        { id: 'spaces-topics',   label: 'Browse topics',   method: 'GET', path: '/2/spaces/topics' },
         { id: 'space-get',       label: 'Get space',       method: 'GET', path: '/2/spaces/:id' },
+        { id: 'spaces-creator',  label: 'By creator',      method: 'GET', path: '/2/spaces/by/creator_ids' },
         { id: 'space-buyers',    label: 'Ticket buyers',   method: 'GET', path: '/2/spaces/:id/buyers' },
         { id: 'space-tweets',    label: 'Space tweets',    method: 'GET', path: '/2/spaces/:id/tweets' },
       ],
@@ -173,7 +175,6 @@ window.XDOC_DATA = (function () {
       items: [
         { id: 'trends-global',       label: 'Trends',              method: 'GET', path: '/2/trends' },
         { id: 'trends-woeid',        label: 'Trends by WOEID',     method: 'GET', path: '/2/trends/by/woeid/:woeid' },
-        { id: 'trends-personalized', label: 'Personalized',        method: 'GET', path: '/2/users/personalized_trends' },
       ],
     },
     {
@@ -327,21 +328,21 @@ print(res.json())`,
     },
 
     'root': {
-      method: 'GET', path: '/', name: 'Service root',
-      summary: 'Minimal banner dengan title, version, link ke `/docs`. Tidak meng-expose route inventory.',
+      method: 'GET', path: '/info', name: 'Service root',
+      summary: 'Minimal banner dengan title, version, link ke `/docs`. Root `/` sekarang serve docs UI.',
       auth: 'Public.',
       scope: ['public'],
       responses: [
         { code: 200, label: 'OK', body: '{\n  "service": "X (Twitter) Cookie API",\n  "version": "2.3.0",\n  "docs": "/docs"\n}' },
       ],
       examples: {
-        curl: `curl ${BASE}/`,
-        javascript: `const res = await fetch("${BASE}/");\nconst info = await res.json();`,
-        python: `import requests\nprint(requests.get("${BASE}/").json())`,
+        curl: `curl ${BASE}/info`,
+        javascript: `const res = await fetch("${BASE}/info");\nconst info = await res.json();`,
+        python: `import requests\nprint(requests.get("${BASE}/info").json())`,
       },
       mockOk: {
         status: 200, headers: { ...COMMON_HEADERS },
-        body: '{\n  "service": "X (Twitter) Cookie API",\n  "version": "2.3.0",\n  "docs": "/docs"\n}',
+        body: '{\n  "service": "X (Twitter) Cookie API",\n  "version": "2.3.0",\n  "docs": "/docs",\n  "reference": "/"\n}',
       },
     },
 
@@ -842,48 +843,6 @@ res = requests.get(
       },
     },
 
-    // ── DM ─────────────────────────────────────────────────────────────────
-    'dm-send': {
-      method: 'POST', path: '/2/dm_conversations/with/:participant_id/messages', name: 'Send DM',
-      summary: 'Kirim DM ke user. Otomatis resolve / create conversation. Mendukung text + media.',
-      auth: COMMON_AUTH, scope: COMMON_SCOPE,
-      params: [
-        { name: 'participant_id', loc: 'path', type: 'string', required: true, desc: 'Target user ID.' },
-      ],
-      body: [
-        { name: 'text',         type: 'string', required: false, desc: 'Body pesan. Wajib ada salah satu (`text` atau `media_id`).' },
-        { name: 'attachments',  type: 'object[]', required: false, desc: 'Array `{ media_id }`.' },
-      ],
-      responses: [
-        { code: 200, label: 'OK', body: '{\n  "data": {\n    "dm_event_id": "1786394285310038016",\n    "dm_conversation_id": "44196397-12"\n  }\n}' },
-      ],
-      examples: {
-        curl: `curl -X POST "${BASE}/2/dm_conversations/with/12/messages" \\
-  -H "Authorization: Bearer $AUTH_TOKEN" \\
-  -H "Content-Type: application/json" \\
-  -d '{"text":"hello"}'`,
-        javascript: `await fetch(\`${BASE}/2/dm_conversations/with/\${participantId}/messages\`, {
-  method: "POST",
-  headers: {
-    "Authorization": \`Bearer \${process.env.AUTH_TOKEN}\`,
-    "Content-Type": "application/json",
-  },
-  body: JSON.stringify({ text: "hello" }),
-});`,
-        python: `import os, requests
-requests.post(
-    f"${BASE}/2/dm_conversations/with/{participant_id}/messages",
-    headers={"Authorization": f"Bearer {os.environ['AUTH_TOKEN']}"},
-    json={"text": "hello"},
-)`,
-      },
-      mockOk: {
-        status: 200,
-        headers: { ...COMMON_HEADERS, 'x-engine': 'dm' },
-        body: '{\n  "data": {\n    "dm_event_id": "1786394285310038016",\n    "dm_conversation_id": "44196397-12"\n  }\n}',
-      },
-    },
-
     // ── Trends ─────────────────────────────────────────────────────────────
     'trends-global': {
       method: 'GET', path: '/2/trends', name: 'Trends',
@@ -1252,9 +1211,16 @@ requests.post(
       ok: '{\n  "data": [\n    { "id": "111", "text": "RT @me: …" }\n  ],\n  "meta": { "result_count": 1 }\n}',
     }),
     'user-affiliates': ep({
-      method: 'GET', path: '/2/users/:id/affiliates', name: 'Affiliates (501)',
-      summary: 'Akun-akun yang afiliasi (verified org). Belum di-discover di mirror cookie.',
-      stub: true,
+      method: 'GET', path: '/2/users/:id/affiliates', name: 'Affiliates (Business team)',
+      summary: 'X Premium Business profile team members — `UserBusinessProfileTeamTimeline`.',
+      params: [
+        { name: 'user_id', loc: 'path',  type: 'string',  required: true,  desc: 'User rest_id.' },
+        { name: 'count',   loc: 'query', type: 'integer', required: false, desc: '1-100. Default 20.' },
+        { name: 'cursor',  loc: 'query', type: 'string',  required: false, desc: 'Pagination cursor.' },
+        P_RAW,
+      ],
+      op: 'UserBusinessProfileTeamTimeline',
+      ok: '{\n  "data": { "user": { "result": { "business_account": { "team_timeline": { "timeline": { "instructions": [] } } } } } }\n}',
     }),
 
     // ── Timelines ────────────────────────────────────────────────
@@ -1401,9 +1367,15 @@ requests.post(
       ok: '{\n  "data": [\n    { "id": "111", "text": "from member" }\n  ],\n  "meta": { "result_count": 1 }\n}',
     }),
     'list-followed': ep({
-      method: 'GET', path: '/2/users/:id/followed_lists', name: 'Followed lists (501)',
-      summary: 'List yang di-subscribe user. Operasi `ListSubscriptions` belum di-discover.',
-      stub: true,
+      method: 'GET', path: '/2/users/:id/followed_lists', name: 'Followed lists',
+      summary: 'List yang di-subscribe user. Via `ListsManagementPageTimeline` GraphQL.',
+      params: [
+        { name: 'user_id', loc: 'path', type: 'string', required: true, desc: 'User ID.' },
+        ...P_PAGINATION,
+        P_RAW,
+      ],
+      op: 'ListsManagementPageTimeline',
+      ok: '{\n  "data": [\n    { "id_str": "1700…", "name": "tech-folks", "subscriber_count": 12 }\n  ],\n  "meta": { "result_count": 1 }\n}',
     }),
     'list-follow': ep({
       method: 'POST', path: '/2/users/:id/followed_lists', name: 'Follow list',
@@ -1517,6 +1489,79 @@ requests.post(
     }),
 
     // ── Direct Messages ──────────────────────────────────────────
+    'dm-send': {
+      method: 'POST', path: '/2/dm_conversations/with/:participant_id/messages', name: 'Send DM (by user)',
+      summary: 'Kirim DM 1-1. Otomatis resolve / create conversation. REST 1.1 dm/new2.json.',
+      auth: COMMON_AUTH, scope: COMMON_SCOPE,
+      params: [
+        { name: 'participant_id', loc: 'path', type: 'string', required: true, desc: 'Target user ID.' },
+      ],
+      body: [
+        { name: 'text',         type: 'string', required: false, desc: 'Body pesan. Wajib ada salah satu (text atau media_id).' },
+        { name: 'media_id',     type: 'string', required: false, desc: 'Media ID dari upload.' },
+        { name: 'attachments',  type: 'object[]', required: false, desc: 'Array `{ media_id }`.' },
+        { name: 'reply_to_dm_event_id', type: 'string', required: false, desc: 'DM event ID yang di-reply.' },
+      ],
+      responses: [
+        { code: 200, label: 'OK', body: '{\n  "data": {\n    "dm_event_id": "1786394285310038016",\n    "dm_conversation_id": "44196397-12"\n  }\n}' },
+      ],
+      examples: {
+        curl: `curl -X POST "${BASE}/2/dm_conversations/with/12/messages" \\
+  -H "Authorization: Bearer $AUTH_TOKEN" \\
+  -H "Content-Type: application/json" \\
+  -d '{"text":"hello"}'`,
+        javascript: `await fetch(\`${BASE}/2/dm_conversations/with/\${participantId}/messages\`, {
+  method: "POST",
+  headers: {
+    "Authorization": \`Bearer \${process.env.AUTH_TOKEN}\`,
+    "Content-Type": "application/json",
+  },
+  body: JSON.stringify({ text: "hello" }),
+});`,
+        python: `import os, requests
+requests.post(
+    f"${BASE}/2/dm_conversations/with/{participant_id}/messages",
+    headers={"Authorization": f"Bearer {os.environ['AUTH_TOKEN']}"},
+    json={"text": "hello"},
+)`,
+      },
+      mockOk: {
+        status: 200,
+        headers: { ...COMMON_HEADERS, 'x-engine': 'dm' },
+        body: '{\n  "data": {\n    "dm_event_id": "1786394285310038016",\n    "dm_conversation_id": "44196397-12"\n  }\n}',
+      },
+    },
+    'dm-send-conv': ep({
+      method: 'POST', path: '/2/dm_conversations/:id/messages', name: 'Send DM (by conv)',
+      summary: 'Kirim DM ke conversation ID tertentu (1-1 atau group). REST 1.1 dm/new2.json.',
+      params: [
+        { name: 'conversation_id', loc: 'path', type: 'string', required: true, desc: 'Conversation ID.' },
+      ],
+      body: [
+        { name: 'text',         type: 'string', required: false, desc: 'Body pesan. Wajib ada salah satu.' },
+        { name: 'media_id',     type: 'string', required: false, desc: 'Media ID dari upload.' },
+        { name: 'attachments',  type: 'object[]', required: false, desc: 'Array `{ media_id }`.' },
+        { name: 'reply_to_dm_event_id', type: 'string', required: false, desc: 'DM event ID yang di-reply.' },
+      ],
+      engine: 'dm',
+      ok: '{\n  "data": {\n    "dm_event_id": "1786394285310038016",\n    "dm_conversation_id": "44196397-12"\n  }\n}',
+    }),
+    'dm-media': ep({
+      method: 'GET', path: '/2/dm_conversations/media/:dm_id/:media_id/:resource_id', name: 'Download DM media',
+      summary: 'Proxy stream binary DM media dari ton.twitter.com via sesi auth user. Return raw bytes dengan content-type asli.',
+      params: [
+        { name: 'dm_id',       loc: 'path', type: 'string', required: true, desc: 'DM event ID pemilik media.' },
+        { name: 'media_id',    loc: 'path', type: 'string', required: true, desc: 'Media ID (id_str dari attachment).' },
+        { name: 'resource_id', loc: 'path', type: 'string', required: true, desc: 'Resource ID (biasanya filename dari media_url_https).' },
+        { name: 'filename',    loc: 'query', type: 'string', required: false, desc: 'Optional filename hint (mis. nhp0Nroa.jpg).' },
+      ],
+      engine: 'dm',
+      ok: '(binary stream)',
+      errors: [
+        { code: 401, label: 'Invalid token', body: '{\n  "title": "Unauthorized",\n  "detail": "auth_token invalid/expired",\n  "status": 401\n}' },
+        { code: 502, label: 'Upstream', body: '{\n  "title": "Bad Gateway",\n  "detail": "upstream fetch failed",\n  "status": 502\n}' },
+      ],
+    }),
     'dm-conv-create': ep({
       method: 'POST', path: '/2/dm_conversations', name: 'Create DM conversation',
       summary: 'Create DM conv (auto via REST `dm/new2.json`). Bisa group atau 1-on-1.',
@@ -1623,12 +1668,48 @@ requests.post(
     }),
 
     // ── Spaces (semua stub karena enterprise tier) ─────────────────
-    'spaces-bulk':    ep({ method: 'GET', path: '/2/spaces',                  name: 'Bulk lookup spaces (501)',  summary: 'Operasi `AudioSpaceById` (fan-out) belum di-wire.', stub: true }),
-    'spaces-creator': ep({ method: 'GET', path: '/2/spaces/by/creator_ids',  name: 'By creator (501)',          summary: 'Operasi `AudioSpacesByCreator` belum di-discover.', stub: true }),
-    'spaces-search':  ep({ method: 'GET', path: '/2/spaces/search',           name: 'Search spaces (501)',       summary: 'Operasi `AudioSpaceSearch` belum di-discover.', stub: true }),
-    'space-get':      ep({ method: 'GET', path: '/2/spaces/:id',              name: 'Get space (501)',           summary: 'Operasi `AudioSpaceById` belum di-wire.', stub: true }),
-    'space-buyers':   ep({ method: 'GET', path: '/2/spaces/:id/buyers',       name: 'Ticket buyers (501)',       summary: 'Butuh OAuth2 user-context.', stub: true }),
-    'space-tweets':   ep({ method: 'GET', path: '/2/spaces/:id/tweets',       name: 'Space tweets (501)',        summary: 'Operasi `AudioSpaceTweets` belum di-wire.', stub: true }),
+    'spaces-bulk': ep({
+      method: 'GET', path: '/2/spaces', name: 'Bulk lookup spaces',
+      summary: 'Fan-out lookup banyak Space sekaligus — internal calls `AudioSpaceById` per ID.',
+      params: [
+        { name: 'ids', loc: 'query', type: 'string', required: true, desc: 'Comma-separated Space IDs.' },
+        P_RAW,
+      ],
+      op: 'AudioSpaceById',
+      ok: '{\n  "data": [\n    { "audioSpace": { "metadata": { "rest_id": "1zqKVPWMoXYxB", "state": "Ended", "title": "..." } } }\n  ]\n}',
+    }),
+    'spaces-topics': ep({
+      method: 'GET', path: '/2/spaces/topics', name: 'Browse Space topics',
+      summary: 'List kategori topik untuk discovery — `BrowseSpaceTopics`.',
+      params: [P_RAW],
+      op: 'BrowseSpaceTopics',
+      ok: '{\n  "data": { "browse_space_topics": { "topics": [ { "topic_id": "...", "name": "..." } ] } }\n}',
+    }),
+    'space-get': ep({
+      method: 'GET', path: '/2/spaces/:id', name: 'Get space',
+      summary: 'Detail satu Space — `AudioSpaceById` (metadata, host, listeners, replay).',
+      params: [
+        { name: 'space_id', loc: 'path', type: 'string', required: true, desc: 'Space rest_id (mis. `1zqKVPWMoXYxB`).' },
+        P_RAW,
+      ],
+      op: 'AudioSpaceById',
+      ok: '{\n  "data": { "audioSpace": { "metadata": { "rest_id": "1zqKVPWMoXYxB", "title": "Topic Bahas X", "state": "Ended" } } } }',
+    }),
+    'spaces-creator': ep({
+      method: 'GET', path: '/2/spaces/by/creator_ids', name: 'By creator (501)',
+      summary: 'X web client tidak meng-expose `AudioSpacesByCreator`. Workaround: `/2/users/:id/tweets` filter `card_uri="audio_space"`.',
+      stub: true,
+    }),
+    'space-buyers': ep({
+      method: 'GET', path: '/2/spaces/:id/buyers', name: 'Ticket buyers (501)',
+      summary: 'Butuh OAuth2 user-context.',
+      stub: true,
+    }),
+    'space-tweets': ep({
+      method: 'GET', path: '/2/spaces/:id/tweets', name: 'Space tweets (501)',
+      summary: 'X web client tidak meng-expose `AudioSpaceTweets`. Workaround: SearchTimeline dengan `q=https://x.com/i/spaces/:id`.',
+      stub: true,
+    }),
 
     // ── Birdwatch / Community Notes ──────────────────────────────
     'note-create': ep({
@@ -1701,13 +1782,6 @@ requests.post(
       ],
       engine: 'rest',
       ok: '{\n  "data": [\n    { "name": "#FastAPI", "tweet_volume": 12842 }\n  ],\n  "meta": { "woeid": 1, "as_of": "2026-05-17T09:14:00Z" }\n}',
-    }),
-    'trends-personalized': ep({
-      method: 'GET', path: '/2/users/personalized_trends', name: 'Personalized trends',
-      summary: 'Personalized trends untuk authenticated user. Ranked berdasar follow + engagement.',
-      params: [P_RAW],
-      engine: 'rest',
-      ok: '{\n  "data": [\n    { "name": "#FastAPI", "tweet_volume": 12842 }\n  ],\n  "meta": { "as_of": "2026-05-17T09:14:00Z" }\n}',
     }),
 
     // ── Media ────────────────────────────────────────────────────
@@ -1823,7 +1897,9 @@ with open("photo.png", "rb") as f:
       title: 'Changelog',
       lead: 'Recent changes ke Xapi mirror.',
       sections: [
-        { kicker: 'v2.3.0', title: 'Current', body: 'Mirror lengkap X v2 endpoint family: tweets, users, timelines, lists, bookmarks, DM, communities, spaces (stub), birdwatch, trends, media. GraphQL via httpx + Playwright fallback untuk CF-gated.' },
+        { kicker: 'v2.3.2', title: 'Current', body: 'Smoke-test 55 endpoint → fix /2/users/{id}/affiliates (variabel teamName/includePromotedContent/withClientEventToken/withVoice via Playwright capture) + /2/users/{id}/followed_lists (sebelumnya stub_501, sekarang ListsManagementPageTimeline). Removed: /2/spaces/search (AudioSpaceSearch op pensiun, X retired /i/spaces hub), /2/users/personalized_trends (REST 1.1 dead, upstream 404). Router order fix: trends sebelum users supaya path statis tidak tertangkap /{user_id}.' },
+        { kicker: 'v2.3.1', title: 'Previous', body: 'Spaces + affiliates dari stub → real GraphQL: AudioSpaceById, AudioSpaceSearch, BrowseSpaceTopics, UserBusinessProfileTeamTimeline. Total 61 GraphQL ops di registry.' },
+        { kicker: 'v2.3.0', title: 'Previous', body: 'Mirror lengkap X v2 endpoint family: tweets, users, timelines, lists, bookmarks, DM, communities, birdwatch, trends, media. GraphQL via httpx + Playwright fallback untuk CF-gated.' },
         { kicker: 'BREAKING', title: 'Migration dari /search legacy', body: 'POST /search dengan body `{auth_token, q}` deprecated. Pakai GET `/2/tweets/search/recent?query=...` dengan bearer header.' },
         { kicker: 'REMOVED', title: 'Enterprise tier endpoints', body: 'Streams, Compliance, Webhooks, Account Activity, Search Counts/All, Insights, Analytics, News, Media library di-hapus karena butuh OAuth2 app-only bearer + dev portal subscription.' },
       ],

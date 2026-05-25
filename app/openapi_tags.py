@@ -66,7 +66,7 @@ def auto_tag(path: str) -> str:
         return "Bookmarks"
 
     # Trends
-    if p.startswith("/2/trends") or "/personalized_trends" in p:
+    if p.startswith("/2/trends"):
         return "Trends"
 
     # Media

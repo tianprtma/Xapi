@@ -71,6 +71,11 @@ async def lifespan(_: FastAPI):
     yield
     await PlaywrightPool.get().close()
     await ClientPool.get().close_all()
+    try:
+        from app.xchat.bridge import XChatBridgeRegistry
+        await XChatBridgeRegistry.get().close_all()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 app = FastAPI(
@@ -119,6 +124,7 @@ async def _redoc_ui():
 
 # Mount routers — order doesn't matter, but listed by tag priority.
 app.include_router(infra.router)
+app.include_router(trends.router)
 app.include_router(users.router)
 app.include_router(tweets.router)
 app.include_router(timelines.router)
@@ -128,7 +134,6 @@ app.include_router(communities.router)
 app.include_router(birdwatch.router)
 app.include_router(dm.router)
 app.include_router(spaces.router)
-app.include_router(trends.router)
 app.include_router(media.router)
 
 install_security_middleware(app)
@@ -169,21 +174,21 @@ if DOCS_UI_SERVE.is_dir():
         """StaticFiles + Cache-Control headers untuk asset deterministik.
 
         - HTML (index.html): no-cache, must-revalidate (always-fresh shell)
-        - JSX/JS/CSS/data.js: 1 hour public cache (re-validate via etag)
         - bundle.js (esbuild output): immutable 1 year (versioned via build hash)
+        - CSS/JSX/data.js: no-cache + ETag (revalidate every load, cheap 304s
+          kalau gak berubah). Bikin perubahan style/data langsung kelihatan
+          tanpa hard-reload. Cocok untuk dev + tetap aman buat prod (tetap
+          hemat bandwidth via 304).
         """
         async def get_response(self, path: str, scope):
             response = await super().get_response(path, scope)
             if isinstance(response, StarletteResponse) and response.status_code == 200:
-                # path "" / "." / "index.html" semua resolve ke index.html
-                if path in ("", ".", "/", "index.html") or path.endswith(".html"):
-                    response.headers["Cache-Control"] = "no-cache, must-revalidate"
-                elif path.endswith("bundle.js"):
+                if path.endswith("bundle.js"):
                     # esbuild bundle: deterministic, safe long cache.
                     response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
                 else:
-                    # JSX, CSS, data.js — re-validate cepat via etag, 1 jam fresh.
-                    response.headers["Cache-Control"] = "public, max-age=3600"
+                    # HTML / CSS / JSX / data.js → always revalidate via ETag.
+                    response.headers["Cache-Control"] = "no-cache, must-revalidate"
             return response
 
     app.mount("/", CachedStaticFiles(directory=str(DOCS_UI_SERVE), html=True), name="docs-ui")

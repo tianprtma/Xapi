@@ -323,11 +323,22 @@ async def v2_list_tweets(
 
 
 @router.get("/2/users/{user_id}/followed_lists")
-async def v2_followed_lists(user_id: str = PathParam(...)) -> JSONResponse:
-    return stub_501(
-        feature="followed_lists",
-        reason=NEW_GQL_REASON + " Operation: ListSubscriptions.",
-    )
+async def v2_followed_lists(
+    user_id: str = PathParam(..., pattern=r"^\d+$"),
+    max_results: int = Query(20, ge=1, le=100),
+    authorization: Optional[str] = Header(None),
+    auth_token: Optional[str] = Query(None),
+    raw: int = Query(0),
+) -> JSONResponse:
+    """List subscriptions (followed lists) — `ListsManagementPageTimeline`.
+
+    Note: X web client only exposes my-own list management (auth user). Server
+    ignores `user_id` if it doesn't match the auth session — same behavior as
+    `/2/lists/by/owner/{user_id}` for non-self lookup.
+    """
+    tok = extract_bearer(authorization, auth_token)
+    result = await graphql_call("ListsManagementPageTimeline", {"count": max_results}, tok)
+    return write_finalize(result, raw=bool(raw))
 
 
 @router.post("/2/users/{user_id}/followed_lists")

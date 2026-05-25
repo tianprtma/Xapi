@@ -124,34 +124,3 @@ async def v2_trends_by_woeid(
 ) -> JSONResponse:
     """Canonical: GET /2/trends/by/woeid/{woeid}."""
     return await _trends_impl(woeid, authorization, auth_token, raw)
-
-
-@router.get("/2/users/personalized_trends")
-async def v2_personalized_trends(
-    authorization: Optional[str] = Header(None),
-    auth_token: Optional[str] = Query(None),
-    raw: int = Query(0),
-) -> JSONResponse:
-    """Personalized trends untuk current user (REST 1.1 trends/personalized)."""
-    tok = extract_bearer(authorization, auth_token)
-    result = await rest_call("trends/personalized.json", tok, method="GET")
-    if raw:
-        return wrap(result)
-    if result.get("status") == "ok":
-        try:
-            payload = result["data"]
-            trends = payload[0].get("trends", []) if isinstance(payload, list) else []
-            return JSONResponse(
-                status_code=200,
-                content={
-                    "data": [
-                        {"name": t.get("name"), "url": t.get("url"), "tweet_volume": t.get("tweet_volume")}
-                        for t in trends
-                    ],
-                    "meta": {"as_of": payload[0].get("as_of") if isinstance(payload, list) else None},
-                },
-            )
-        except Exception:  # noqa: BLE001
-            return wrap(result)
-    return wrap(result)
-

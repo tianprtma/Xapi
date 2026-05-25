@@ -154,6 +154,54 @@ def _media_obj(m: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _dm_attachment_obj(m: dict[str, Any]) -> dict[str, Any]:
+    """
+    Best-effort flatten of a DM attachment.media object so consumers can
+    download the binary directly. Differs from `_media_obj` because DM
+    media uses `id_str` not `media_key`, and video variants are nested
+    under `video_info.variants`.
+
+    Returns: {kind, mime, url, width?, height?, duration_ms?, byte_size?}
+    where `kind` ∈ {photo, video, animated_gif} per X DM payload.
+    """
+    kind = m.get("type") or "photo"
+    mime: Optional[str] = None
+    url: Optional[str] = m.get("media_url_https")
+    width = (m.get("original_info") or {}).get("width")
+    height = (m.get("original_info") or {}).get("height")
+    duration_ms = (m.get("video_info") or {}).get("duration_millis")
+    byte_size: Optional[int] = None
+
+    if kind in ("video", "animated_gif"):
+        # Pick highest-bitrate mp4 variant; X also returns m3u8 (HLS) which
+        # we skip — re-uploading HLS to X needs a manifest fetch.
+        variants = (m.get("video_info") or {}).get("variants") or []
+        mp4s = [v for v in variants if v.get("content_type") == "video/mp4"]
+        mp4s.sort(key=lambda v: v.get("bitrate") or 0, reverse=True)
+        if mp4s:
+            url = mp4s[0].get("url")
+            mime = "video/mp4"
+    if kind == "photo" and url:
+        # X serves DM photos at media_url_https; format is in `format` field
+        # (jpg|png|gif|webp). MIME is best-guessed from extension.
+        ext = (url.rsplit(".", 1)[-1] or "").lower().split("?", 1)[0]
+        mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+                "gif": "image/gif", "webp": "image/webp"}.get(ext) or "image/jpeg"
+    if isinstance(m.get("size"), int):
+        byte_size = m.get("size")
+
+    return {
+        "kind": kind,
+        "mime": mime,
+        "url": url,
+        "width": width,
+        "height": height,
+        "duration_ms": duration_ms,
+        "byte_size": byte_size,
+        "media_id": str(m.get("id_str") or m.get("id") or ""),
+    }
+
+
 def format_tweet(gql: dict[str, Any]) -> dict[str, Any]:
     """Format TweetResultByRestId."""
     tw = (gql or {}).get("data", {}).get("tweetResult", {}).get("result", {})
@@ -498,16 +546,27 @@ def _dm_user_obj(u: dict[str, Any]) -> Optional[dict[str, Any]]:
     }
 
 
-def _dm_event_to_obj(ev: dict[str, Any]) -> Optional[dict[str, Any]]:
+def _dm_event_to_obj(
+    ev: dict[str, Any],
+    users: Optional[dict[str, Any]] = None,
+) -> Optional[dict[str, Any]]:
     """
     Convert REST 1.1 DM event → X API v2 dm_events shape.
     Spec v2: {id, event_type, created_at, dm_conversation_id, sender_id, text, attachments?, referenced_tweets?, participant_ids?}
+
+    `users` is the inbox-level users map keyed by user_id (string). When
+    provided, MessageCreate events get a non-spec `_sender_follows_owner`
+    flag derived from `users[sender_id].followed_by` so consumers can
+    enforce mutual/follower-only policies without a second lookup.
     """
     if not ev:
         return None
     et = ev.get("type") or ev.get("event_type")
     msg = ev.get("message_create") or {}
-    msg_data = msg.get("message_data") or {}
+    # REST 1.1 inbox_initial_state.entries: message_data sits directly on the
+    # event (entry was {"message": {message_data: {...}}}). For
+    # Account Activity API (`message_create.message_data`), keep nested fallback.
+    msg_data = ev.get("message_data") or msg.get("message_data") or {}
 
     base: dict[str, Any] = {
         "id": str(ev.get("id") or ev.get("event_id") or ""),
@@ -517,7 +576,7 @@ def _dm_event_to_obj(ev: dict[str, Any]) -> Optional[dict[str, Any]]:
     }
 
     if et in ("message_create", "Message", "message"):
-        sender = msg.get("sender_id") or ev.get("sender_id")
+        sender = msg_data.get("sender_id") or msg.get("sender_id") or ev.get("sender_id")
         text = msg_data.get("text") or ev.get("text")
         base.update(
             {
@@ -526,6 +585,15 @@ def _dm_event_to_obj(ev: dict[str, Any]) -> Optional[dict[str, Any]]:
                 "text": text,
             }
         )
+        # Tag sender follow status for downstream policy. `followed_by` is
+        # 1.1's "this user follows the bot owner". Missing/None → unknown.
+        if sender and users:
+            sender_obj = users.get(str(sender)) or {}
+            fb = sender_obj.get("followed_by")
+            if fb is True:
+                base["_sender_follows_owner"] = True
+            elif fb is False:
+                base["_sender_follows_owner"] = False
         # entities
         entities = msg_data.get("entities") or {}
         if entities:
@@ -549,6 +617,10 @@ def _dm_event_to_obj(ev: dict[str, Any]) -> Optional[dict[str, Any]]:
         media = attach.get("media") or attach.get("photo") or attach.get("video")
         if media and media.get("id_str"):
             base["attachments"] = {"media_keys": [str(media["id_str"])]}
+            # Surface DL URL + type so consumers can fetch the binary without
+            # re-walking includes. `_xapi_attachments` is non-spec; consumers
+            # should treat it as best-effort.
+            base["_xapi_attachments"] = [_dm_attachment_obj(media)]
         # quoted/referenced tweet
         if attach.get("tweet"):
             tw = attach["tweet"]
@@ -602,6 +674,7 @@ def format_dm_events(payload: dict[str, Any]) -> dict[str, Any]:
     Sumber kemungkinan:
       - inbox_initial_state.entries (user_updates)
       - conversation_timeline.entries (conversation/{id})
+      - inbox_timeline (dm/inbox_timeline/{trusted,untrusted}.json)
     """
     data: list[dict[str, Any]] = []
     users: dict[str, dict] = {}
@@ -611,17 +684,19 @@ def format_dm_events(payload: dict[str, Any]) -> dict[str, Any]:
         (payload or {}).get("inbox_initial_state")
         or (payload or {}).get("user_events")
         or (payload or {}).get("conversation_timeline")
+        or (payload or {}).get("inbox_timeline")
         or {}
     )
 
+    raw_users_src = inbox.get("users") or {}
+
     for ev in inbox.get("entries", []) or []:
         for k, v in ev.items():
-            obj = _dm_event_to_obj({**v, "type": k})
+            obj = _dm_event_to_obj({**v, "type": k}, users=raw_users_src)
             if obj:
                 data.append(obj)
 
-    raw_users = inbox.get("users") or {}
-    for uid, u in (raw_users or {}).items():
+    for uid, u in (raw_users_src or {}).items():
         uo = _dm_user_obj(u)
         if uo and uo["id"]:
             users[uo["id"]] = uo

@@ -369,12 +369,33 @@ async def v2_user_by_id(
     return finalize(result, format_user, raw=bool(raw))
 
 
-@router.get("/2/users/{user_id}/affiliates")
-async def v2_user_affiliates(user_id: str = PathParam(...)) -> JSONResponse:
-    return stub_501(
-        feature="user_affiliates",
-        reason=NEW_GQL_REASON + " Operation: UserAffiliatesTimeline.",
-    )
+@router.get(
+    "/2/users/{user_id}/affiliates",
+    summary="Affiliates (Business team)",
+    description="X Premium Business profile team members via `UserBusinessProfileTeamTimeline` GraphQL.",
+)
+async def v2_user_affiliates(
+    user_id: str = PathParam(..., pattern=r"^\d+$"),
+    count: int = Query(20, ge=1, le=100),
+    cursor: Optional[str] = Query(None),
+    authorization: Optional[str] = Header(None),
+    auth_token: Optional[str] = Query(None),
+    raw: int = Query(0),
+) -> JSONResponse:
+    """X Premium Business "team members" — UserBusinessProfileTeamTimeline."""
+    tok = extract_bearer(authorization, auth_token)
+    variables: dict[str, Any] = {
+        "userId": user_id,
+        "count": count,
+        "teamName": "NotAssigned",
+        "includePromotedContent": False,
+        "withClientEventToken": False,
+        "withVoice": True,
+    }
+    if cursor:
+        variables["cursor"] = cursor
+    result = await graphql_call("UserBusinessProfileTeamTimeline", variables, tok)
+    return write_finalize(result, raw=bool(raw))
 
 
 @router.get("/2/users/{user_id}/blocking")

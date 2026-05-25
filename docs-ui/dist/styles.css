@@ -535,7 +535,7 @@ ul { margin: 0; padding: 0; list-style: none; }
 /* ── Quickstart cards ──────────────────────────────────────────────────────── */
 .quick-grid {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
   gap: 12px;
 }
 .quick-card {
@@ -578,7 +578,7 @@ ul { margin: 0; padding: 0; list-style: none; }
 /* ── Endpoint area cards (overview) ────────────────────────────────────────── */
 .ep-grid {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
   gap: 12px;
 }
 .ep-card {
@@ -633,7 +633,7 @@ ul { margin: 0; padding: 0; list-style: none; }
 /* ── Conventions ───────────────────────────────────────────────────────────── */
 .conv-grid {
   display: grid;
-  grid-template-columns: repeat(2, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
   border: 1px solid var(--border);
   border-radius: var(--radius);
   overflow: hidden;
@@ -731,7 +731,9 @@ ul { margin: 0; padding: 0; list-style: none; }
 .param-table {
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  overflow: hidden;
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior-x: contain;
   background: var(--bg-1);
 }
 .param-row {
@@ -805,7 +807,9 @@ ul { margin: 0; padding: 0; list-style: none; }
   font-size: 12px;
   color: var(--fg);
   white-space: pre;
-  overflow: hidden;
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior-x: contain;
   line-height: 1.6;
 }
 
@@ -928,7 +932,9 @@ ul { margin: 0; padding: 0; list-style: none; }
   line-height: 1.65;
   color: var(--fg);
   white-space: pre;
-  overflow: hidden;
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior-x: contain;
   flex: 1 1 0;
 }
 .codepane-code-flush { border-top: 1px solid var(--border-soft); flex: 0 0 auto; }
@@ -1090,3 +1096,50 @@ ul { margin: 0; padding: 0; list-style: none; }
 .docs-app[data-density="compact"] .hero { padding-bottom: 22px; margin-bottom: 22px; }
 .docs-app[data-density="compact"] .content-section { margin-bottom: 26px; }
 .docs-app[data-density="compact"] .main { padding: 22px 28px 40px; }
+
+/* ────────────────────────────────────────────────────────────────────────────
+   Scrollbar styling — slim, themed, hover-amplified.
+   Firefox: scrollbar-color/scrollbar-width. Chromium/WebKit: ::-webkit-scrollbar.
+   ──────────────────────────────────────────────────────────────────────────── */
+
+/* Firefox: thin + accent color */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in oklab, var(--accent) 30%, transparent) transparent;
+}
+
+/* Chromium / WebKit: slim track, accent thumb, brighter on hover */
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: color-mix(in oklab, var(--accent) 22%, transparent);
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+  transition: background 0.15s ease;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in oklab, var(--accent) 55%, transparent);
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-thumb:active {
+  background: var(--accent);
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* Slimmer scrollbar untuk konten secondary (sidebar/code blocks) */
+.sidebar-nav::-webkit-scrollbar,
+.codepane-code::-webkit-scrollbar,
+.resp-body::-webkit-scrollbar,
+.param-table::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}

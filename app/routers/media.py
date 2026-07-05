@@ -14,13 +14,14 @@ from fastapi import APIRouter, Header, HTTPException, Path as PathParam, Query, 
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from ..auth import extract_bearer
+
 from formatter import (
     format_birdwatch_batsignal,
     format_birdwatch_note_result,
     format_birdwatch_notes_slice,
     format_bookmark_folders,
     format_community,
-    format_dm_events,
     format_dm_send_result,
     format_error,
     format_tweet,
@@ -72,16 +73,18 @@ router = APIRouter(tags=["Media"])
 
 
 @router.post("/2/media/metadata")
-async def v2_media_metadata(request: Request) -> JSONResponse:
+async def v2_media_metadata(
+    request: Request,
+    authorization: Optional[str] = Header(None),
+    auth_token: Optional[str] = Query(None),
+) -> JSONResponse:
     """POST /2/media/metadata — alt_text via media/metadata/create.json (REST 1.1)."""
-    auth_token = request.headers.get("authorization", "").removeprefix("Bearer ").strip() or request.query_params.get("auth_token")
-    if not auth_token:
-        raise HTTPException(status_code=401, detail="missing auth_token")
+    tok = extract_bearer(authorization, auth_token)
     try:
         body = await request.json()
     except Exception:  # noqa: BLE001
         return JSONResponse(status_code=400, content=format_error("Bad Request", "invalid JSON", "bad_request", 400))
-    result = await rest_call("media/metadata/create.json", auth_token, json_body=body)
+    result = await rest_call("media/metadata/create.json", tok, json_body=body)
     return write_finalize(result, raw=False)
 
 
@@ -163,11 +166,11 @@ async def v2_media_upload_init() -> JSONResponse:
 
 
 @router.post("/2/media/upload/{media_id}/append")
-async def v2_media_upload_append(media_id: str = PathParam(...)) -> JSONResponse:
+async def v2_media_upload_append(media_id: str = PathParam(..., pattern=r"^\d+$")) -> JSONResponse:
     return stub_501(feature="media_upload_append", reason="Lihat /2/media/upload/initialize.")
 
 
 @router.post("/2/media/upload/{media_id}/finalize")
-async def v2_media_uploadfinalize(media_id: str = PathParam(...)) -> JSONResponse:
+async def v2_media_uploadfinalize(media_id: str = PathParam(..., pattern=r"^\d+$")) -> JSONResponse:
     return stub_501(feature="media_upload_finalize", reason="Lihat /2/media/upload/initialize.")
 

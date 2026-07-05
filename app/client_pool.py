@@ -24,6 +24,7 @@ from .config import (
     gen_ct0,
     random_proxy,
     random_user_agent,
+    token_key,
 )
 
 
@@ -63,6 +64,7 @@ class ClientPool:
             (session, per_token_lock) — caller must hold the lock for the
             duration of the request to avoid concurrent use of one session.
         """
+        key = token_key(auth_token)
         async with self._lock:
             now = time.time()
             # Expire stale entries first
@@ -74,9 +76,9 @@ class ClientPool:
                 except Exception:  # noqa: BLE001
                     pass
 
-            entry = self._cache.get(auth_token)
+            entry = self._cache.get(key)
             if entry:
-                self._cache.move_to_end(auth_token)
+                self._cache.move_to_end(key)
                 entry.last_used = now
                 return entry.session, entry.lock
 
@@ -94,7 +96,7 @@ class ClientPool:
                 kwargs["proxies"] = {"http": proxy, "https": proxy}
             session = AsyncSession(**kwargs)
             entry = _Entry(session)
-            self._cache[auth_token] = entry
+            self._cache[key] = entry
 
             # Evict LRU if over capacity
             while len(self._cache) > CLIENT_POOL_MAX:
@@ -108,8 +110,9 @@ class ClientPool:
 
     async def invalidate(self, auth_token: str) -> None:
         """Drop session (e.g., on 401/403) so next request gets fresh TLS."""
+        key = token_key(auth_token)
         async with self._lock:
-            entry = self._cache.pop(auth_token, None)
+            entry = self._cache.pop(key, None)
         if entry:
             try:
                 await entry.session.close()

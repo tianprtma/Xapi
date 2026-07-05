@@ -20,7 +20,6 @@ from formatter import (
     format_birdwatch_notes_slice,
     format_bookmark_folders,
     format_community,
-    format_dm_events,
     format_dm_send_result,
     format_error,
     format_tweet,
@@ -65,7 +64,7 @@ from ..config import (
     WEB_BEARER,
 )
 from ..playwright_helpers import resolve_screen_name, tweet_author_handle
-from ..responses import finalize, stub_501, wrap, write_finalize
+from ..responses import batch_finalize, finalize, stub_501, wrap, write_finalize
 
 
 router = APIRouter(tags=["Tweets"])
@@ -143,7 +142,7 @@ async def v2_tweets_bulk(
     if refs: inc["tweets"] = list(refs.values())
     if inc: out["includes"] = inc
     if errors: out["errors"] = errors
-    return JSONResponse(status_code=200, content=out)
+    return batch_finalize(out)
 
 
 @router.post("/2/tweets")
@@ -175,7 +174,7 @@ async def v2_create_tweet(
         variables["attachment_url"] = f"https://twitter.com/i/status/{body.quote_tweet_id}"
 
     result = await graphql_call("CreateTweet", variables, tok, method="POST")
-    return write_finalize(result, raw=bool(raw))
+    return write_finalize(result, raw=bool(raw), formatter=format_tweet, success_status=201)
 
 
 @router.get("/2/tweets/search/recent")

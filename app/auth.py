@@ -83,15 +83,17 @@ def extract_bearer(authorization: Optional[str], auth_token_q: Optional[str]) ->
         tok = auth_token_q.strip()
 
     if not tok:
+        from .errors import build_error_jsonapi
         raise HTTPException(
             status_code=401,
-            detail="missing auth_token (header 'Authorization: Bearer <auth_token>')",
+            detail=build_error_jsonapi("AUTH_TOKEN_MISSING")["errors"][0]["detail"],
         )
 
     if not AUTH_TOKEN_PATTERN.match(tok):
+        from .errors import build_error_jsonapi
         raise HTTPException(
             status_code=401,
-            detail="invalid auth_token format (expected 40 hex chars)",
+            detail=build_error_jsonapi("AUTH_TOKEN_INVALID_FORMAT")["errors"][0]["detail"],
         )
     return tok
 
@@ -150,7 +152,8 @@ async def warm_session(
     try:
         await client.get(HOMEPAGE_URL)
     except Exception:  # noqa: BLE001
-        pass
+        import logging
+        logging.getLogger("xapi.auth").debug("warm_session home_page failed", exc_info=True)
 
     # X kasih ct0 server-issued di domain .x.com (leading dot). Placeholder lokal
     # nyantol di domain="" atau "x.com" tanpa leading dot. Strategy: prefer ct0

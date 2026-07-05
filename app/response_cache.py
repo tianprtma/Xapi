@@ -17,7 +17,7 @@ import time
 from collections import OrderedDict
 from typing import Any, Optional
 
-from .config import RESPONSE_CACHE_TTL
+from .config import RESPONSE_CACHE_TTL, token_key
 
 
 # Operations yang aman di-cache (read-only, deterministic given vars + token).
@@ -50,8 +50,8 @@ MAX_CACHE_ENTRIES = 2000
 
 
 def _key(operation: str, variables: dict[str, Any], auth_token: str) -> tuple:
-    """Stable tuple key. Faster than SHA-256 (~5x) at hot path."""
-    return (operation, json.dumps(variables, sort_keys=True, default=str), auth_token)
+    """Stable tuple key. Hashes auth_token so plaintext doesn't sit in memory."""
+    return (operation, json.dumps(variables, sort_keys=True, default=str), token_key(auth_token))
 
 
 class ResponseCache:

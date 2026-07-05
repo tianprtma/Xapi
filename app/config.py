@@ -12,7 +12,9 @@ from typing import Any, Literal
 # ──────────────────────────── GraphQL metadata ────────────────────────────
 
 _META_PATH = Path(__file__).parent.parent / "_gql_meta.json"
-GQL_META: dict[str, dict[str, Any]] = json.loads(_META_PATH.read_text())
+GQL_META: dict[str, dict[str, Any]] = (
+    json.loads(_META_PATH.read_text()) if _META_PATH.exists() else {}
+)
 
 # ──────────────────────────── Bearer & URLs ────────────────────────────
 
@@ -72,6 +74,10 @@ DEFAULT_HEADERS: dict[str, str] = {
     "x-twitter-active-user": "yes",
     "x-twitter-auth-type": "OAuth2Session",
     "x-twitter-client-language": "en",
+    "apollo-require-preflight": "true",
+    "sec-ch-ua": '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"macOS"',
 }
 
 # ──────────────────────────── Viewer / Search features ────────────────────────────
@@ -227,6 +233,10 @@ AUTH_TOKEN_PATTERN = _re.compile(r"^[a-f0-9]{40}$")
 # Generate dengan `openssl rand -hex 32`. Kosong = endpoint disabled.
 ADMIN_TOKEN: str = os.environ.get("ADMIN_TOKEN", "").strip()
 
+# XChat bridge: auto-start bridge untuk bot account di startup.
+# Ambil dari env var atau terserah.
+XCHAT_BOT_USER_ID: str = os.environ.get("XCHAT_BOT_USER_ID", "").strip()
+
 # Proxy rotation: comma-separated `http://[user:pass@]host:port` urls.
 # Random per make_client call. Kosong = no proxy (direct).
 _proxy_raw = os.environ.get("PROXY_LIST", "").strip()
@@ -269,3 +279,33 @@ RETRY_MAX_DELAY: float = float(os.environ.get("RETRY_MAX_DELAY", "8.0"))
 # HTTP client pool size (max simultaneous AsyncSession).
 CLIENT_POOL_MAX: int = int(os.environ.get("CLIENT_POOL_MAX", "50"))
 CLIENT_POOL_TTL: int = int(os.environ.get("CLIENT_POOL_TTL", "600"))  # 10 min
+
+# ──────────────────────────── Token hashing ────────────────────────────
+
+import hashlib as _hashlib
+import secrets as _secrets
+
+# Per-process salt — rotated every restart. Within a single process,
+# hashed token values cannot be correlated with other processes.
+# NOTE: when using uvicorn --workers > 1, workers inherit the parent's
+# salt via fork(), so cross-worker correlation IS possible. For true
+# per-worker isolation, spawn workers (--workers N with gunicorn
+# --preload off) or use separate container instances.
+_TOKEN_SALT: str = _secrets.token_hex(16)
+
+
+def token_key(auth_token: str) -> str:
+    """Return a stable per-process sha256 hash of `auth_token`.
+
+    Used as the cache key in SessionStore, ResponseCache, and ClientPool
+    instead of plaintext auth_token. The per-process salt means an attacker
+    who captures a memory dump of one process cannot map hashes back to
+    original tokens without capturing the salt from that same process
+    (which lives alongside the hashes in memory anyway — but prevents
+    offline dictionary attacks and cross-process correlation).
+
+    This is NOT a hard cryptographic guarantee (the salt lives in the same
+    process) — it's a reasonable defense-in-depth layer against casual
+    memory inspection.
+    """
+    return _hashlib.sha256(f"{_TOKEN_SALT}:{auth_token}".encode()).hexdigest()

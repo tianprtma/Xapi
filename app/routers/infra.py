@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import inspect
+import logging
 from typing import Any, Optional
 
 import httpx
 from fastapi import APIRouter, Header, HTTPException, Query
 from fastapi.responses import JSONResponse
+
+_log_admin = logging.getLogger("xapi.admin")
 from pydantic import BaseModel, Field
 
 from playwright_search import search_via_browser
@@ -24,7 +27,7 @@ router = APIRouter(tags=["Infra"])
 
 
 class SearchRequest(BaseModel):
-    auth_token: str = Field(..., min_length=10, description="X auth_token cookie")
+    auth_token: Optional[str] = Field(None, min_length=10, description="DEPRECATED: use Authorization header")
     q: str = Field(..., min_length=1, description="Keyword pencarian")
     type: SearchType = Field("Latest", description="Latest | Top | People | Media")
 
@@ -53,11 +56,12 @@ async def info() -> dict[str, Any]:
 
     Endpoint moved from `/` ke `/info` karena root sekarang serve docs-ui static.
     """
-    from main import app  # type: ignore[import]
+    from main import app, WORKER_ID  # type: ignore[import]
 
     return {
         "service": app.title,
         "version": app.version,
+        "worker_id": WORKER_ID,
         "docs": "/docs",
         "reference": "/",
     }
@@ -86,7 +90,13 @@ async def login(
             content={"status": "error", "error": "Upstream request failed"},
         )
     code = 200 if result["status"] == "valid" else 401
-    return JSONResponse(status_code=code, content=result)
+    # Strip sensitive cookies jar — only return user profile + minimal tokens
+    safe = {
+        "status": result["status"],
+        "user": result.get("user"),
+        "tokens": result.get("tokens", {}),
+    }
+    return JSONResponse(status_code=code, content=safe)
 
 
 # ──────────────────────────── Admin stats (locked behind ADMIN_TOKEN) ────────────────────────────
@@ -98,7 +108,7 @@ async def admin_stats(
 ) -> dict[str, Any]:
     """Combined infra stats. Requires `X-Admin-Token` header matching `ADMIN_TOKEN` env."""
     _require_admin(x_admin_token)
-    from main import app  # type: ignore[import]
+    from main import app, WORKER_ID  # type: ignore[import]
 
     routes_summary: dict[str, list[str]] = {"implemented": [], "stub_501": []}
     for r in app.routes:
@@ -114,11 +124,20 @@ async def admin_stats(
                 continue
             routes_summary[bucket].append(f"{m} {r.path}")
 
+    from ..security import RateLimitMiddleware
+
+    rl_stats: dict[str, Any] = {}
+    rl_instance = RateLimitMiddleware.get()
+    if rl_instance is not None:
+        rl_stats = await rl_instance.stats()
+
     return {
+        "worker_id": WORKER_ID,
         "session_cache": await SessionStore.get().stats(),
         "tid_provider": await TIDProvider.get().stats(),
         "client_pool": await ClientPool.get().stats(),
         "response_cache": await ResponseCache.get().stats(),
+        "rate_limiter": rl_stats,
         "routes": {
             "v2_total": len(routes_summary["implemented"]) + len(routes_summary["stub_501"]),
             "v2_implemented": len(routes_summary["implemented"]),
@@ -129,15 +148,22 @@ async def admin_stats(
     }
 
 
+
 @router.post("/search")
-async def search(req: SearchRequest) -> JSONResponse:
+async def search(
+    req: SearchRequest,
+    authorization: Optional[str] = Header(None),
+) -> JSONResponse:
     """Search tweets/users via Playwright headless browser (~3-6s).
 
     httpx engine sudah di-deprecate karena X selalu block direct SearchTimeline call.
     """
+    from ..auth import extract_bearer
+
+    tok = extract_bearer(authorization, req.auth_token)
     try:
         pw_result = await search_via_browser(
-            auth_token=req.auth_token,
+            auth_token=tok,
             q=req.q,
             search_type=req.type,
         )

@@ -109,9 +109,6 @@ async def _graphql_call_once(
                 "queryId": meta["queryId"],
             })
 
-        jar = {c.name: c.value for c in client.cookies.jar}
-        ct0 = jar.get("ct0", ct0)
-
         if resp.status_code != 200:
             if resp.status_code in (401, 403):
                 await SessionStore.get().invalidate(auth_token)
@@ -119,8 +116,6 @@ async def _graphql_call_once(
                 "status": "error",
                 "http_status": resp.status_code,
                 "error": resp.text[:1000],
-                "cookies": jar,
-                "tokens": {"bearer": WEB_BEARER, "ct0": ct0, "auth_token": auth_token},
                 "data": None,
             }
 
@@ -132,8 +127,6 @@ async def _graphql_call_once(
                 "http_status": resp.status_code,
                 "error": "non-JSON response",
                 "raw": resp.text[:1000],
-                "cookies": jar,
-                "tokens": {"bearer": WEB_BEARER, "ct0": ct0, "auth_token": auth_token},
                 "data": None,
             }
 
@@ -141,8 +134,6 @@ async def _graphql_call_once(
             "status": "ok",
             "http_status": 200,
             "operation": operation,
-            "cookies": jar,
-            "tokens": {"bearer": WEB_BEARER, "ct0": ct0, "auth_token": auth_token},
             "data": payload,
         }
 
@@ -208,29 +199,22 @@ async def _rest_call_once(
             headers["content-type"] = "application/x-www-form-urlencoded"
             resp = await client.request(method, url, headers=headers, data=data or {})
 
-        jar = {c.name: c.value for c in client.cookies.jar}
-        ct0 = jar.get("ct0", ct0)
+        if resp.status_code >= 400:
+            return {
+                "status": "error",
+                "http_status": resp.status_code,
+                "error": resp.text[:1000],
+                "data": None,
+            }
 
         try:
             payload = resp.json()
         except json.JSONDecodeError:
             payload = {"raw": resp.text[:1000]}
 
-        if resp.status_code >= 400:
-            return {
-                "status": "error",
-                "http_status": resp.status_code,
-                "error": payload,
-                "cookies": jar,
-                "tokens": {"bearer": WEB_BEARER, "ct0": ct0, "auth_token": auth_token},
-                "data": None,
-            }
-
         return {
             "status": "ok",
             "http_status": resp.status_code,
-            "cookies": jar,
-            "tokens": {"bearer": WEB_BEARER, "ct0": ct0, "auth_token": auth_token},
             "data": payload,
         }
 
@@ -311,9 +295,6 @@ async def _dm_call_once(
         else:
             resp = await client.request(method, url, headers=headers, params=final_params)
 
-        jar = {c.name: c.value for c in client.cookies.jar}
-        ct0 = jar.get("ct0", ct0)
-
         try:
             payload = resp.json()
         except json.JSONDecodeError:
@@ -326,23 +307,25 @@ async def _dm_call_once(
                 "status": "error",
                 "http_status": resp.status_code,
                 "error": payload,
-                "cookies": jar,
-                "tokens": {"bearer": WEB_BEARER, "ct0": ct0, "auth_token": auth_token},
                 "data": None,
             }
 
         return {
             "status": "ok",
             "http_status": resp.status_code,
-            "cookies": jar,
-            "tokens": {"bearer": WEB_BEARER, "ct0": ct0, "auth_token": auth_token},
             "data": payload,
         }
 
 
 def dm_conv_id_for(me: str, other: str) -> str:
     """1-1 DM conversation_id format = sorted(me, other) joined dengan '-'."""
-    a, b = sorted([str(me), str(other)], key=lambda x: int(x) if x.isdigit() else x)
+    def _safe_sort_key(x: str) -> tuple[int, str]:
+        try:
+            return (0, int(x))
+        except (ValueError, TypeError):
+            return (1, x)
+
+    a, b = sorted([str(me), str(other)], key=_safe_sort_key)
     return f"{a}-{b}"
 
 
@@ -490,8 +473,6 @@ def _invalid_token_response(e: InvalidTokenError, auth_token: str) -> dict[str, 
         "status": "invalid",
         "http_status": e.http_status,
         "error": e.message,
-        "cookies": e.jar,
-        "tokens": {"bearer": WEB_BEARER, "ct0": e.ct0, "auth_token": auth_token},
         "data": None,
     }
 

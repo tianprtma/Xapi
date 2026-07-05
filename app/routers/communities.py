@@ -20,7 +20,6 @@ from formatter import (
     format_birdwatch_notes_slice,
     format_bookmark_folders,
     format_community,
-    format_dm_events,
     format_dm_send_result,
     format_error,
     format_tweet,

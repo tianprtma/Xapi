@@ -22,6 +22,10 @@ Environment variables (optional):
 
 from __future__ import annotations
 
+import logging
+import os
+import secrets
+import uuid as _uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -35,6 +39,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from playwright_search import PlaywrightPool
 
 from app.client_pool import ClientPool
+from app.observability import install_observability
 from app.openapi_tags import OPENAPI_TAGS, install_auto_tagger
 from app.routers import (
     birdwatch,
@@ -60,22 +65,36 @@ DOCS_UI_SERVE = DOCS_UI_DIST if DOCS_UI_DIST.is_dir() else DOCS_UI_DIR
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    """Startup pre-warm + shutdown cleanup.
+    """Startup pre-warm + graceful shutdown.
 
-    Pre-warm Playwright browser supaya request pertama tidak nunggu Chromium
-    init (~2-3s). Browser tetap satu shared instance.
+    Shutdown order: Playwright browser → ClientPool → SessionStore.
+    Each step is isolated so one stuck component doesn't block others from closing.
     """
     # Pre-warm di background — non-blocking startup.
     import asyncio
+
     asyncio.create_task(PlaywrightPool.get().warmup())
     yield
-    await PlaywrightPool.get().close()
-    await ClientPool.get().close_all()
+    # Graceful shutdown — ordered, isolated
+    shutdown_log = logging.getLogger("xapi.shutdown")
+
+    # 1. Playwright browser (depends on nothing)
     try:
-        from app.xchat.bridge import XChatBridgeRegistry
-        await XChatBridgeRegistry.get().close_all()
-    except Exception:  # noqa: BLE001
-        pass
+        await asyncio.wait_for(PlaywrightPool.get().close(), timeout=10.0)
+        shutdown_log.info("playwright closed")
+    except asyncio.TimeoutError:
+        shutdown_log.warning("playwright close timed out after 10s")
+    except Exception:
+        shutdown_log.exception("playwright close failed")
+
+    # 3. Client pool (depends on nothing after PW is done)
+    try:
+        await asyncio.wait_for(ClientPool.get().close_all(), timeout=5.0)
+        shutdown_log.info("client pool closed")
+    except asyncio.TimeoutError:
+        shutdown_log.warning("client pool close timed out after 5s")
+    except Exception:
+        shutdown_log.exception("client pool close failed")
 
 
 app = FastAPI(
@@ -122,6 +141,10 @@ async def _redoc_ui():
         redoc_js_url=_REDOC_JS,
     )
 
+# Per-worker identity — generated at startup for cache-fragmentation diagnostics.
+WORKER_ID: str = _uuid.uuid4().hex[:8]
+
+
 # Mount routers — order doesn't matter, but listed by tag priority.
 app.include_router(infra.router)
 app.include_router(trends.router)
@@ -136,8 +159,10 @@ app.include_router(dm.router)
 app.include_router(spaces.router)
 app.include_router(media.router)
 
+
 install_security_middleware(app)
 install_auto_tagger(app)
+install_observability(app)
 
 
 @app.exception_handler(StarletteHTTPException)
@@ -149,20 +174,26 @@ async def _api_404_handler(request, exc):
     """
     p = request.url.path
     if exc.status_code == 404 and (p.startswith("/2/") or p in ("/login", "/info", "/search", "/admin/stats", "/docs", "/openapi.json", "/redoc")):
+        from app.errors import build_error
         return JSONResponse(
             status_code=404,
-            content={
-                "errors": [{
-                    "title": "Not Found",
-                    "detail": f"no API route matches {request.method} {p}",
-                    "type": "not_found",
-                    "status": 404,
-                }]
-            },
+            content=build_error("INFRA_NOT_FOUND", method=request.method, path=p),
         )
     # Default: re-raise untuk dapet HTML dari static mount, atau
     # default Starlette response.
     return await http_exception_handler(request, exc)
+
+
+@app.exception_handler(Exception)
+async def _global_500_handler(request, exc):
+    """Catch unhandled exceptions — return consistent JSON."""
+    import logging
+    logging.getLogger("xapi").exception("Unhandled exception: %s", exc)
+    from app.errors import build_error
+    return JSONResponse(
+        status_code=500,
+        content=build_error("INFRA_INTERNAL_ERROR"),
+    )
 
 
 # Static docs-ui at `/`. Prefer pre-compiled dist/ kalau ada (no Babel) —
@@ -202,9 +233,22 @@ if __name__ == "__main__":
     workers = int(os.environ.get("WEB_CONCURRENCY", "1"))
     if workers > 1:
         sys.stderr.write(
-            "WARNING: Xapi caches (SessionStore, ResponseCache, ContextPool) "
-            "are per-worker in-memory. With WEB_CONCURRENCY>1 each worker has "
-            "duplicate cache → ~Nx memory + ~N-1x cache miss antar worker. "
-            "Recommended: workers=1 + horizontal scale via reverse proxy/multiple instances.\n"
+            f"[Xapi WORKER={WORKER_ID}] WARNING: Xapi caches (SessionStore, ResponseCache, "
+            f"ClientPool) are per-worker in-memory. With WEB_CONCURRENCY={workers} each worker "
+            f"has duplicate cache → ~{workers}x memory + ~{workers-1}x cache miss antar worker. "
+            f"Recommended: workers=1 + horizontal scale via reverse proxy/multiple instances.\n"
         )
-    uvicorn.run(app, host="0.0.0.0", port=8000, workers=workers)
+    sys.stderr.write(
+        f"[Xapi WORKER={WORKER_ID}] Starting on 0.0.0.0:8000 "
+        f"(WEB_CONCURRENCY={workers})\n"
+    )
+    import uvicorn.config as _uv_config
+    config = _uv_config.Config(
+        app=app,
+        host="0.0.0.0",
+        port=8000,
+        workers=workers,
+        server_header=False,
+    )
+    server = uvicorn.Server(config=config)
+    server.run()

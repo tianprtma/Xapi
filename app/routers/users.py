@@ -20,7 +20,6 @@ from formatter import (
     format_birdwatch_notes_slice,
     format_bookmark_folders,
     format_community,
-    format_dm_events,
     format_dm_send_result,
     format_error,
     format_tweet,
@@ -65,7 +64,7 @@ from ..config import (
     WEB_BEARER,
 )
 from ..playwright_helpers import resolve_screen_name, tweet_author_handle
-from ..responses import finalize, stub_501, wrap, write_finalize
+from ..responses import batch_finalize, finalize, stub_501, wrap, write_finalize
 
 
 router = APIRouter(tags=["Users"])
@@ -94,7 +93,7 @@ async def v2_users_bulk(
     auth_token: Optional[str] = Query(None),
     raw: int = Query(0),
 ) -> JSONResponse:
-    """GET /2/users?ids=1,2,3 — fan-out via UserByRestId (Playwright, bisa lambat)."""
+    """GET /2/users?ids=1,2,3 — fan-out via UserByRestId GraphQL."""
     tok = extract_bearer(authorization, auth_token)
     id_list = [i.strip() for i in ids.split(",") if i.strip()][:100]
     if not id_list:
@@ -104,12 +103,8 @@ async def v2_users_bulk(
 
     async def _one(uid: str) -> dict[str, Any]:
         try:
-            pw = await fetch_via_browser(
-                auth_token=tok,
-                navigate_url=f"https://x.com/i/user/{uid}",
-                match_path=["/UserByRestId", "/UserByScreenName"],
-            )
-            return {"id": uid, "data": pw.get("data"), "status": pw.get("status")}
+            r = await graphql_call("UserByRestId", {"userId": uid, "withSafetyModeUserFields": True}, tok)
+            return {"id": uid, "data": r.get("data"), "status": r.get("status", "ok")}
         except Exception as e:  # noqa: BLE001
             return {"id": uid, "status": "error", "error": str(e)}
 
@@ -130,7 +125,7 @@ async def v2_users_bulk(
             data.append(formatted["data"])
     out: dict[str, Any] = {"data": data, "meta": {"result_count": len(data)}}
     if errors: out["errors"] = errors
-    return JSONResponse(status_code=200, content=out)
+    return batch_finalize(out)
 
 
 @router.get("/2/users/by")
@@ -168,7 +163,7 @@ async def v2_users_by_usernames(
             data.append(f["data"])
     out: dict[str, Any] = {"data": data, "meta": {"result_count": len(data)}}
     if errors: out["errors"] = errors
-    return JSONResponse(status_code=200, content=out)
+    return batch_finalize(out)
 
 
 @router.get("/2/users/by/username/{username}")
@@ -670,12 +665,12 @@ async def v2_unpin_tweet(
 
 
 @router.get("/2/users/{user_id}/public_keys")
-async def v2_user_public_keys(user_id: str = PathParam(...)) -> JSONResponse:
+async def v2_user_public_keys(user_id: str = PathParam(..., pattern=r"^\d+$")) -> JSONResponse:
     return stub_501(feature="user_public_keys", reason="X PassKey/E2EE public keys belum di-discover.")
 
 
 @router.post("/2/users/{user_id}/public_keys")
-async def v2_user_public_keys_post(user_id: str = PathParam(...)) -> JSONResponse:
+async def v2_user_public_keys_post(user_id: str = PathParam(..., pattern=r"^\d+$")) -> JSONResponse:
     return stub_501(feature="user_public_keys_post", reason="X PassKey/E2EE public keys belum di-discover.")
 
 

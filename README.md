@@ -2,7 +2,7 @@
 
 Mirror endpoint X API v2 (`docs.x.com/x-api`) lewat cookie `auth_token`. Backend: GraphQL via httpx + Playwright fallback untuk endpoint CF-gated.
 
-- **119 routes** mirror v2 (read + write + DM + lists + media + community notes + trends)
+- **~115 routes** mirror v2 (read + write + DM + lists + media + community notes + trends)
 - **Docs UI** built-in di `/` (interactive reference + try-it console)
 - **OpenAPI/Swagger** di `/docs`
 
@@ -109,11 +109,6 @@ Semua endpoint butuh `auth_token` cookie. Token di-pass via:
 | GET | `/2/users/{id}/bookmarks` | httpx | Bookmarks (own only) |
 | GET | `/2/users/{id}/bookmarks/folders` | httpx | BookmarkFoldersSlice |
 | GET | `/2/users/{id}/bookmarks/folders/{folder_id}` | httpx | BookmarkFolderTimeline |
-| GET | `/2/dm_events` | DM | inbox events |
-| GET | `/2/dm_conversations/{id}/dm_events` | DM | conversation events |
-| GET | `/2/dm_conversations/with/{participant_id}/dm_events` | DM | events with user |
-| GET | `/2/dm_events/{event_id}` | DM | single event |
-| GET | `/2/dm_conversations/media/{dm_id}/{media_id}/{resource_id}` | DM | proxy stream binary media |
 | GET | `/2/communities/{id}` | httpx | CommunityByRestId |
 | GET | `/2/notes/search/notes_written?alias=` | httpx | Birdwatch contributor notes |
 | GET | `/2/notes/search/posts_eligible_for_notes?tweet_id=` | httpx | Birdwatch BatSignal |
@@ -162,23 +157,6 @@ Semua endpoint butuh `auth_token` cookie. Token di-pass via:
 | POST | `/2/notes` | GraphQL | submit Birdwatch note |
 | POST | `/2/evaluate_note` | GraphQL | rate Birdwatch note |
 | DELETE | `/2/notes/{id}` | GraphQL | delete Birdwatch note |
-
-### DM features (beyond v2 spec)
-
-Parameter query khusus di `GET /2/dm_events`:
-
-| Param | Default | Note |
-|---|---|---|
-| `include_requests` | `1` | Include Message Requests inbox (untrusted senders). Set `0` untuk inbox utama saja. |
-| `xchat_user_id` | — | Numeric bot ID. Kalau diisi, merge plaintext E2E XChat dari `chat_{userId}.db` (OPFS) |
-
-Non-standard response fields:
-
-| Field | Note |
-|---|---|
-| `_xapi_attachments` | Array `[{url, media_id, resource_id, original_url}]`. URL di dalam field ini bisa di-download via `GET /2/dm_conversations/media/{dm_id}/{media_id}/{resource_id}`. |
-| `_sender_follows_owner` | `true`/`false` — hanya muncul di event dari Message Requests inbox (`include_requests=1`). |
-| `_xchat` | `true` jika event berasal dari XChat E2E database (bukan REST inbox). |
 
 ### Query param umum
 

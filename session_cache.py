@@ -19,6 +19,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from app.config import token_key
 
 TTL_SECONDS = 300  # 5 menit
 MAX_SESSIONS = 5000
@@ -36,10 +37,10 @@ class Session:
     last_used: float = field(default_factory=time.time)
 
     def is_alive(self, ttl: float = TTL_SECONDS) -> bool:
-        return (time.time() - self.created_at) < ttl
+        return (time.time() - self.last_used) < ttl
 
     def viewer_alive(self, ttl: float = TTL_SECONDS) -> bool:
-        return self.viewer is not None and (time.time() - self.viewer_at) < ttl
+        return self.viewer is not None and (time.time() - self.last_used) < ttl
 
 
 class SessionStore:
@@ -58,14 +59,15 @@ class SessionStore:
         return cls._instance
 
     async def lookup(self, auth_token: str, ttl: float = TTL_SECONDS) -> Optional[Session]:
+        key = token_key(auth_token)
         async with self._lock:
-            sess = self._cache.get(auth_token)
+            sess = self._cache.get(key)
             if sess and sess.is_alive(ttl):
                 sess.last_used = time.time()
-                self._cache.move_to_end(auth_token)
+                self._cache.move_to_end(key)
                 return sess
             if sess:
-                self._cache.pop(auth_token, None)
+                self._cache.pop(key, None)
             return None
 
     async def store(
@@ -75,6 +77,7 @@ class SessionStore:
         cookies: dict[str, str],
         user_id: Optional[str] = None,
     ) -> Session:
+        key = token_key(auth_token)
         async with self._lock:
             sess = Session(
                 auth_token=auth_token,
@@ -82,33 +85,36 @@ class SessionStore:
                 cookies=cookies,
                 user_id=user_id,
             )
-            self._cache[auth_token] = sess
-            self._cache.move_to_end(auth_token)
+            self._cache[key] = sess
+            self._cache.move_to_end(key)
             while len(self._cache) > MAX_SESSIONS:
                 self._cache.popitem(last=False)
             return sess
 
     async def store_viewer(self, auth_token: str, viewer_payload: dict[str, Any]) -> None:
         """Cache viewer/login result untuk /2/users/me fast path."""
+        key = token_key(auth_token)
         async with self._lock:
-            sess = self._cache.get(auth_token)
+            sess = self._cache.get(key)
             if sess:
                 sess.viewer = viewer_payload
                 sess.viewer_at = time.time()
-                self._cache.move_to_end(auth_token)
+                self._cache.move_to_end(key)
 
     async def lookup_viewer(self, auth_token: str, ttl: float = TTL_SECONDS) -> Optional[dict[str, Any]]:
+        key = token_key(auth_token)
         async with self._lock:
-            sess = self._cache.get(auth_token)
+            sess = self._cache.get(key)
             if sess and sess.viewer_alive(ttl):
                 sess.last_used = time.time()
-                self._cache.move_to_end(auth_token)
+                self._cache.move_to_end(key)
                 return sess.viewer
             return None
 
     async def invalidate(self, auth_token: str) -> None:
+        key = token_key(auth_token)
         async with self._lock:
-            self._cache.pop(auth_token, None)
+            self._cache.pop(key, None)
 
     async def stats(self) -> dict[str, int]:
         async with self._lock:

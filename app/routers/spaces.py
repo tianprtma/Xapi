@@ -20,7 +20,6 @@ from formatter import (
     format_birdwatch_notes_slice,
     format_bookmark_folders,
     format_community,
-    format_dm_events,
     format_dm_send_result,
     format_error,
     format_tweet,
@@ -128,7 +127,7 @@ async def v2_spaces_topics(
     description="Single Space lookup by ID — `AudioSpaceById` GraphQL (includes replays + listeners).",
 )
 async def v2_space_by_id(
-    space_id: str = PathParam(...),
+    space_id: str = PathParam(..., pattern=r"^[A-Za-z0-9]+$"),
     authorization: Optional[str] = Header(None),
     auth_token: Optional[str] = Query(None),
     raw: int = Query(0),
@@ -145,7 +144,7 @@ async def v2_space_by_id(
 
 
 @router.get("/2/spaces/{space_id}/buyers")
-async def v2_space_buyers(space_id: str = PathParam(...)) -> JSONResponse:
+async def v2_space_buyers(space_id: str = PathParam(..., pattern=r"^[A-Za-z0-9]+$")) -> JSONResponse:
     return stub_501(feature="space_buyers", reason=OAUTH2_USER_CTX_REASON)
 
 
@@ -161,7 +160,7 @@ async def v2_spaces_by_creator() -> JSONResponse:
 
 
 @router.get("/2/spaces/{space_id}/tweets")
-async def v2_space_tweets(space_id: str = PathParam(...)) -> JSONResponse:
+async def v2_space_tweets(space_id: str = PathParam(..., pattern=r"^[A-Za-z0-9]+$")) -> JSONResponse:
     return stub_501(
         feature="space_tweets",
         reason=(

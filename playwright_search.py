@@ -14,14 +14,20 @@ Trade-off:
 Concurrency: PLAYWRIGHT_MAX_CONCURRENT (default 4) batasi number of pages
 yang aktif paralel — di luar limit, request antri di asyncio.Semaphore.
 Tanpa cap, headless Chrome bisa OOM saat >10 concurrent pages.
+
+In-flight coalescing: identical concurrent requests (same op + token + vars)
+share a single browser page. The first caller runs the operation; waiters
+receive the same result when the page finishes. Eliminates redundant ~3-6s
+headless Chrome calls when e.g. a worker fan-out hits the same endpoint.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
-from typing import Any, Literal, Optional
+from typing import Any, Callable, Coroutine, Literal, Optional
 
 from playwright.async_api import (
     Browser,
@@ -29,6 +35,8 @@ from playwright.async_api import (
     Response,
     async_playwright,
 )
+
+log = logging.getLogger(__name__)
 
 SearchType = Literal["Latest", "Top", "People", "Media"]
 
@@ -43,6 +51,95 @@ URL_FILTER = {
 # Cap concurrent Playwright operations (browser pages aktif). Default 4 pages —
 # tweak via env. Headless Chrome ~80-150MB per page, jadi 4 = ~600MB RAM peak.
 PLAYWRIGHT_MAX_CONCURRENT = int(os.environ.get("PLAYWRIGHT_MAX_CONCURRENT", "4"))
+
+
+# ──────────────────────────── In-flight coalescer ────────────────────────────
+
+
+class _InFlightCoalescer:
+    """Deduplicate identical concurrent Playwright calls.
+
+    Two callers asking for the same (op, key, vars) at the same time share
+    one page — the second caller waits for the first's result instead of
+    spawning its own Chromium page (saving ~80-150MB + 3-6s).
+    """
+
+    def __init__(self) -> None:
+        self._pending: dict[str, asyncio.Event] = {}
+        self._results: dict[str, dict[str, Any]] = {}
+        self._lock = asyncio.Lock()
+
+    async def run(
+        self,
+        key: str,
+        fn: Callable[[], Coroutine[Any, Any, dict[str, Any]]],
+    ) -> dict[str, Any]:
+        """Execute `fn()` once per unique `key` across concurrent callers.
+
+        If another caller is already executing for this key, wait for its
+        result. Otherwise execute and broadcast.
+        """
+        async with self._lock:
+            existing = self._pending.get(key)
+            if existing is not None:
+                pass  # Another caller is running — wait below
+            else:
+                self._pending[key] = asyncio.Event()
+
+        if existing is not None:
+            # Waiter path: block until executor stores result, then take it
+            await existing.wait()
+            stored = self._results.pop(key, None)
+            if stored is None:
+                raise RuntimeError(f"coalesced call for {key} failed upstream")
+            if isinstance(stored, Exception):
+                raise stored
+            return stored
+
+        # Executor path: run fn(), store result (or exception), wake waiters
+        exc: BaseException | None = None
+        result: dict[str, Any] | None = None
+        try:
+            result = await fn()
+            return result
+        except BaseException as e:
+            exc = e
+            raise
+        finally:
+            # Always store something before setting event, so waiters never
+            # hang. Store exception object on failure so waiters see it.
+            async with self._lock:
+                if exc is not None:
+                    self._results[key] = exc  # waiter will re-raise
+                elif result is not None:
+                    self._results[key] = result
+                self._pending.pop(key, None).set()
+
+
+_coalescer = _InFlightCoalescer()
+
+
+def _search_key(auth_token: str, q: str, search_type: SearchType) -> str:
+    import hashlib
+    from app.config import token_key
+    return f"search:{token_key(auth_token)}:{q}:{search_type}"
+
+
+def _fetch_key(auth_token: str, navigate_url: str, match_path: str | list[str], click_selector: str | None = None) -> str:
+    import hashlib
+    from app.config import token_key
+    cs = click_selector or ""
+    mp = match_path if isinstance(match_path, str) else "|".join(sorted(match_path))
+    return f"fetch:{token_key(auth_token)}:{navigate_url}:{mp}:{cs}"
+
+
+def _click_key(auth_token: str, navigate_url: str, click_selector: str, match_response_substr: str | list[str] | None = None) -> str:
+    import hashlib
+    from app.config import token_key
+    mr = ""
+    if match_response_substr:
+        mr = match_response_substr if isinstance(match_response_substr, str) else "|".join(sorted(match_response_substr))
+    return f"click:{token_key(auth_token)}:{navigate_url}:{click_selector}:{mr}"
 
 
 class PlaywrightPool:
@@ -116,6 +213,8 @@ async def _new_context(browser: Browser, auth_token: str) -> BrowserContext:
         viewport={"width": 1280, "height": 800},
         locale="en-US",
     )
+    # ct0 — X CSRF token, needed by ton.twitter.com alongside auth_token
+    _ct0 = secrets.token_hex(16)
     await context.add_cookies(
         [
             {
@@ -126,7 +225,25 @@ async def _new_context(browser: Browser, auth_token: str) -> BrowserContext:
                 "httpOnly": True,
                 "secure": True,
                 "sameSite": "None",
-            }
+            },
+            {
+                "name": "auth_token",
+                "value": auth_token,
+                "domain": ".twitter.com",
+                "path": "/",
+                "httpOnly": True,
+                "secure": True,
+                "sameSite": "None",
+            },
+            {
+                "name": "ct0",
+                "value": _ct0,
+                "domain": ".twitter.com",
+                "path": "/",
+                "httpOnly": False,
+                "secure": True,
+                "sameSite": "None",
+            },
         ]
     )
     return context
@@ -216,7 +333,23 @@ async def click_action_via_browser(
     `match_response_substr` = string/list yang harus ada di URL response untuk di-capture.
 
     Concurrency: page lifecycle di-batasi `PlaywrightPool.semaphore`.
+    Identical concurrent clicks coalesce.
     """
+    key = _click_key(auth_token, navigate_url, click_selector, match_response_substr)
+    return await _coalescer.run(key, lambda: _click_coalesced(
+        auth_token, navigate_url, click_selector, confirm_selector,
+        match_response_substr, timeout,
+    ))
+
+
+async def _click_coalesced(
+    auth_token: str,
+    navigate_url: str,
+    click_selector: str,
+    confirm_selector: Optional[str],
+    match_response_substr: Optional[str | list[str]],
+    timeout: float,
+) -> dict[str, Any]:
     async with PlaywrightPool.get().semaphore:
         return await _click_action_via_browser_impl(
             auth_token, navigate_url, click_selector, confirm_selector,
@@ -330,6 +463,7 @@ async def _action_via_browser_impl(
     content_type: str = "application/json",
     timeout: float = 25.0,
 ) -> dict[str, Any]:
+    from app.config import WEB_BEARER
     context = await ContextPool.get().acquire(auth_token)
     page = await context.new_page()
 
@@ -347,14 +481,13 @@ async def _action_via_browser_impl(
             body_str = body or ""
 
         result = await page.evaluate(
-            """async ({url, method, body, contentType}) => {
-                // Ambil ct0 dari cookie
+            """async ({url, method, body, contentType, bearer}) => {
                 const ct0 = (document.cookie.match(/ct0=([^;]+)/) || [])[1] || "";
                 const opts = {
                     method,
                     credentials: "include",
                     headers: {
-                        "authorization": "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA",
+                        "authorization": "Bearer " + bearer,
                         "content-type": contentType,
                         "x-csrf-token": ct0,
                         "x-twitter-auth-type": "OAuth2Session",
@@ -369,7 +502,7 @@ async def _action_via_browser_impl(
                 try { json = JSON.parse(txt); } catch (e) {}
                 return { status: r.status, body: json !== null ? json : txt };
             }""",
-            {"url": url, "method": method, "body": body_str, "contentType": content_type},
+            {"url": url, "method": method, "body": body_str, "contentType": content_type, "bearer": WEB_BEARER},
         )
 
         cookies = await context.cookies()
@@ -383,14 +516,12 @@ async def _action_via_browser_impl(
                 "status": "error",
                 "http_status": status_code,
                 "error": payload,
-                "cookies": cookie_dict,
                 "data": None,
             }
 
         return {
             "status": "ok",
             "http_status": status_code,
-            "cookies": cookie_dict,
             "data": payload,
         }
     finally:
@@ -416,7 +547,20 @@ async def fetch_via_browser(
     yang nggak auto-fire request, mis. tab Replies).
 
     Pakai untuk endpoint GraphQL yang di-gate Cloudflare (UserByRestId, dll).
+
+    Identical concurrent fetches coalesce — share one page load.
     """
+    key = _fetch_key(auth_token, navigate_url, match_path, click_selector)
+    return await _coalescer.run(key, lambda: _fetch_coalesced(auth_token, navigate_url, match_path, timeout, click_selector))
+
+
+async def _fetch_coalesced(
+    auth_token: str,
+    navigate_url: str,
+    match_path: str | list[str],
+    timeout: float,
+    click_selector: Optional[str],
+) -> dict[str, Any]:
     async with PlaywrightPool.get().semaphore:
         return await _fetch_via_browser_impl(auth_token, navigate_url, match_path, timeout, click_selector)
 
@@ -466,9 +610,6 @@ async def _fetch_via_browser_impl(
         while "data" not in captured and asyncio.get_event_loop().time() < deadline:
             await asyncio.sleep(0.2)
 
-        cookies = await context.cookies()
-        cookie_dict = {c["name"]: c["value"] for c in cookies}
-
         if "data" not in captured:
             return {
                 "status": "error",
@@ -476,7 +617,6 @@ async def _fetch_via_browser_impl(
                 "captured_url": captured.get("url"),
                 "http_status": captured.get("status"),
                 "raw": captured.get("raw"),
-                "cookies": cookie_dict,
                 "data": None,
             }
 
@@ -484,7 +624,6 @@ async def _fetch_via_browser_impl(
             "status": "ok",
             "http_status": captured.get("status", 200),
             "captured_url": captured.get("url"),
-            "cookies": cookie_dict,
             "data": captured["data"],
         }
     finally:
@@ -504,7 +643,19 @@ async def search_via_browser(
     """
     Buka x.com/search, tangkap response SearchTimeline / adaptive.json.
     Return: {status, data: <raw GraphQL JSON>, cookies, captured_url}
+
+    Identical concurrent searches coalesce — share one page load.
     """
+    key = _search_key(auth_token, q, search_type)
+    return await _coalescer.run(key, lambda: _search_coalesced(auth_token, q, search_type, timeout))
+
+
+async def _search_coalesced(
+    auth_token: str,
+    q: str,
+    search_type: SearchType,
+    timeout: float,
+) -> dict[str, Any]:
     async with PlaywrightPool.get().semaphore:
         return await _search_via_browser_impl(auth_token, q, search_type, timeout)
 
@@ -558,9 +709,6 @@ async def _search_via_browser_impl(
         while "data" not in captured and asyncio.get_event_loop().time() < deadline:
             await asyncio.sleep(0.2)
 
-        cookies = await context.cookies()
-        cookie_dict = {c["name"]: c["value"] for c in cookies}
-
         if "data" not in captured:
             return {
                 "status": "error",
@@ -568,7 +716,6 @@ async def _search_via_browser_impl(
                 "captured_url": captured.get("url"),
                 "http_status": captured.get("status"),
                 "raw": captured.get("raw"),
-                "cookies": cookie_dict,
                 "data": None,
             }
 
@@ -576,7 +723,6 @@ async def _search_via_browser_impl(
             "status": "ok",
             "http_status": captured.get("status", 200),
             "captured_url": captured.get("url"),
-            "cookies": cookie_dict,
             "data": captured["data"],
         }
     finally:

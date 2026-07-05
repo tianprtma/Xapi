@@ -203,8 +203,16 @@ def _dm_attachment_obj(m: dict[str, Any]) -> dict[str, Any]:
 
 
 def format_tweet(gql: dict[str, Any]) -> dict[str, Any]:
-    """Format TweetResultByRestId."""
-    tw = (gql or {}).get("data", {}).get("tweetResult", {}).get("result", {})
+    """Format TweetResultByRestId / CreateTweet."""
+    data = (gql or {}).get("data", {})
+    # Try TweetResultByRestId path first
+    tw = data.get("tweetResult", {}).get("result", {})
+    if not tw:
+        # Try CreateTweet path (tweet_results.result format)
+        tw = data.get("create_tweet", {}).get("tweet_results", {}).get("result", {})
+    if not tw:
+        # Try CreateTweet path (tweet format — actual CreateTweet GQL response)
+        tw = data.get("create_tweet", {}).get("tweet", {})
     obj = _tweet_result_to_obj(tw)
     if not obj:
         return {"errors": [{"title": "Not Found", "detail": "Tweet not found", "type": "not_found"}]}
@@ -240,7 +248,7 @@ def _collect_includes_from_tweet(tweet_result: dict[str, Any]) -> dict[str, list
         qcore = quoted.get("core", {}) or {}
         qauthor = qcore.get("user_results", {}).get("result", {}) if qcore else {}
         qa = _user_result_to_obj(qauthor)
-        if qa and qa["id"] not in {u["id"] for u in includes["users"]}:
+        if qa and qa.get("id") and qa["id"] not in {u["id"] for u in includes["users"] if u.get("id")}:
             includes["users"].append(qa)
 
     return {k: v for k, v in includes.items() if v}
@@ -667,67 +675,6 @@ def _dm_ts_to_iso(ts: Any) -> Optional[str]:
         return str(ts)
 
 
-def format_dm_events(payload: dict[str, Any]) -> dict[str, Any]:
-    """
-    Format REST 1.1 dm/user_updates atau dm/conversation/{id} → v2 dm_events shape.
-
-    Sumber kemungkinan:
-      - inbox_initial_state.entries (user_updates)
-      - conversation_timeline.entries (conversation/{id})
-      - inbox_timeline (dm/inbox_timeline/{trusted,untrusted}.json)
-    """
-    data: list[dict[str, Any]] = []
-    users: dict[str, dict] = {}
-    convs: dict[str, dict] = {}
-
-    inbox = (
-        (payload or {}).get("inbox_initial_state")
-        or (payload or {}).get("user_events")
-        or (payload or {}).get("conversation_timeline")
-        or (payload or {}).get("inbox_timeline")
-        or {}
-    )
-
-    raw_users_src = inbox.get("users") or {}
-
-    for ev in inbox.get("entries", []) or []:
-        for k, v in ev.items():
-            obj = _dm_event_to_obj({**v, "type": k}, users=raw_users_src)
-            if obj:
-                data.append(obj)
-
-    for uid, u in (raw_users_src or {}).items():
-        uo = _dm_user_obj(u)
-        if uo and uo["id"]:
-            users[uo["id"]] = uo
-
-    raw_convs = inbox.get("conversations") or {}
-    for cid, conv in (raw_convs or {}).items():
-        convs[cid] = {
-            "id": cid,
-            "type": conv.get("type"),
-            "name": conv.get("name"),
-            "participant_ids": [str(p.get("user_id")) for p in conv.get("participants", [])],
-            "created_at": _dm_ts_to_iso(conv.get("create_time")),
-            "last_read_event_id": conv.get("last_read_event_id"),
-        }
-
-    meta: dict[str, Any] = {"result_count": len(data)}
-    cursor = inbox.get("min_entry_id") or inbox.get("cursor")
-    if cursor:
-        meta["next_token"] = str(cursor)
-
-    out: dict[str, Any] = {"data": data, "meta": meta}
-    includes: dict[str, Any] = {}
-    if users:
-        includes["users"] = list(users.values())
-    if convs:
-        includes["dm_conversations"] = list(convs.values())
-    if includes:
-        out["includes"] = includes
-    return out
-
-
 def format_dm_send_result(payload: dict[str, Any]) -> dict[str, Any]:
     """
     Format response dm/new2.json (single message create) → v2 send DM result.
@@ -745,3 +692,4 @@ def format_dm_send_result(payload: dict[str, Any]) -> dict[str, Any]:
             if obj and obj.get("id"):
                 return {"data": {"dm_conversation_id": obj.get("dm_conversation_id"), "dm_event_id": obj["id"]}}
     return {"data": payload}
+

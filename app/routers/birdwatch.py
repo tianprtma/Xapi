@@ -20,7 +20,6 @@ from formatter import (
     format_birdwatch_notes_slice,
     format_bookmark_folders,
     format_community,
-    format_dm_events,
     format_dm_send_result,
     format_error,
     format_tweet,
@@ -107,11 +106,12 @@ async def v2_evaluate_note(
         "suggestion": body.suggestion,
     }
     result = await graphql_call("BirdwatchCreateRating", variables, tok, method="POST")
-    if raw:
-        return wrap(result)
-    if result["status"] != "ok":
-        return write_finalize(result, raw=False)
-    return JSONResponse(status_code=201, content=format_birdwatch_note_result(result.get("data") or {}))
+    return write_finalize(
+        result,
+        raw=bool(raw),
+        formatter=format_birdwatch_note_result,
+        success_status=201,
+    )
 
 
 @router.post("/2/notes")
@@ -130,11 +130,12 @@ async def v2_notes_create(
         "data_v1": body.data,
     }
     result = await graphql_call("BirdwatchCreateNote", variables, tok, method="POST")
-    if raw:
-        return wrap(result)
-    if result["status"] != "ok":
-        return write_finalize(result, raw=False)
-    return JSONResponse(status_code=201, content=format_birdwatch_note_result(result.get("data") or {}))
+    return write_finalize(
+        result,
+        raw=bool(raw),
+        formatter=format_birdwatch_note_result,
+        success_status=201,
+    )
 
 
 @router.get("/2/notes/search/notes_written")
@@ -170,7 +171,7 @@ async def v2_notes_eligible_posts(
 
 @router.delete("/2/notes/{note_id}")
 async def v2_notes_delete(
-    note_id: str = PathParam(...),
+    note_id: str = PathParam(..., pattern=r"^\d+$"),
     authorization: Optional[str] = Header(None),
     auth_token: Optional[str] = Query(None),
     raw: int = Query(0),

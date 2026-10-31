@@ -7,6 +7,8 @@ in main.py via `app.include_router`.
 
 from __future__ import annotations
 
+import os
+import sqlite3
 from typing import Any, Optional
 
 import httpx
@@ -365,6 +367,38 @@ async def v2_unmute(
     return write_finalize(result, raw=bool(raw))
 
 
+BOT_DB_PATH = os.environ.get(
+    "BOT_DB_PATH", "/opt/jkt48history/data/bot.db")
+
+
+def _cached_profile(user_id: str) -> Optional[dict[str, Any]]:
+    """V2 user object dari snapshot profil bot DB (read-only, tanpa browser)."""
+    try:
+        conn = sqlite3.connect(f"file:{BOT_DB_PATH}?mode=ro", uri=True, timeout=5)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT name, username, description, image_url, website,"
+            " followers_count, verified FROM profile_snapshots"
+            " WHERE member_id = ? ORDER BY captured_at DESC LIMIT 1",
+            (user_id,)).fetchone()
+        conn.close()
+    except Exception:  # noqa: BLE001
+        return None
+    if row is None:
+        return None
+    return {
+        "id": user_id,
+        "name": row["name"] or "",
+        "username": row["username"] or "",
+        "description": row["description"] or "",
+        "profile_image_url": row["image_url"] or "",
+        "url": row["website"] or "",
+        "verified": bool(row["verified"]),
+        "protected": False,
+        "public_metrics": {"followers_count": row["followers_count"] or 0},
+    }
+
+
 @router.get("/2/users/{user_id}")
 async def v2_user_by_id(
     user_id: str = PathParam(..., pattern=r"^\d+$"),
@@ -378,19 +412,34 @@ async def v2_user_by_id(
         "UserByRestId", {"userId": user_id, "withSafetyModeUserFields": True}, tok
     )
     if result.get("status") != "ok":
-        pw = await fetch_via_browser(
-            auth_token=tok,
-            navigate_url=f"https://x.com/i/user/{user_id}",
-            match_path=["/UserByRestId", "/UserByScreenName"],
+        # Fallback TANPA Playwright (hemat RAM — Chromium besar dan sering
+        # terpicu saat rate limit): serve dari cache snapshot profil.
+        cached = await _cached_profile(user_id)
+        if cached is not None:
+            return JSONResponse(content={"data": cached})
+        # Playwright hanya bila diizinkan eksplisit (PLAYWRIGHT_FALLBACK=1)
+        if os.environ.get("PLAYWRIGHT_FALLBACK", "0") == "1":
+            pw = await fetch_via_browser(
+                auth_token=tok,
+                navigate_url=f"https://x.com/i/user/{user_id}",
+                match_path=["/UserByRestId", "/UserByScreenName"],
+            )
+            result = {
+                "status": pw["status"],
+                "http_status": pw.get("http_status", 200),
+                "operation": "UserByRestId",
+                "engine": "playwright",
+                "data": pw.get("data"),
+                "error": pw.get("error"),
+            }
+            return finalize(result, format_user, raw=bool(raw))
+        return JSONResponse(
+            status_code=result.get("http_status") or 502,
+            content=format_error(
+                "Upstream Error",
+                "UserByRestId gagal dan tidak ada cache profil",
+                "upstream_error", result.get("http_status") or 502),
         )
-        result = {
-            "status": pw["status"],
-            "http_status": pw.get("http_status", 200),
-            "operation": "UserByRestId",
-            "engine": "playwright",
-            "data": pw.get("data"),
-            "error": pw.get("error"),
-        }
     return finalize(result, format_user, raw=bool(raw))
 
 

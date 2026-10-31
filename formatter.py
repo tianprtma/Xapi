@@ -23,9 +23,11 @@ def _user_result_to_obj(user_result: dict[str, Any]) -> Optional[dict[str, Any]]
 
     legacy = user_result.get("legacy", {}) or {}
     core = user_result.get("core", {}) or {}
-    avatar = (user_result.get("avatar") or {}).get("image_url_https") or legacy.get(
-        "profile_image_url_https"
-    )
+    # X memindah lokasi avatar beberapa kali: avatar.image_url_https (lama),
+    # avatar.image_url (baru), legacy.profile_image_url_https (fallback).
+    _av = user_result.get("avatar") or {}
+    avatar = (_av.get("image_url_https") or _av.get("image_url")
+              or legacy.get("profile_image_url_https"))
     location = (user_result.get("location") or {}).get("location") or legacy.get("location")
 
     return {
@@ -143,14 +145,30 @@ def _build_attachments(legacy: dict[str, Any]) -> dict[str, Any]:
 
 
 def _media_obj(m: dict[str, Any]) -> dict[str, Any]:
+    kind = m.get("type")
+    url = m.get("media_url_https")
+    variants: Optional[list[dict[str, Any]]] = None
+    if kind in ("video", "animated_gif"):
+        # Video: sertakan variants + `url` = mp4 bitrate tertinggi, supaya
+        # consumer bisa download video aslinya (bukan cuma thumbnail).
+        variants = [
+            {"bitrate": v.get("bitrate"), "content_type": v.get("content_type"),
+             "url": v.get("url")}
+            for v in (m.get("video_info") or {}).get("variants") or []
+            if v.get("url")
+        ]
+        mp4s = [v for v in variants if v.get("content_type") == "video/mp4"]
+        if mp4s:
+            url = max(mp4s, key=lambda v: v.get("bitrate") or 0)["url"]
     return {
         "media_key": m.get("media_key"),
-        "type": m.get("type"),
-        "url": m.get("media_url_https"),
+        "type": kind,
+        "url": url,
         "preview_image_url": m.get("media_url_https"),
         "width": (m.get("original_info") or {}).get("width"),
         "height": (m.get("original_info") or {}).get("height"),
         "alt_text": m.get("ext_alt_text"),
+        **({"variants": variants} if variants else {}),
     }
 
 
@@ -310,6 +328,20 @@ def _walk_timeline_entries(payload: dict[str, Any]) -> tuple[list[dict], Optiona
     return entries, next_cursor, prev_cursor
 
 
+def _flatten_module_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """TimelineTimelineModule (mis. profile-conversation / reply thread) → item tunggal."""
+    out: list[dict[str, Any]] = []
+    for e in entries:
+        content = e.get("content", {}) or {}
+        if content.get("entryType") == "TimelineTimelineModule" and isinstance(content.get("items"), list):
+            for it in content["items"]:
+                if isinstance(it, dict):
+                    out.append({"content": it.get("item") or it.get("content") or it})
+        else:
+            out.append(e)
+    return out
+
+
 def _entry_to_tweet(entry: dict[str, Any]) -> Optional[dict[str, Any]]:
     content = entry.get("content", {}) or {}
     item_content = content.get("itemContent") or content.get("content") or {}
@@ -344,6 +376,7 @@ def format_tweet_collection(
 ) -> dict[str, Any]:
     """Format timeline GraphQL → {data:[...], includes:{}, meta:{}}."""
     entries, next_cursor, prev_cursor = _walk_timeline_entries(gql)
+    entries = _flatten_module_entries(entries)
 
     data: list[dict[str, Any]] = []
     users: dict[str, dict] = {}
@@ -684,7 +717,18 @@ def format_dm_send_result(payload: dict[str, Any]) -> dict[str, Any]:
         obj = _dm_event_to_obj({**ev, "type": ev.get("type") or "message_create"})
         if obj:
             return {"data": {"dm_conversation_id": obj.get("dm_conversation_id"), "dm_event_id": obj["id"]}}
-    # fallback shape
+    # fallback shapes: dm/new2.json {entries:[{message:{...}}]} atau
+    # {user_events:{entries:[{message_create:{...}}]}}
+    entries = (payload or {}).get("entries") or []
+    entries = entries + (((payload or {}).get("user_events") or {}).get("entries") or [])
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        for k, v in e.items():
+            if k in ("message", "message_create", "ParticipantInitialize", "join_conversation") and isinstance(v, dict):
+                obj = _dm_event_to_obj({**v, "type": k})
+                if obj and obj.get("id"):
+                    return {"data": {"dm_conversation_id": obj.get("dm_conversation_id"), "dm_event_id": obj["id"]}}
     entries = ((payload or {}).get("user_events") or {}).get("entries") or []
     for e in entries:
         for k, v in e.items():

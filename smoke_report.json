@@ -1,0 +1,1002 @@
+[
+  {
+    "method": "GET",
+    "path": "/info",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/openapi.json",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/docs",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/redoc",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/login",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/users/me",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/admin/stats",
+    "outcome": "PASS",
+    "status": 404,
+    "code": "INFRA_NOT_FOUND",
+    "detail": "ADMIN_TOKEN unset -> hidden"
+  },
+  {
+    "method": "POST",
+    "path": "/search",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": "legacy Playwright search"
+  },
+  {
+    "method": "GET",
+    "path": "/2/users/by/username/tianxbt",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/users/1548220745381478402/tweets",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "POST",
+    "path": "/2/lists",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/users/by/username/tianxbt",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/users/by",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/users",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/users/1391552089424158720",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/users/search",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/users/reposts_of_me",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/users/1391552089424158720/affiliates",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/users/1391552089424158720/tweets",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/users/1391552089424158720/tweets/replies",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/users/1391552089424158720/mentions",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": "username auto-resolve"
+  },
+  {
+    "method": "GET",
+    "path": "/2/users/1391552089424158720/media",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/users/1391552089424158720/liked_tweets",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/users/1391552089424158720/followers",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/users/1391552089424158720/following",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/users/1391552089424158720/blocking",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/users/1391552089424158720/muting",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/tweets",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/tweets/2112097100758704566",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/tweets/2112097100758704566/detail",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/tweets/2112097100758704566/liking_users",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/tweets/2112097100758704566/retweeted_by",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/tweets/2112097100758704566/retweets",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/tweets/2112097100758704566/quote_tweets",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/notes/search/posts_eligible_for_notes",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/tweets/search/recent",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/home_timeline",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/users/1391552089424158720/timelines/reverse_chronological",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/users/1391552089424158720/owned_lists",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/users/1391552089424158720/list_memberships",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/users/1391552089424158720/pinned_lists",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/users/1391552089424158720/followed_lists",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/lists/by/owner/1391552089424158720",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/lists/2115842556651331664",
+    "outcome": "PASS",
+    "status": 200,
+    "code": 214,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/lists/2115842556651331664/tweets",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/lists/2115842556651331664/members",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/lists/2115842556651331664/followers",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/users/1391552089424158720/bookmarks",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/users/1391552089424158720/bookmarks/folders",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/users/{id}/bookmarks/folders/{folder_id}",
+    "outcome": "SKIP",
+    "status": null,
+    "code": null,
+    "detail": "no bookmark folder"
+  },
+  {
+    "method": "GET",
+    "path": "/2/trends",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/trends/by/woeid/1",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/spaces/topics",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/spaces",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": "space may have ended"
+  },
+  {
+    "method": "GET",
+    "path": "/2/spaces/1dKrPrOnOOvJX",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": "space may have ended"
+  },
+  {
+    "method": "GET",
+    "path": "/2/communities/1941941069249380702",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/notes/search/notes_written",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/users/1548220745381478402",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "POST",
+    "path": "/2/tweets",
+    "outcome": "PASS",
+    "status": 201,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "POST",
+    "path": "/2/tweets",
+    "outcome": "PASS",
+    "status": 201,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "POST",
+    "path": "/2/tweets",
+    "outcome": "PASS",
+    "status": 201,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "PUT",
+    "path": "/2/tweets/2115842683482853789/hidden",
+    "outcome": "WARN",
+    "status": 403,
+    "code": "UPSTREAM_ERROR",
+    "detail": "X forbids hiding self-thread replies | Authorization: Failed to moderate or unmoderate because 2115842683482853789 is part of a self-thread"
+  },
+  {
+    "method": "PUT",
+    "path": "/2/tweets/2115842683482853789/hidden",
+    "outcome": "WARN",
+    "status": 403,
+    "code": "UPSTREAM_ERROR",
+    "detail": "X forbids hiding self-thread replies | Authorization: Failed to moderate or unmoderate because 2115842683482853789 is part of a self-thread"
+  },
+  {
+    "method": "POST",
+    "path": "/2/users/1391552089424158720/likes",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "DELETE",
+    "path": "/2/users/1391552089424158720/likes/2115842681868083383",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "POST",
+    "path": "/2/users/1391552089424158720/retweets",
+    "outcome": "WARN",
+    "status": 403,
+    "code": "UPSTREAM_ERROR",
+    "detail": "X replica lag: delete may take minutes to propagate | Authorization: You have already retweeted this Tweet. (327)"
+  },
+  {
+    "method": "DELETE",
+    "path": "/2/users/1391552089424158720/retweets/2112097100758704566",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "POST",
+    "path": "/2/users/1391552089424158720/retweets",
+    "outcome": "WARN",
+    "status": 403,
+    "code": "UPSTREAM_ERROR",
+    "detail": "X eventual consistency: delete may lag | Authorization: You have already retweeted this Tweet. (327)"
+  },
+  {
+    "method": "DELETE",
+    "path": "/2/users/1391552089424158720/retweets/by/source_tweet_id/2112097100758704566",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "POST",
+    "path": "/2/users/1391552089424158720/bookmarks",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "DELETE",
+    "path": "/2/users/1391552089424158720/bookmarks/2115842681868083383",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "POST",
+    "path": "/2/users/1391552089424158720/pinned_tweets",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "DELETE",
+    "path": "/2/users/1391552089424158720/pinned_tweets/2115842681868083383",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "POST",
+    "path": "/2/media/upload",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "POST",
+    "path": "/2/media/metadata",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "POST",
+    "path": "/2/tweets",
+    "outcome": "PASS",
+    "status": 201,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "POST",
+    "path": "/2/users/1391552089424158720/following",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "POST",
+    "path": "/2/users/1391552089424158720/muting",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "POST",
+    "path": "/2/users/1391552089424158720/blocking",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "DELETE",
+    "path": "/2/users/1391552089424158720/blocking/1548220745381478402",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "POST",
+    "path": "/2/lists",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/lists/2115842812793225682",
+    "outcome": "PASS",
+    "status": 200,
+    "code": 214,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/lists/2115842812793225682/tweets",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/lists/2115842812793225682/members",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/lists/2115842812793225682/followers",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "PUT",
+    "path": "/2/lists/2115842812793225682",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "PUT",
+    "path": "/2/lists",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "POST",
+    "path": "/2/lists/2115842812793225682/members",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "DELETE",
+    "path": "/2/lists/2115842812793225682/members/1548220745381478402",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "POST",
+    "path": "/2/lists/2115842812793225682/pinned",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "DELETE",
+    "path": "/2/lists/2115842812793225682/pinned",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "POST",
+    "path": "/2/users/1391552089424158720/followed_lists",
+    "outcome": "WARN",
+    "status": 403,
+    "code": "UPSTREAM_ERROR",
+    "detail": "X forbids subscribing to own list | Authorization: You aren't allowed to subscribe to this list."
+  },
+  {
+    "method": "DELETE",
+    "path": "/2/users/1391552089424158720/followed_lists/2115842812793225682",
+    "outcome": "WARN",
+    "status": 400,
+    "code": "UPSTREAM_ERROR",
+    "detail": "X forbids subscribing to own list | BadRequest: The specified user is not a subscriber of this list."
+  },
+  {
+    "method": "POST",
+    "path": "/2/users/1391552089424158720/pinned_lists",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "DELETE",
+    "path": "/2/users/1391552089424158720/pinned_lists/2115842812793225682",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "POST",
+    "path": "/2/dm_conversations/with/1548220745381478402/messages",
+    "outcome": "PASS",
+    "status": 201,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "DELETE",
+    "path": "/2/dm_events/2115842852056125750",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "POST",
+    "path": "/2/dm_conversations/1391552089424158720-1548220745381478402/messages",
+    "outcome": "PASS",
+    "status": 201,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "DELETE",
+    "path": "/2/dm_events/2115842854660788426",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "POST",
+    "path": "/2/dm_conversations",
+    "outcome": "PASS",
+    "status": 201,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "DELETE",
+    "path": "/2/dm_events/2115842857869402270",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "POST",
+    "path": "/2/users/1548220745381478402/dm/block",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "POST",
+    "path": "/2/users/1548220745381478402/dm/unblock",
+    "outcome": "PASS",
+    "status": 200,
+    "code": null,
+    "detail": ""
+  },
+  {
+    "method": "POST",
+    "path": "/2/notes",
+    "outcome": "WARN",
+    "status": 422,
+    "code": "UPSTREAM_ERROR",
+    "detail": "requires Birdwatch contributor account | {\"errors\":[{\"code\":\"GRAPHQL_VALIDATION_FAILED\",\"extensions\":{\"code\":\"GRAPHQL_VALIDATION_FAILED\"},\"message\":\"Internal server error\",\"path\":[\"variable\",\"data_v1\",\"notMisleadingClearUnbased\"]}]}"
+  },
+  {
+    "method": "DELETE",
+    "path": "/2/notes/{id}",
+    "outcome": "SKIP",
+    "status": null,
+    "code": null,
+    "detail": "note creation rejected by X (not eligible)"
+  },
+  {
+    "method": "GET",
+    "path": "/2/communities/search",
+    "outcome": "PASS",
+    "status": 501,
+    "code": "STUB_NOT_IMPLEMENTED",
+    "detail": ""
+  },
+  {
+    "method": "POST",
+    "path": "/2/chat/conversations/group",
+    "outcome": "PASS",
+    "status": 501,
+    "code": "STUB_NOT_IMPLEMENTED",
+    "detail": ""
+  },
+  {
+    "method": "POST",
+    "path": "/2/chat/conversations/group/initialize",
+    "outcome": "PASS",
+    "status": 501,
+    "code": "STUB_NOT_IMPLEMENTED",
+    "detail": ""
+  },
+  {
+    "method": "POST",
+    "path": "/2/chat/conversations/1/keys",
+    "outcome": "PASS",
+    "status": 501,
+    "code": "STUB_NOT_IMPLEMENTED",
+    "detail": ""
+  },
+  {
+    "method": "POST",
+    "path": "/2/chat/conversations/1/members",
+    "outcome": "PASS",
+    "status": 501,
+    "code": "STUB_NOT_IMPLEMENTED",
+    "detail": ""
+  },
+  {
+    "method": "POST",
+    "path": "/2/chat/conversations/1/messages",
+    "outcome": "PASS",
+    "status": 501,
+    "code": "STUB_NOT_IMPLEMENTED",
+    "detail": ""
+  },
+  {
+    "method": "POST",
+    "path": "/2/chat/conversations/1/read",
+    "outcome": "PASS",
+    "status": 501,
+    "code": "STUB_NOT_IMPLEMENTED",
+    "detail": ""
+  },
+  {
+    "method": "POST",
+    "path": "/2/chat/conversations/1/typing",
+    "outcome": "PASS",
+    "status": 501,
+    "code": "STUB_NOT_IMPLEMENTED",
+    "detail": ""
+  },
+  {
+    "method": "POST",
+    "path": "/2/chat/media/upload/finalize",
+    "outcome": "PASS",
+    "status": 501,
+    "code": "STUB_NOT_IMPLEMENTED",
+    "detail": ""
+  },
+  {
+    "method": "POST",
+    "path": "/2/chat/media/upload/initialize",
+    "outcome": "PASS",
+    "status": 501,
+    "code": "STUB_NOT_IMPLEMENTED",
+    "detail": ""
+  },
+  {
+    "method": "POST",
+    "path": "/2/chat/media/upload/1/append",
+    "outcome": "PASS",
+    "status": 501,
+    "code": "STUB_NOT_IMPLEMENTED",
+    "detail": ""
+  },
+  {
+    "method": "POST",
+    "path": "/2/media/upload/initialize",
+    "outcome": "PASS",
+    "status": 501,
+    "code": "STUB_NOT_IMPLEMENTED",
+    "detail": ""
+  },
+  {
+    "method": "POST",
+    "path": "/2/media/upload/1/append",
+    "outcome": "PASS",
+    "status": 501,
+    "code": "STUB_NOT_IMPLEMENTED",
+    "detail": ""
+  },
+  {
+    "method": "POST",
+    "path": "/2/media/upload/1/finalize",
+    "outcome": "PASS",
+    "status": 501,
+    "code": "STUB_NOT_IMPLEMENTED",
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/spaces/1/buyers",
+    "outcome": "PASS",
+    "status": 501,
+    "code": "STUB_NOT_IMPLEMENTED",
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/spaces/by/creator_ids",
+    "outcome": "PASS",
+    "status": 501,
+    "code": "STUB_NOT_IMPLEMENTED",
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/spaces/1/tweets",
+    "outcome": "PASS",
+    "status": 501,
+    "code": "STUB_NOT_IMPLEMENTED",
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/users/public_keys",
+    "outcome": "PASS",
+    "status": 501,
+    "code": "STUB_NOT_IMPLEMENTED",
+    "detail": ""
+  },
+  {
+    "method": "GET",
+    "path": "/2/users/1/public_keys",
+    "outcome": "PASS",
+    "status": 501,
+    "code": "STUB_NOT_IMPLEMENTED",
+    "detail": ""
+  },
+  {
+    "method": "POST",
+    "path": "/2/users/1/public_keys",
+    "outcome": "PASS",
+    "status": 501,
+    "code": "STUB_NOT_IMPLEMENTED",
+    "detail": ""
+  }
+]

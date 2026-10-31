@@ -245,7 +245,7 @@ if __name__ == "__main__":
     import uvicorn.config as _uv_config
     config = _uv_config.Config(
         app=app,
-        host="0.0.0.0",
+        host=os.environ.get("API_HOST", "127.0.0.1"),
         port=8000,
         workers=workers,
         server_header=False,

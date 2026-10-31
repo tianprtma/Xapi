@@ -8,17 +8,22 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import secrets
 from typing import Any, Optional
 from urllib.parse import urlparse as _urlparse
 
 from fastapi import HTTPException
 
+from curl_cffi import CurlMime
+from curl_cffi.requests import AsyncSession as CurlAsyncSession
+
 from session_cache import SessionStore
 from tid_provider import TIDProvider
 
 from .auth import (
     InvalidTokenError,
+    WarmNetworkError,
     api_headers,
     make_client,
     warm_session,
@@ -26,6 +31,7 @@ from .auth import (
 from .client_pool import pooled_client
 from .config import (
     CHUNK_SIZE,
+    MEDIA_PROXY_EXEMPT,
     DEFAULT_HEADERS,
     DM_BASE,
     DM_DEFAULT_PARAMS,
@@ -34,12 +40,31 @@ from .config import (
     REST_BASE,
     UPLOAD_BASE,
     WEB_BEARER,
+    gen_ct0,
+    random_user_agent,
 )
 from .response_cache import ResponseCache
 from .retry import with_retry
 
 
 # ──────────────────────────── GraphQL ────────────────────────────
+
+
+# Batasi fan-out paralel ke upstream per request — 100 gather sekaligus
+# membuat burst yang memicu rate limit / hang.
+FANOUT_SEM_SIZE = 10
+
+import asyncio as _asyncio
+
+def fanout_semaphore() -> _asyncio.Semaphore:
+    """Semaphore lazy per event-loop (dibuat sekali)."""
+    global _fanout_sem
+    try:
+        return _fanout_sem
+    except NameError:
+        _fanout_sem = _asyncio.Semaphore(FANOUT_SEM_SIZE)
+        return _fanout_sem
+
 
 
 async def graphql_call(
@@ -83,6 +108,13 @@ async def _graphql_call_once(
             ct0, _ = await warm_session(client, auth_token)
         except InvalidTokenError as e:
             return _invalid_token_response(e, auth_token)
+        except WarmNetworkError as e:
+            return {
+                "status": "error",
+                "http_status": 502,
+                "error": f"warm-up failed: {e.message}",
+                "data": None,
+            }
 
         params = {
             "variables": json.dumps(variables),
@@ -93,7 +125,7 @@ async def _graphql_call_once(
 
         headers = api_headers(ct0)
         try:
-            tid = await TIDProvider.get().generate(method, _urlparse(url).path)
+            tid = await TIDProvider.get().generate(method, _urlparse(url).path, auth_token)
             if tid:
                 headers["x-client-transaction-id"] = tid
         except Exception:  # noqa: BLE001
@@ -179,6 +211,13 @@ async def _rest_call_once(
             ct0, _ = await warm_session(client, auth_token)
         except InvalidTokenError as e:
             return _invalid_token_response(e, auth_token)
+        except WarmNetworkError as e:
+            return {
+                "status": "error",
+                "http_status": 502,
+                "error": f"warm-up failed: {e.message}",
+                "data": None,
+            }
 
         headers = {
             **DEFAULT_HEADERS,
@@ -186,7 +225,7 @@ async def _rest_call_once(
             "x-csrf-token": ct0,
         }
         try:
-            tid = await TIDProvider.get().generate(method, _urlparse(url).path)
+            tid = await TIDProvider.get().generate(method, _urlparse(url).path, auth_token)
             if tid:
                 headers["x-client-transaction-id"] = tid
         except Exception:  # noqa: BLE001
@@ -269,6 +308,13 @@ async def _dm_call_once(
             ct0, _ = await warm_session(client, auth_token)
         except InvalidTokenError as e:
             return _invalid_token_response(e, auth_token)
+        except WarmNetworkError as e:
+            return {
+                "status": "error",
+                "http_status": 502,
+                "error": f"warm-up failed: {e.message}",
+                "data": None,
+            }
 
         headers = {
             **DEFAULT_HEADERS,
@@ -276,7 +322,7 @@ async def _dm_call_once(
             "x-csrf-token": ct0,
         }
         try:
-            tid = await TIDProvider.get().generate(method, _urlparse(url).path)
+            tid = await TIDProvider.get().generate(method, _urlparse(url).path, auth_token)
             if tid:
                 headers["x-client-transaction-id"] = tid
         except Exception:  # noqa: BLE001
@@ -375,12 +421,48 @@ async def media_upload(
 ) -> dict[str, Any]:
     """Chunked upload (INIT/APPEND/FINALIZE [+ STATUS polling]) ke upload.x.com.
 
+    MEDIA_PROXY_EXEMPT (default aktif): upload dibuat **direct tanpa proxy**
+    untuk hemat kuota proxy — video bisa puluhan MB. Session direct memakai
+    cookie hasil warm_session (yang tetap lewat jalur proxy). Kalau direct
+    gagal karena network, fallback otomatis ke session ber-proxy; error yang
+    dikembalikan X sendiri (4xx dsb.) TIDAK memicu fallback.
+
     Returns:
         {status, media_id?, processing_info?, data}
     """
-    async with pooled_client(auth_token) as client:
+    # Warm session via jalur proxy dulu (konsisten dengan crawl). Kalau
+    # proxy mati dan MEDIA_PROXY_EXEMPT aktif, warm ulang via direct —
+    # session upload memang direct, jadi konsisten.
+    jar: dict[str, str] = {}
+    ct0: Optional[str] = None
+    try:
+        async with pooled_client(auth_token) as client:
+            try:
+                ct0, _ = await warm_session(client, auth_token)
+            except InvalidTokenError as e:
+                return {
+                    "status": "invalid",
+                    "http_status": e.http_status,
+                    "error": e.message,
+                    "data": None,
+                }
+            jar = {c.name: c.value for c in client.cookies.jar}
+    except Exception as exc:  # noqa: BLE001 — network/proxy error, lanjut direct
+        logging.getLogger("xapi.upload").info(
+            "warm via proxy gagal (%s) — coba warm direct", exc)
+
+    if ct0 is None:
+        if not MEDIA_PROXY_EXEMPT:
+            return {
+                "status": "error",
+                "http_status": 502,
+                "error": "warm-up failed (proxy down, MEDIA_PROXY_EXEMPT off)",
+                "data": None,
+            }
+        direct0 = _direct_session(auth_token, {}, 30.0)
         try:
-            ct0, _ = await warm_session(client, auth_token)
+            ct0, _ = await warm_session(direct0, auth_token)
+            jar = {c.name: c.value for c in direct0.cookies.jar}
         except InvalidTokenError as e:
             return {
                 "status": "invalid",
@@ -388,33 +470,96 @@ async def media_upload(
                 "error": e.message,
                 "data": None,
             }
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "status": "error",
+                "http_status": 502,
+                "error": f"warm-up failed (proxy & direct): {exc}",
+                "data": None,
+            }
+        finally:
+            try:
+                await direct0.close()
+            except Exception:  # noqa: BLE001
+                pass
 
-        base_headers = {
-            **DEFAULT_HEADERS,
-            "authorization": f"Bearer {WEB_BEARER}",
-            "x-csrf-token": ct0,
-        }
+    base_headers = {
+        **DEFAULT_HEADERS,
+        "authorization": f"Bearer {WEB_BEARER}",
+        "x-csrf-token": ct0,
+    }
+
+    if MEDIA_PROXY_EXEMPT:
+        direct = _direct_session(auth_token, jar, timeout)
+        try:
+            return await _upload_chunks(
+                direct, base_headers, file_bytes, media_type, media_category)
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger("xapi.upload").warning(
+                "upload direct gagal (%s: %s) — fallback ke proxy",
+                type(exc).__name__, exc)
+        finally:
+            try:
+                await direct.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    async with pooled_client(auth_token) as client:
         client.timeout = timeout
+        return await _upload_chunks(
+            client, base_headers, file_bytes, media_type, media_category)
 
-        # 1. INIT
-        init_params: dict[str, str] = {
-            "command": "INIT",
-            "total_bytes": str(len(file_bytes)),
-            "media_type": media_type,
-        }
-        if media_category:
-            init_params["media_category"] = media_category
 
-        init_resp = await client.post(UPLOAD_BASE, headers=base_headers, params=init_params)
-        if init_resp.status_code >= 400:
-            return _upload_error(init_resp, "INIT")
-        init_json = init_resp.json()
-        media_id = init_json.get("media_id_string") or str(init_json.get("media_id"))
+def _direct_session(auth_token: str, jar: dict[str, str],
+                    timeout: float) -> Any:
+    """Session curl_cffi TANPA proxy — untuk jalur media (hemat kuota)."""
+    cookies = {"auth_token": auth_token, "ct0": gen_ct0()}
+    cookies.update(jar or {})
+    sess = CurlAsyncSession(
+        cookies=cookies,
+        headers={**DEFAULT_HEADERS, "user-agent": random_user_agent()},
+        impersonate="chrome124",
+        timeout=timeout,
+        allow_redirects=True,
+    )
+    return sess
 
-        # 2. APPEND chunks
-        seg = 0
-        for offset in range(0, len(file_bytes), CHUNK_SIZE):
-            chunk = file_bytes[offset : offset + CHUNK_SIZE]
+
+async def _upload_chunks(
+    client: Any,
+    base_headers: dict[str, str],
+    file_bytes: bytes,
+    media_type: str,
+    media_category: Optional[str],
+) -> dict[str, Any]:
+    """INIT/APPEND/FINALIZE/STATUS memakai session yang diberikan."""
+    # 1. INIT
+    init_params: dict[str, str] = {
+        "command": "INIT",
+        "total_bytes": str(len(file_bytes)),
+        "media_type": media_type,
+    }
+    if media_category:
+        init_params["media_category"] = media_category
+
+    init_resp = await client.post(UPLOAD_BASE, headers=base_headers, data=init_params)
+    if init_resp.status_code >= 400:
+        return _upload_error(init_resp, "INIT")
+    init_json = init_resp.json()
+    media_id = init_json.get("media_id_string") or str(init_json.get("media_id"))
+
+    # 2. APPEND chunks
+    seg = 0
+    for offset in range(0, len(file_bytes), CHUNK_SIZE):
+        chunk = file_bytes[offset : offset + CHUNK_SIZE]
+        mime = CurlMime()
+        try:
+            mime.addpart(
+                "media",
+                data=chunk,
+                filename="blob",
+                content_type="application/octet-stream",
+            )
             ap_resp = await client.post(
                 UPLOAD_BASE,
                 headers=base_headers,
@@ -423,46 +568,48 @@ async def media_upload(
                     "media_id": media_id,
                     "segment_index": str(seg),
                 },
-                files={"media": ("blob", chunk, "application/octet-stream")},
+                multipart=mime,
             )
-            if ap_resp.status_code >= 400:
-                return _upload_error(ap_resp, f"APPEND[{seg}]", media_id=media_id)
-            seg += 1
+        finally:
+            mime.close()
+        if ap_resp.status_code >= 400:
+            return _upload_error(ap_resp, f"APPEND[{seg}]", media_id=media_id)
+        seg += 1
 
-        # 3. FINALIZE
-        fin_resp = await client.post(
+    # 3. FINALIZE
+    fin_resp = await client.post(
+        UPLOAD_BASE,
+        headers=base_headers,
+        data={"command": "FINALIZE", "media_id": media_id},
+    )
+    if fin_resp.status_code >= 400:
+        return _upload_error(fin_resp, "FINALIZE", media_id=media_id)
+    fin_json = fin_resp.json()
+
+    # 4. STATUS polling kalau processing async
+    info = fin_json.get("processing_info")
+    while info and info.get("state") in ("pending", "in_progress"):
+        await asyncio.sleep(int(info.get("check_after_secs") or 2))
+        st_resp = await client.get(
             UPLOAD_BASE,
             headers=base_headers,
-            params={"command": "FINALIZE", "media_id": media_id},
+            params={"command": "STATUS", "media_id": media_id},
         )
-        if fin_resp.status_code >= 400:
-            return _upload_error(fin_resp, "FINALIZE", media_id=media_id)
-        fin_json = fin_resp.json()
-
-        # 4. STATUS polling kalau processing async
+        if st_resp.status_code >= 400:
+            return _upload_error(st_resp, "STATUS", media_id=media_id)
+        fin_json = st_resp.json()
         info = fin_json.get("processing_info")
-        while info and info.get("state") in ("pending", "in_progress"):
-            await asyncio.sleep(int(info.get("check_after_secs") or 2))
-            st_resp = await client.get(
-                UPLOAD_BASE,
-                headers=base_headers,
-                params={"command": "STATUS", "media_id": media_id},
-            )
-            if st_resp.status_code >= 400:
-                return _upload_error(st_resp, "STATUS", media_id=media_id)
-            fin_json = st_resp.json()
-            info = fin_json.get("processing_info")
 
-        if info and info.get("state") == "failed":
-            return {
-                "status": "error",
-                "error": info.get("error") or info,
-                "stage": "PROCESSING",
-                "media_id": media_id,
-                "data": fin_json,
-            }
+    if info and info.get("state") == "failed":
+        return {
+            "status": "error",
+            "error": info.get("error") or info,
+            "stage": "PROCESSING",
+            "media_id": media_id,
+            "data": fin_json,
+        }
 
-        return {"status": "ok", "http_status": 200, "data": fin_json}
+    return {"status": "ok", "http_status": 200, "data": fin_json}
 
 
 # ──────────────────────────── Internal helpers ────────────────────────────

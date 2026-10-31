@@ -45,6 +45,7 @@ from ..auth import (
     warm_session,
 )
 from ..clients import (
+    fanout_semaphore,
     build_dm_new2_payload,
     dm_call,
     dm_conv_id_for,
@@ -101,11 +102,12 @@ async def v2_tweets_bulk(
     import asyncio
 
     async def _one(tid: str) -> dict[str, Any]:
-        return await graphql_call(
-            "TweetResultByRestId",
-            {"tweetId": tid, "withCommunity": False, "includePromotedContent": False, "withVoice": False},
-            tok,
-        )
+        async with fanout_semaphore():
+            return await graphql_call(
+                "TweetResultByRestId",
+                {"tweetId": tid, "withCommunity": False, "includePromotedContent": False, "withVoice": False},
+                tok,
+            )
 
     results = await asyncio.gather(*[_one(t) for t in id_list], return_exceptions=True)
 
@@ -272,13 +274,16 @@ async def v2_tweet_detail(
 @router.put("/2/tweets/{tweet_id}/hidden")
 async def v2_hide_reply(
     tweet_id: str = PathParam(..., pattern=r"^\d+$"),
+    hidden: bool = Query(True, description="true = hide reply, false = unhide"),
     authorization: Optional[str] = Header(None),
     auth_token: Optional[str] = Query(None),
     raw: int = Query(0),
 ) -> JSONResponse:
-    """PUT /2/tweets/{id}/hidden — hide/unhide reply via ModerateTweet."""
+    """PUT /2/tweets/{id}/hidden - hide/unhide reply via ModerateTweet."""
     tok = extract_bearer(authorization, auth_token)
-    result = await graphql_call("ModerateTweet", {"tweetId": tweet_id}, tok, method="POST")
+    result = await graphql_call(
+        "ModerateTweet", {"tweetId": tweet_id, "hidden": hidden}, tok, method="POST"
+    )
     return write_finalize(result, raw=bool(raw))
 
 

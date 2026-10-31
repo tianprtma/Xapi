@@ -245,12 +245,28 @@ PROXY_LIST: tuple[str, ...] = tuple(
 ) if _proxy_raw else tuple()
 
 
+def proxy_for_token(auth_token: str) -> str | None:
+    """Proxy deterministik per token — akun yang sama selalu lewat IP sama.
+
+    Pairing stabil bahkan setelah restart (hash token -> index PROXY_LIST).
+    """
+    if not PROXY_LIST:
+        return None
+    import hashlib
+    idx = int(hashlib.sha256(auth_token.encode()).hexdigest(), 16) % len(PROXY_LIST)
+    return PROXY_LIST[idx]
+
+
 def random_proxy() -> str | None:
     """Random pick proxy dari PROXY_LIST (None kalau kosong)."""
     if not PROXY_LIST:
         return None
     return random.choice(PROXY_LIST)
 
+
+# Upload media (upload.x.com) direct tanpa proxy — hemat kuota proxy
+# (video bisa puluhan MB). 0 = upload ikut jalur proxy.
+MEDIA_PROXY_EXEMPT: bool = os.environ.get("MEDIA_PROXY_EXEMPT", "1").strip() not in ("0", "false", "no")
 
 # Disable `?raw=1` di prod (env ENABLE_RAW=0). Default 1 (enabled).
 ENABLE_RAW: bool = os.environ.get("ENABLE_RAW", "1").strip() not in ("0", "false", "no")

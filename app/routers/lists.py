@@ -88,6 +88,10 @@ class ListMemberBody(BaseModel):
     user_id: str
 
 
+class ListFollowBody(BaseModel):
+    list_id: str
+
+
 class UpdateListPathBody(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
@@ -343,14 +347,30 @@ async def v2_followed_lists(
 @router.post("/2/users/{user_id}/followed_lists")
 async def v2_follow_list(
     user_id: str = PathParam(..., pattern=r"^\d+$"),
-    list_id: str = Query(..., pattern=r"^\d+$"),
+    list_id: Optional[str] = Query(None, pattern=r"^\d+$"),
+    body: Optional[ListFollowBody] = None,
     authorization: Optional[str] = Header(None),
     auth_token: Optional[str] = Query(None),
     raw: int = Query(0),
 ) -> JSONResponse:
-    """POST /2/users/{id}/followed_lists?list_id=… — subscribe to list."""
+    """POST /2/users/{id}/followed_lists — subscribe to list.
+
+    Menerima JSON body {\"list_id\": \"…\"} (API resmi v2) atau
+    ?list_id= query param (kompatibilitas lama).
+    """
+    resolved = (body.list_id if body else None) or list_id
+    if not resolved or not resolved.isdigit():
+        return JSONResponse(
+            status_code=422,
+            content=format_error(
+                "Invalid request",
+                "list_id required: JSON body {\"list_id\": \"…\"} atau query param ?list_id=",
+                "invalid_request",
+                422,
+            ),
+        )
     tok = extract_bearer(authorization, auth_token)
-    result = await graphql_call("ListSubscribe", {"listId": list_id}, tok, method="POST")
+    result = await graphql_call("ListSubscribe", {"listId": resolved}, tok, method="POST")
     return write_finalize(result, raw=bool(raw))
 
 

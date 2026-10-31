@@ -22,7 +22,7 @@ from .config import (
     CLIENT_POOL_TTL,
     DEFAULT_HEADERS,
     gen_ct0,
-    random_proxy,
+    proxy_for_token,
     random_user_agent,
     token_key,
 )
@@ -84,7 +84,7 @@ class ClientPool:
 
             # Build new session with random UA + proxy
             headers = {**DEFAULT_HEADERS, "user-agent": random_user_agent()}
-            proxy = random_proxy()
+            proxy = proxy_for_token(auth_token)
             kwargs: dict[str, Any] = dict(
                 cookies={"auth_token": auth_token, "ct0": gen_ct0()},
                 headers=headers,

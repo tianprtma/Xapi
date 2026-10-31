@@ -45,6 +45,7 @@ from ..auth import (
     warm_session,
 )
 from ..clients import (
+    fanout_semaphore,
     build_dm_new2_payload,
     dm_call,
     dm_conv_id_for,
@@ -103,7 +104,8 @@ async def v2_users_bulk(
 
     async def _one(uid: str) -> dict[str, Any]:
         try:
-            r = await graphql_call("UserByRestId", {"userId": uid, "withSafetyModeUserFields": True}, tok)
+            async with fanout_semaphore():
+                r = await graphql_call("UserByRestId", {"userId": uid, "withSafetyModeUserFields": True}, tok)
             return {"id": uid, "data": r.get("data"), "status": r.get("status", "ok")}
         except Exception as e:  # noqa: BLE001
             return {"id": uid, "status": "error", "error": str(e)}
@@ -144,7 +146,8 @@ async def v2_users_by_usernames(
     import asyncio
 
     async def _one(name: str) -> dict[str, Any]:
-        return await graphql_call("UserByScreenName", {"screen_name": name}, tok)
+        async with fanout_semaphore():
+            return await graphql_call("UserByScreenName", {"screen_name": name}, tok)
 
     results = await asyncio.gather(*[_one(n) for n in name_list], return_exceptions=True)
 
@@ -348,19 +351,23 @@ async def v2_user_by_id(
 ) -> JSONResponse:
     """Mirror: GET /2/users/{id} → UserByRestId (Playwright, CF-gated)."""
     tok = extract_bearer(authorization, auth_token)
-    pw = await fetch_via_browser(
-        auth_token=tok,
-        navigate_url=f"https://x.com/i/user/{user_id}",
-        match_path=["/UserByRestId", "/UserByScreenName"],
+    result = await graphql_call(
+        "UserByRestId", {"userId": user_id, "withSafetyModeUserFields": True}, tok
     )
-    result = {
-        "status": pw["status"],
-        "http_status": pw.get("http_status", 200),
-        "operation": "UserByRestId",
-        "engine": "playwright",
-        "data": pw.get("data"),
-        "error": pw.get("error"),
-    }
+    if result.get("status") != "ok":
+        pw = await fetch_via_browser(
+            auth_token=tok,
+            navigate_url=f"https://x.com/i/user/{user_id}",
+            match_path=["/UserByRestId", "/UserByScreenName"],
+        )
+        result = {
+            "status": pw["status"],
+            "http_status": pw.get("http_status", 200),
+            "operation": "UserByRestId",
+            "engine": "playwright",
+            "data": pw.get("data"),
+            "error": pw.get("error"),
+        }
     return finalize(result, format_user, raw=bool(raw))
 
 
@@ -576,14 +583,8 @@ async def v2_mentions(
     tok = extract_bearer(authorization, auth_token)
     handle = username
     if not handle:
-        # Resolve via Playwright UserByRestId
-        from playwright_search import fetch_via_browser
-        ur = await fetch_via_browser(tok, f"https://x.com/i/user/{user_id}", "/UserByRestId")
-        if ur.get("status") == "ok":
-            try:
-                handle = ur["data"]["data"]["user"]["result"]["core"]["screen_name"]
-            except Exception:  # noqa: BLE001
-                pass
+        # Resolve via Playwright UserByRestId/UserByScreenName
+        handle = await resolve_screen_name(user_id, tok)
     if not handle:
         return JSONResponse(
             status_code=400,
@@ -720,9 +721,8 @@ async def v2_user_tweets_replies(
         return JSONResponse(status_code=404, content=format_error("Not Found", "user_id not found", "not_found", 404))
     pw = await fetch_via_browser(
         auth_token=tok,
-        navigate_url=f"https://x.com/{handle}",
-        match_path=["/UserTweetsAndReplies"],
-        click_selector=f"a[href='/{handle}/with_replies']",
+        navigate_url=f"https://x.com/{handle}/with_replies",
+        match_path=["/UserTweetsAndReplies", "/UserRepliesTimeline"],
         timeout=30.0,
     )
     result = {

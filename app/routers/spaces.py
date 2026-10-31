@@ -45,6 +45,7 @@ from ..auth import (
     warm_session,
 )
 from ..clients import (
+    fanout_semaphore,
     build_dm_new2_payload,
     dm_call,
     dm_conv_id_for,
@@ -91,12 +92,13 @@ async def v2_spaces_lookup(
 
     import asyncio
     async def _one(sid: str):
-        return await graphql_call("AudioSpaceById", {
-            "id": sid,
-            "isMetatagsQuery": False,
-            "withReplays": True,
-            "withListeners": True,
-        }, tok)
+        async with fanout_semaphore():
+            return await graphql_call("AudioSpaceById", {
+                "id": sid,
+                "isMetatagsQuery": False,
+                "withReplays": True,
+                "withListeners": True,
+            }, tok)
 
     results = await asyncio.gather(*[_one(s) for s in id_list])
     if raw:

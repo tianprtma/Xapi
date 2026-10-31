@@ -26,7 +26,7 @@ from .config import (
     VIEWER_FIELD_TOGGLES,
     WEB_BEARER,
     gen_ct0,
-    random_proxy,
+    proxy_for_token,
     random_user_agent,
 )
 
@@ -42,6 +42,18 @@ class InvalidTokenError(Exception):
         self.message = message
         self.jar = jar
         self.ct0 = ct0
+
+
+class WarmNetworkError(Exception):
+    """Raised when the warm-up GET x.com/home fails for network reasons.
+
+    Harus dibedakan dari InvalidTokenError: network failure tidak boleh
+    meng-invalidate session cache — sifatnya sementara (502), bukan 401.
+    """
+
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
 
 
 # ──────────────────────────── Helpers ────────────────────────────
@@ -104,7 +116,7 @@ def make_client(auth_token: str) -> AsyncSession:
     Per-request: random UA dari pool + random proxy dari PROXY_LIST (kalau set).
     """
     headers = {**DEFAULT_HEADERS, "user-agent": random_user_agent()}
-    proxy = random_proxy()
+    proxy = proxy_for_token(auth_token)
     kwargs: dict[str, Any] = dict(
         cookies={"auth_token": auth_token, "ct0": gen_ct0()},
         headers=headers,
@@ -151,9 +163,16 @@ async def warm_session(
 
     try:
         await client.get(HOMEPAGE_URL)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         import logging
         logging.getLogger("xapi.auth").debug("warm_session home_page failed", exc_info=True)
+        # Retry sekali — glitch jaringan/proxy satu-off jangan langsung gagal.
+        try:
+            await client.get(HOMEPAGE_URL)
+        except Exception:  # noqa: BLE001
+            raise WarmNetworkError(
+                f"GET {HOMEPAGE_URL} failed twice: {type(exc).__name__}: {exc}"
+            ) from exc
 
     # X kasih ct0 server-issued di domain .x.com (leading dot). Placeholder lokal
     # nyantol di domain="" atau "x.com" tanpa leading dot. Strategy: prefer ct0
@@ -214,6 +233,15 @@ async def login_with_auth_token(auth_token: str) -> dict[str, Any]:
                 "error": e.message,
                 "cookies": e.jar,
                 "tokens": {"bearer": WEB_BEARER, "ct0": e.ct0, "auth_token": auth_token},
+                "user": None,
+            }
+        except WarmNetworkError as e:
+            return {
+                "status": "error",
+                "http_status": 502,
+                "error": f"warm-up failed: {e.message}",
+                "cookies": {},
+                "tokens": {"bearer": WEB_BEARER, "ct0": "", "auth_token": auth_token},
                 "user": None,
             }
 
@@ -294,7 +322,7 @@ async def resolve_me_id(auth_token: str) -> Optional[str]:
     async with pooled_client(auth_token) as client:
         try:
             await warm_session(client, auth_token)
-        except InvalidTokenError:
+        except (InvalidTokenError, WarmNetworkError):
             return None
         jar = {c.name: c.value for c in client.cookies.jar}
         return extract_user_id_from_twid(jar.get("twid"))

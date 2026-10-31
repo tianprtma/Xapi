@@ -27,6 +27,7 @@ import asyncio
 import json
 import logging
 import os
+import secrets
 from typing import Any, Callable, Coroutine, Literal, Optional
 
 from playwright.async_api import (

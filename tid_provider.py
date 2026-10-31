@@ -51,10 +51,10 @@ class TIDProvider:
     def _is_stale(self) -> bool:
         return self._ct is None or (time.time() - self._loaded_at) > TTL_SECONDS
 
-    async def _refresh(self) -> None:
+    async def _refresh(self, auth_token: Optional[str] = None) -> None:
         loop = asyncio.get_event_loop()
 
-        def _do() -> ClientTransaction:
+        def _fetch_home_via_requests() -> str:
             sess = requests.Session()
             sess.timeout = (5, 10)  # connect=5s, read=10s
             sess.headers["User-Agent"] = (
@@ -62,7 +62,51 @@ class TIDProvider:
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/124.0.0.0 Safari/537.36"
             )
-            home = handle_x_migration(sess)
+            return str(handle_x_migration(sess))
+
+        async def _fetch_home_via_browser() -> Optional[str]:
+            if not auth_token:
+                return None
+            try:
+                from playwright_search import ContextPool
+
+                ctx = await ContextPool.get().acquire(auth_token)
+                page = await ctx.new_page()
+                try:
+                    # Raw response body — bukan page.content(): X menghapus
+                    # SVG `loading-x-anim` (animation key frames) dari DOM
+                    # setelah app mount, jadi DOM-nya tidak bisa dipakai
+                    # untuk generate animation key.
+                    resp = await page.goto(
+                        "https://x.com/home",
+                        wait_until="domcontentloaded",
+                        timeout=30000,
+                    )
+                    if resp is None:
+                        return None
+                    return await resp.text()
+                finally:
+                    await page.close()
+            except Exception as e:  # noqa: BLE001
+                log.warning("TID home fetch via browser failed: %s", e)
+                return None
+
+        # Halaman home logged-out tidak lagi memuat chunk-map `ondemand.s`
+        # (X mengubah HTML landing page) — ambil dari browser yang login dulu,
+        # baru fallback ke requests.
+        home_html = await _fetch_home_via_browser() or await loop.run_in_executor(
+            None, _fetch_home_via_requests
+        )
+        home = bs4.BeautifulSoup(home_html, "html.parser")
+
+        def _do() -> ClientTransaction:
+            sess = requests.Session()
+            sess.timeout = (5, 10)
+            sess.headers["User-Agent"] = (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            )
             ondemand_url = get_ondemand_file_url(response=home)
             ondemand_resp = sess.get(ondemand_url, timeout=10)
             ondemand = bs4.BeautifulSoup(ondemand_resp.content, "html.parser")
@@ -71,7 +115,7 @@ class TIDProvider:
         self._ct = await loop.run_in_executor(None, _do)
         self._loaded_at = time.time()
 
-    async def generate(self, method: str, path: str) -> str:
+    async def generate(self, method: str, path: str, auth_token: Optional[str] = None) -> str:
         """
         method = "GET" / "POST" / "DELETE".
         path = "/i/api/graphql/abc/CreateTweet" atau "/1.1/blocks/destroy.json".
@@ -84,7 +128,7 @@ class TIDProvider:
         async with self._lock:
             if self._is_stale():
                 try:
-                    await self._refresh()
+                    await self._refresh(auth_token)
                     self._refresh_failures = 0
                     self._fallback_mode = False
                 except Exception as e:  # noqa: BLE001

@@ -5,6 +5,7 @@ Mirror endpoint X API v2 (`docs.x.com/x-api`) lewat cookie `auth_token`. Backend
 - **~115 routes** mirror v2 (read + write + DM + lists + media + community notes + trends)
 - **Docs UI** built-in di `/` (interactive reference + try-it console)
 - **OpenAPI/Swagger** di `/docs`
+- **Agent Skill** di [`SKILL.md`](SKILL.md) — dipakai agent (Claude Code, opencode, dll) untuk memanggil API ini; katalog endpoint lengkap di [`references/`](references/)
 
 ## Setup
 

@@ -165,9 +165,8 @@ async def v2_dm_conv_create(
     )
     if body.conversation_type.lower() in ("group", "groupdm"):
         payload["conversation_id"] = "-".join(sorted([me] + list(body.participant_ids), key=lambda x: int(x) if x.isdigit() else x))
-    else:
-        if len(body.participant_ids) == 1:
-            payload["conversation_id"] = dm_conv_id_for(me, body.participant_ids[0])
+    # OneToOne: biarkan recipient_ids auto-create conversation. Mengirim
+    # conversation_id untuk conversation yang belum ada ditolak X (code 214).
 
     result = await dm_call("dm/new2.json", tok, method="POST", json_body=payload, with_dm_defaults=False)
     if raw:
@@ -219,7 +218,8 @@ async def v2_dm_send(
 
 @router.post("/2/dm_conversations/{conversation_id}/messages")
 async def v2_dm_send_to_conv(
-    conversation_id: str = PathParam(..., pattern=r"^\d+$"),
+    # 1-1 conversation id = "<me>-<other>" (dua numeric dijoin '-')
+    conversation_id: str = PathParam(..., pattern=r"^\d+(-\d+)?$"),
     body: DMSendBody = ...,
     authorization: Optional[str] = Header(None),
     auth_token: Optional[str] = Query(None),
@@ -303,10 +303,17 @@ async def v2_dm_block(
     result = await dm_call(
         "dm/conversation/disable.json",
         tok,
-        method="POST",
-        data={"conversation_id": conv_id, "request_id": secrets.token_hex(16)},
+        method="GET",
+        params={"conversation_id": conv_id, "request_id": secrets.token_hex(16)},
         with_dm_defaults=False,
     )
+    # X web sudah memensiunkan disable.json granular (balas 279 "conversation
+    # doesn't exist" meski conversation valid) — fallback ke account-level
+    # block yang sama dengan route /2/users/{id}/blocking.
+    if result["status"] == "error" and result.get("http_status") == 404:
+        result = await rest_call("blocks/create.json", tok, data={"user_id": user_id})
+        if result["status"] == "ok":
+            return JSONResponse(status_code=200, content={"data": {"blocking": True, "user_id": user_id}})
     if raw:
         return wrap(result)
     if result["status"] == "ok":
@@ -336,10 +343,16 @@ async def v2_dm_unblock(
     result = await dm_call(
         "dm/conversation/accept.json",
         tok,
-        method="POST",
-        data={"conversation_id": conv_id, "request_id": secrets.token_hex(16)},
+        method="GET",
+        params={"conversation_id": conv_id, "request_id": secrets.token_hex(16)},
         with_dm_defaults=False,
     )
+    # Mirror fallback dm/block: X memensiunkan endpoint granular — pakai
+    # account-level unblock.
+    if result["status"] == "error" and result.get("http_status") == 404:
+        result = await rest_call("blocks/destroy.json", tok, data={"user_id": user_id})
+        if result["status"] == "ok":
+            return JSONResponse(status_code=200, content={"data": {"blocking": False, "user_id": user_id}})
     if raw:
         return wrap(result)
     if result["status"] == "ok":

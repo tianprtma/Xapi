@@ -49,9 +49,10 @@ URL_FILTER = {
     "Media": "image",
 }
 
-# Cap concurrent Playwright operations (browser pages aktif). Default 4 pages —
-# tweak via env. Headless Chrome ~80-150MB per page, jadi 4 = ~600MB RAM peak.
-PLAYWRIGHT_MAX_CONCURRENT = int(os.environ.get("PLAYWRIGHT_MAX_CONCURRENT", "4"))
+# Cap concurrent Playwright operations (browser pages aktif). Default 1 —
+# fallback profil jarang terpakai, dan headless Chrome ~250MB + 80-150MB
+# per halaman tambahan. Naikkan via env hanya jika VPS RAM besar.
+PLAYWRIGHT_MAX_CONCURRENT = int(os.environ.get("PLAYWRIGHT_MAX_CONCURRENT", "1"))
 
 
 # ──────────────────────────── In-flight coalescer ────────────────────────────

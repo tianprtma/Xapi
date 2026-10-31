@@ -189,8 +189,34 @@ async def v2_tweets_search_recent(
     auth_token: Optional[str] = Query(None),
     raw: int = Query(0),
 ) -> JSONResponse:
-    """Mirror: GET /2/tweets/search/recent → SearchTimeline via Playwright."""
+    """Mirror: GET /2/tweets/search/recent → SearchTimeline GraphQL.
+
+    GraphQL-first (curl_cffi + TID, tanpa browser); Playwright hanya
+    fallback bila GraphQL gagal.
+    """
     tok = extract_bearer(authorization, auth_token)
+    gql = await graphql_call(
+        "SearchTimeline",
+        {
+            "rawQuery": query,
+            "count": max_results,
+            "product": "Top" if type == "Top" else "Latest",
+            "querySource": "typed_query",
+        },
+        tok,
+        method="POST",
+    )
+    if gql.get("status") == "ok":
+        result = {
+            "engine": "graphql",
+            "status": "ok",
+            "http_status": 200,
+            "data": gql.get("data"),
+            "error": None,
+        }
+        fmt = format_tweet_collection if type != "People" else (lambda g: format_tweet_collection(g, item="user"))
+        return finalize(result, fmt, raw=bool(raw))
+    # fallback Playwright bila GraphQL gagal (rate limit / challenge)
     try:
         pw = await search_via_browser(auth_token=tok, q=query, search_type=type)
         result = {

@@ -268,8 +268,31 @@ async def v2_users_search(
     auth_token: Optional[str] = Query(None),
     raw: int = Query(0),
 ) -> JSONResponse:
-    """GET /2/users/search?query= — SearchTimeline (product=People)."""
+    """GET /2/users/search?query= — SearchTimeline (product=People).
+
+    GraphQL-first; Playwright hanya fallback.
+    """
     tok = extract_bearer(authorization, auth_token)
+    gql = await graphql_call(
+        "SearchTimeline",
+        {
+            "rawQuery": query,
+            "count": max_results,
+            "product": "People",
+            "querySource": "typed_query",
+        },
+        tok,
+        method="POST",
+    )
+    if gql.get("status") == "ok":
+        result = {
+            "engine": "graphql",
+            "status": "ok",
+            "http_status": 200,
+            "data": gql.get("data"),
+            "error": None,
+        }
+        return finalize(result, lambda g: format_tweet_collection(g, item="user"), raw=bool(raw))
     pw = await search_via_browser(auth_token=tok, q=query, search_type="People")
     result = {
         "engine": "playwright",

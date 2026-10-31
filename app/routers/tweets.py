@@ -195,17 +195,17 @@ async def v2_tweets_search_recent(
     fallback bila GraphQL gagal.
     """
     tok = extract_bearer(authorization, auth_token)
-    gql = await graphql_call(
-        "SearchTimeline",
-        {
-            "rawQuery": query,
-            "count": max_results,
-            "product": "Top" if type == "Top" else "Latest",
-            "querySource": "typed_query",
-        },
-        tok,
-        method="POST",
-    )
+    product = {"Latest": "Latest", "Top": "Top",
+               "Media": "Media", "People": "People"}.get(type, "Latest")
+    variables: dict[str, Any] = {
+        "rawQuery": query,
+        "count": max_results,
+        "product": product,
+        "querySource": "typed_query",
+    }
+    if next_token:
+        variables["cursor"] = next_token
+    gql = await graphql_call("SearchTimeline", variables, tok, method="POST")
     if gql.get("status") == "ok":
         result = {
             "engine": "graphql",

@@ -54,6 +54,12 @@ URL_FILTER = {
 # per halaman tambahan. Naikkan via env hanya jika VPS RAM besar.
 PLAYWRIGHT_MAX_CONCURRENT = int(os.environ.get("PLAYWRIGHT_MAX_CONCURRENT", "1"))
 
+# Master switch seluruh jalur Playwright (search fallback + TID via browser).
+# Default 0: headless Chrome ~300MB + driver node 130MB per launch, dan di
+# VPS tanpa binary Chromium jalur ini selalu gagal. Set PLAYWRIGHT_ENABLED=1
+# hanya jika binary terinstall dan fallback memang diinginkan.
+PLAYWRIGHT_ENABLED = os.environ.get("PLAYWRIGHT_ENABLED", "0") == "1"
+
 
 # ──────────────────────────── In-flight coalescer ────────────────────────────
 
@@ -152,11 +158,18 @@ class PlaywrightPool:
 
     _instance: Optional["PlaywrightPool"] = None
 
+    # Setelah N launch gagal beruntun, jalur browser dimatikan permanen untuk
+    # umur proses — mencegah spawn driver node (130MB) berulang kali saat
+    # binary Chromium tidak tersedia.
+    MAX_LAUNCH_FAILURES = 3
+
     def __init__(self) -> None:
         self._pw = None
         self._browser: Optional[Browser] = None
         self._lock = asyncio.Lock()
         self._sem = asyncio.Semaphore(PLAYWRIGHT_MAX_CONCURRENT)
+        self._launch_failures = 0
+        self._disabled = False
 
     @classmethod
     def get(cls) -> "PlaywrightPool":
@@ -169,8 +182,19 @@ class PlaywrightPool:
         return self._sem
 
     async def ensure(self) -> Browser:
+        if not PLAYWRIGHT_ENABLED:
+            raise RuntimeError(
+                "Playwright disabled (PLAYWRIGHT_ENABLED!=1) — "
+                "jalur browser fallback tidak tersedia"
+            )
+        if self._disabled:
+            raise RuntimeError(
+                "Playwright permanently disabled after repeated launch failures"
+            )
         async with self._lock:
-            if self._browser is None or not self._browser.is_connected():
+            if self._browser is not None and self._browser.is_connected():
+                return self._browser
+            try:
                 self._pw = await async_playwright().start()
                 self._browser = await self._pw.chromium.launch(
                     headless=True,
@@ -180,10 +204,36 @@ class PlaywrightPool:
                         "--disable-dev-shm-usage",
                     ],
                 )
-            return self._browser
+                self._launch_failures = 0
+                return self._browser
+            except Exception:
+                # Stop driver node yang baru di-start supaya tidak jadi
+                # proses yatim 130MB; hitung kegagalan untuk hard-disable.
+                if self._pw is not None:
+                    try:
+                        await self._pw.stop()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    self._pw = None
+                self._browser = None
+                self._launch_failures += 1
+                if self._launch_failures >= self.MAX_LAUNCH_FAILURES:
+                    self._disabled = True
+                    log.error(
+                        "Playwright launch failed %dx — browser fallback "
+                        "disabled for this process",
+                        self._launch_failures,
+                    )
+                raise
 
     async def warmup(self) -> None:
-        """Pre-launch browser di startup supaya request pertama tidak nunggu Chromium init."""
+        """Pre-launch browser di startup supaya request pertama tidak nunggu Chromium init.
+
+        No-op ketika Playwright dimatikan via env — jangan spawn driver
+        node hanya untuk langsung gagal (dan sebelumnya: bocor).
+        """
+        if not PLAYWRIGHT_ENABLED:
+            return
         try:
             await self.ensure()
         except Exception:  # noqa: BLE001

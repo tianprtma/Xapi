@@ -65,7 +65,17 @@ class TIDProvider:
             return str(handle_x_migration(sess))
 
         async def _fetch_home_via_browser() -> Optional[str]:
+            # Jalur browser hanya saat PLAYWRIGHT_ENABLED=1 — di VPS tanpa
+            # binary Chromium jalur ini selalu gagal, dan sebelumnya gagalnya
+            # "diam-diam" (refresh tetap sukses via requests) sehingga dicoba
+            # ulang terus: satu driver node 130MB bocor per percobaan.
             if not auth_token:
+                return None
+            try:
+                from playwright_search import PLAYWRIGHT_ENABLED
+                if not PLAYWRIGHT_ENABLED:
+                    return None
+            except Exception:  # noqa: BLE001
                 return None
             try:
                 from playwright_search import ContextPool

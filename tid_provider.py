@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 import uuid
 from typing import Optional
@@ -31,6 +32,17 @@ MAX_REFRESH_FAILURES = 3
 
 # Saat fallback mode, jangan coba refresh tiap request — ulangi tiap 5 menit.
 FALLBACK_REFRESH_BACKOFF = 300
+
+# Redesain x-web (2026): HTML home tidak lagi memuat webpack chunk-map,
+# sehingga get_ondemand_file_url() gagal. URL ondemand.s terkini diambil
+# dari index script yang di-update otomatis harian oleh fa0311.
+SCRIPT_INDEX_URLS = (
+    "https://raw.githubusercontent.com/fa0311/TwitterInternalAPIDocument/"
+    "master/docs/json/ScriptLoadJson.json",
+)
+ONDEMAND_URL_RE = re.compile(
+    r"https://abs\.twimg\.com/responsive-web/client-web/ondemand\.s\.[0-9a-f]+a\.js"
+)
 
 
 class TIDProvider:
@@ -145,6 +157,41 @@ class TIDProvider:
         )
         home = bs4.BeautifulSoup(home_html, "html.parser")
 
+        def _fetch_ondemand_content(sess: requests.Session) -> bytes:
+            """Ambil isi JS ondemand.s terkini.
+
+            Jalur 1 (lama): chunk-map masih ada di HTML home.
+            Jalur 2 (redesain x-web): HTML home tak lagi memuat chunk-map —
+            URL ondemand.s diambil dari ScriptLoadJson.json (index script
+            yang di-update otomatis harian oleh fa0311/TwitterInternalAPIDocument).
+            """
+            try:
+                ondemand_url = get_ondemand_file_url(response=home)
+            except Exception:  # noqa: BLE001
+                ondemand_url = None
+            if ondemand_url:
+                resp = sess.get(ondemand_url, timeout=10)
+                if resp.status_code == 200 and resp.content:
+                    return resp.content
+            for idx_url in SCRIPT_INDEX_URLS:
+                try:
+                    idx = sess.get(idx_url, timeout=10)
+                    if idx.status_code != 200:
+                        continue
+                    match = ONDEMAND_URL_RE.search(idx.text)
+                    if not match:
+                        continue
+                    resp = sess.get(match.group(0), timeout=10)
+                    if resp.status_code == 200 and resp.content:
+                        log.info(
+                            "TID ondemand.s dari script index: %s",
+                            match.group(0).rsplit("/", 1)[-1],
+                        )
+                        return resp.content
+                except Exception as e:  # noqa: BLE001
+                    log.warning("TID script index fetch gagal: %s", e)
+            raise RuntimeError("ondemand.s tidak dapat ditemukan")
+
         def _do() -> ClientTransaction:
             sess = requests.Session()
             sess.timeout = (5, 10)
@@ -153,9 +200,8 @@ class TIDProvider:
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/124.0.0.0 Safari/537.36"
             )
-            ondemand_url = get_ondemand_file_url(response=home)
-            ondemand_resp = sess.get(ondemand_url, timeout=10)
-            ondemand = bs4.BeautifulSoup(ondemand_resp.content, "html.parser")
+            content = _fetch_ondemand_content(sess)
+            ondemand = bs4.BeautifulSoup(content, "html.parser")
             return ClientTransaction(home, ondemand)
 
         self._ct = await loop.run_in_executor(None, _do)

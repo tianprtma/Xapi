@@ -29,6 +29,9 @@ TTL_SECONDS = 3600
 # Fallback TIDs are UUID-based — still accepted by X but less stealthy.
 MAX_REFRESH_FAILURES = 3
 
+# Saat fallback mode, jangan coba refresh tiap request — ulangi tiap 5 menit.
+FALLBACK_REFRESH_BACKOFF = 300
+
 
 class TIDProvider:
     """Singleton ClientTransaction holder. Refresh setiap TTL_SECONDS."""
@@ -41,6 +44,7 @@ class TIDProvider:
         self._lock = asyncio.Lock()
         self._refresh_failures: int = 0
         self._fallback_mode: bool = False
+        self._next_refresh_try: float = 0.0
 
     @classmethod
     def get(cls) -> "TIDProvider":
@@ -63,6 +67,37 @@ class TIDProvider:
                 "Chrome/124.0.0.0 Safari/537.36"
             )
             return str(handle_x_migration(sess))
+
+        async def _fetch_home_via_client() -> Optional[str]:
+            """Home login via curl_cffi impersonate — tanpa browser.
+
+            HTML shell versi login (SVG `loading-x-anim` + chunk-map
+            `ondemand.s` utuh) itulah yang dibutuhkan ClientTransaction.
+            Home logged-out via requests biasa sudah tidak memuat chunk-map
+            (X mengubah landing page), sedangkan jalur browser butuh Chromium.
+            Session pool sudah ber-cookie auth_token + impersonate Chrome +
+            proxy per token — cukup 1 HTTP request.
+            """
+            if not auth_token:
+                return None
+            try:
+                from app.client_pool import pooled_client
+
+                async with pooled_client(auth_token) as client:
+                    resp = await client.get(
+                        "https://x.com/home",
+                        headers={"Referer": "https://x.com/"},
+                    )
+                    if resp.status_code != 200:
+                        log.warning(
+                            "TID home fetch via client: HTTP %s",
+                            resp.status_code,
+                        )
+                        return None
+                    return resp.text
+            except Exception as e:  # noqa: BLE001
+                log.warning("TID home fetch via client failed: %s", e)
+                return None
 
         async def _fetch_home_via_browser() -> Optional[str]:
             # Jalur browser hanya saat PLAYWRIGHT_ENABLED=1 — di VPS tanpa
@@ -101,11 +136,12 @@ class TIDProvider:
                 log.warning("TID home fetch via browser failed: %s", e)
                 return None
 
-        # Halaman home logged-out tidak lagi memuat chunk-map `ondemand.s`
-        # (X mengubah HTML landing page) — ambil dari browser yang login dulu,
-        # baru fallback ke requests.
-        home_html = await _fetch_home_via_browser() or await loop.run_in_executor(
-            None, _fetch_home_via_requests
+        # Urutan: browser (jika PLAYWRIGHT_ENABLED=1) → curl_cffi login →
+        # requests logged-out (sering tak memuat chunk-map lagi).
+        home_html = (
+            await _fetch_home_via_browser()
+            or await _fetch_home_via_client()
+            or await loop.run_in_executor(None, _fetch_home_via_requests)
         )
         home = bs4.BeautifulSoup(home_html, "html.parser")
 
@@ -136,7 +172,7 @@ class TIDProvider:
         fallback lets write endpoints survive library breakage.
         """
         async with self._lock:
-            if self._is_stale():
+            if self._is_stale() and time.time() >= self._next_refresh_try:
                 try:
                     await self._refresh(auth_token)
                     self._refresh_failures = 0
@@ -149,10 +185,17 @@ class TIDProvider:
                     )
                     if self._refresh_failures >= MAX_REFRESH_FAILURES:
                         self._fallback_mode = True
+                        # Backoff: jangan coba refresh tiap request — tiap
+                        # percobaan = fetch home + ondemand ke x.com.
+                        self._next_refresh_try = (
+                            time.time() + FALLBACK_REFRESH_BACKOFF
+                        )
                         log.error(
                             "TIDProvider entering fallback mode — "
-                            "UUID-based TIDs will be used. Write endpoints "
-                            "will still work but may be slightly less stealthy."
+                            "UUID-based TIDs will be used. Retry refresh "
+                            "in %ds. Write endpoints will still work but "
+                            "may be slightly less stealthy.",
+                            FALLBACK_REFRESH_BACKOFF,
                         )
             ct = self._ct
 

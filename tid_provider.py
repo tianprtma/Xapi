@@ -14,7 +14,7 @@ import logging
 import re
 import time
 import uuid
-from typing import Optional
+from typing import Any, Optional
 
 import bs4
 import requests
@@ -32,6 +32,13 @@ MAX_REFRESH_FAILURES = 3
 
 # Saat fallback mode, jangan coba refresh tiap request — ulangi tiap 5 menit.
 FALLBACK_REFRESH_BACKOFF = 300
+
+# requests.Session mengabaikan atribut .timeout — tanpa default per-call,
+# handle_x_migration bisa menggantung selamanya kalau X menahan koneksi.
+class _BoundedSession(requests.Session):
+    def request(self, *args, **kwargs):  # noqa: ANN002, ANN003
+        kwargs.setdefault("timeout", (5, 15))
+        return super().request(*args, **kwargs)
 
 # Redesain x-web (2026): HTML home tidak lagi memuat webpack chunk-map,
 # sehingga get_ondemand_file_url() gagal. URL ondemand.s terkini diambil
@@ -71,8 +78,7 @@ class TIDProvider:
         loop = asyncio.get_event_loop()
 
         def _fetch_home_via_requests() -> str:
-            sess = requests.Session()
-            sess.timeout = (5, 10)  # connect=5s, read=10s
+            sess = _BoundedSession()
             sess.headers["User-Agent"] = (
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -87,19 +93,35 @@ class TIDProvider:
             `ondemand.s` utuh) itulah yang dibutuhkan ClientTransaction.
             Home logged-out via requests biasa sudah tidak memuat chunk-map
             (X mengubah landing page), sedangkan jalur browser butuh Chromium.
-            Session pool sudah ber-cookie auth_token + impersonate Chrome +
-            proxy per token — cukup 1 HTTP request.
+
+            PENTING: JANGAN pakai app.client_pool.pooled_client() — TID
+            generate dipanggil dari DALAM pooled_client di app.clients
+            (lock per-token sedang dipegang) → self-deadlock. Pakai session
+            sekali-pakai tanpa lock; refresh hanya 1x/jam jadi murah.
             """
             if not auth_token:
                 return None
             try:
-                from app.client_pool import pooled_client
+                from curl_cffi.requests import AsyncSession
 
-                async with pooled_client(auth_token) as client:
-                    resp = await client.get(
-                        "https://x.com/home",
-                        headers={"Referer": "https://x.com/"},
-                    )
+                from .config import gen_ct0, random_proxy, random_user_agent
+
+                kwargs: dict[str, Any] = dict(
+                    cookies={"auth_token": auth_token, "ct0": gen_ct0()},
+                    headers={
+                        "user-agent": random_user_agent(),
+                        "Referer": "https://x.com/",
+                    },
+                    timeout=20.0,
+                    impersonate="chrome124",
+                    allow_redirects=True,
+                )
+                proxy = random_proxy()
+                if proxy:
+                    kwargs["proxies"] = {"http": proxy, "https": proxy}
+                sess = AsyncSession(**kwargs)
+                try:
+                    resp = await sess.get("https://x.com/home")
                     if resp.status_code != 200:
                         log.warning(
                             "TID home fetch via client: HTTP %s",
@@ -107,6 +129,11 @@ class TIDProvider:
                         )
                         return None
                     return resp.text
+                finally:
+                    try:
+                        await sess.close()
+                    except Exception:  # noqa: BLE001
+                        pass
             except Exception as e:  # noqa: BLE001
                 log.warning("TID home fetch via client failed: %s", e)
                 return None
@@ -193,8 +220,7 @@ class TIDProvider:
             raise RuntimeError("ondemand.s tidak dapat ditemukan")
 
         def _do() -> ClientTransaction:
-            sess = requests.Session()
-            sess.timeout = (5, 10)
+            sess = _BoundedSession()
             sess.headers["User-Agent"] = (
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "

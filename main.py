@@ -22,8 +22,25 @@ Environment variables (optional):
 
 from __future__ import annotations
 
+# ── Muat .env SEBELUM import apa pun dari app.* ─────────────────────
+# app/config.py membaca env (PROXY_LIST, ADMIN_TOKEN, MEDIA_PROXY_EXEMPT,
+# dst) SAAT IMPORT. Unit systemd tidak punya EnvironmentFile, dan main.py
+# tidak pernah memuat .env — akibatnya SELURUH isi .env tidak pernah aktif
+# (terbukti: PROXY_LIST terpasang di .env tapi semua request keluar direct
+# dari IP VPS -> rate limit). setdefault: env asli (systemd/shell) menang.
+import os as _os
+from pathlib import Path as _Path
+
+_env_file = _Path(__file__).resolve().parent / ".env"
+if _env_file.is_file():
+    for _line in _env_file.read_text(encoding="utf-8").splitlines():
+        _line = _line.strip()
+        if not _line or _line.startswith("#") or "=" not in _line:
+            continue
+        _k, _v = _line.split("=", 1)
+        _os.environ.setdefault(_k.strip(), _v.strip().strip('"').strip("'"))
+
 import logging
-import os
 import secrets
 import uuid as _uuid
 from contextlib import asynccontextmanager

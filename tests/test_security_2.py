@@ -73,7 +73,7 @@ class TestMakeClient:
         # Check headers were set
         assert client.headers is not None
 
-    @patch("app.auth.random_proxy")
+    @patch("app.auth.proxy_for_token")
     def test_with_proxy(self, mock_proxy):
         mock_proxy.return_value = "http://proxy:8080"
         client = make_client("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")

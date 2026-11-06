@@ -70,7 +70,7 @@ class TestClientPool:
         from app.client_pool import ClientPool
         pool = ClientPool()
         with patch("app.client_pool.CLIENT_POOL_MAX", 10):
-            with patch("app.client_pool.random_proxy", return_value=None):
+            with patch("app.client_pool.proxy_for_token", return_value=None):
                 sess, lock = await pool.acquire("tok1")
                 assert sess is not None
 

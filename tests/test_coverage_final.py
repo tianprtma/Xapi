@@ -104,7 +104,7 @@ class TestAuthRemaining:
 
     async def test_make_client_defaults(self):
         from app.auth import make_client
-        with patch("app.auth.random_proxy", return_value=None):
+        with patch("app.auth.proxy_for_token", return_value=None):
             client = make_client("tok123")
             assert client is not None
 

@@ -32,6 +32,7 @@ class TestSession:
         s = Session(auth_token="tok1", ct0="ct0_1", cookies={})
         assert s.viewer_alive() is False  # no viewer set
         s.viewer = {"status": "valid"}
+        s.viewer_at = time.time()
         s.last_used = time.time()
         assert s.viewer_alive() is True
 

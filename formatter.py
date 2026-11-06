@@ -29,6 +29,14 @@ def _user_result_to_obj(user_result: dict[str, Any]) -> Optional[dict[str, Any]]
     avatar = (_av.get("image_url_https") or _av.get("image_url")
               or legacy.get("profile_image_url_https"))
     location = (user_result.get("location") or {}).get("location") or legacy.get("location")
+    rel_persp = user_result.get("relationship_perspectives") or {}
+    following = rel_persp.get("following") if "following" in rel_persp else legacy.get("following")
+    followed_by = rel_persp.get("followed_by") if "followed_by" in rel_persp else legacy.get("followed_by")
+    blocking = rel_persp.get("blocking") if "blocking" in rel_persp else legacy.get("blocking")
+    muting = rel_persp.get("muting") if "muting" in rel_persp else legacy.get("muting")
+    default_avatar = legacy.get("default_profile_image")
+    if default_avatar is None and isinstance(avatar, str):
+        default_avatar = "default_profile" in avatar
 
     return {
         "id": user_result.get("rest_id"),
@@ -46,6 +54,13 @@ def _user_result_to_obj(user_result: dict[str, Any]) -> Optional[dict[str, Any]]
         ),
         "protected": (user_result.get("privacy") or {}).get("protected") if "privacy" in user_result else legacy.get("protected", False),
         "profile_image_url": avatar,
+        "default_profile_image": bool(default_avatar) if default_avatar is not None else False,
+        "relationship": {
+            "following": following,
+            "followed_by": followed_by,
+            "blocking": blocking,
+            "muting": muting,
+        },
         "public_metrics": {
             "followers_count": legacy.get("followers_count") if legacy.get("followers_count") is not None else (user_result.get("relationship_counts") or {}).get("followers"),
             "following_count": legacy.get("friends_count"),
@@ -580,6 +595,10 @@ def _dm_user_obj(u: dict[str, Any]) -> Optional[dict[str, Any]]:
     """REST 1.1 user → X API v2 user object (subset)."""
     if not u:
         return None
+    avatar = u.get("profile_image_url_https")
+    default_avatar = u.get("default_profile_image")
+    if default_avatar is None and isinstance(avatar, str):
+        default_avatar = "default_profile" in avatar
     return {
         "id": str(u.get("id_str") or u.get("id") or ""),
         "name": u.get("name"),
@@ -588,7 +607,14 @@ def _dm_user_obj(u: dict[str, Any]) -> Optional[dict[str, Any]]:
         "description": u.get("description"),
         "verified": u.get("ext_is_blue_verified") or u.get("verified") or False,
         "protected": u.get("protected", False),
-        "profile_image_url": u.get("profile_image_url_https"),
+        "profile_image_url": avatar,
+        "default_profile_image": bool(default_avatar) if default_avatar is not None else False,
+        "relationship": {
+            "following": u.get("following"),
+            "followed_by": u.get("followed_by"),
+            "blocking": u.get("blocking"),
+            "muting": u.get("muting"),
+        },
         "public_metrics": {
             "followers_count": u.get("followers_count"),
             "following_count": u.get("friends_count"),
@@ -646,6 +672,11 @@ def _dm_event_to_obj(
                 base["_sender_follows_owner"] = True
             elif fb is False:
                 base["_sender_follows_owner"] = False
+            fw = sender_obj.get("following")
+            if fw is True:
+                base["_owner_follows_sender"] = True
+            elif fw is False:
+                base["_owner_follows_sender"] = False
         # entities
         entities = msg_data.get("entities") or {}
         if entities:

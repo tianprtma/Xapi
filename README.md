@@ -163,6 +163,10 @@ Semua endpoint butuh `auth_token` cookie. Token di-pass via:
 | POST | `/2/dm_conversations` | DM | create group/1-on-1 conv |
 | POST | `/2/dm_conversations/with/{participant_id}/messages` | DM | send DM (by user) |
 | POST | `/2/dm_conversations/{id}/messages` | DM | send DM (by conv) |
+| POST | `/2/dm_conversations/{conversation_id}/accept` | DM | approve/accept DM request (by conv) |
+| POST | `/2/dm_conversations/with/{participant_id}/accept` | DM | approve/accept DM request (by user) |
+| DELETE | `/2/dm_conversations/{conversation_id}` | DM | reject/delete DM request or conversation |
+| DELETE | `/2/dm_conversations/with/{participant_id}` | DM | reject/delete 1-on-1 DM request or conv |
 | DELETE | `/2/dm_events/{event_id}` | DM | delete own message |
 | POST | `/2/users/{id}/dm/block` | DM | block from DM |
 | POST | `/2/users/{id}/dm/unblock` | DM | unblock from DM |

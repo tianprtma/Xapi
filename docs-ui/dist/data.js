@@ -137,6 +137,9 @@ window.XDOC_DATA = (function () {
         { id: 'dm-send',          label: 'Send DM (by user)',   method: 'POST', path: '/2/dm_conversations/with/:participant_id/messages' },
         { id: 'dm-send-conv',     label: 'Send DM (by conv)',   method: 'POST', path: '/2/dm_conversations/:id/messages' },
         { id: 'dm-conv-create',   label: 'Create conversation', method: 'POST', path: '/2/dm_conversations' },
+        { id: 'dm-conv-accept',   label: 'Approve DM request',  method: 'POST', path: '/2/dm_conversations/:conversation_id/accept' },
+        { id: 'dm-with-accept',   label: 'Approve DM (by user)', method: 'POST', path: '/2/dm_conversations/with/:participant_id/accept' },
+        { id: 'dm-conv-delete',   label: 'Reject/Delete conv',  method: 'DEL',  path: '/2/dm_conversations/:conversation_id' },
         { id: 'dm-event-delete',  label: 'Delete event',        method: 'DEL',  path: '/2/dm_events/:event_id' },
         { id: 'dm-block',         label: 'Block from DM',       method: 'POST', path: '/2/users/:id/dm/block' },
         { id: 'dm-unblock',       label: 'Unblock from DM',     method: 'POST', path: '/2/users/:id/dm/unblock' },
@@ -1650,6 +1653,36 @@ requests.post(
       op: 'GetConversationPageQuery',
       engine: 'graphql+dm',
       ok: '{\n  "data": [\n    { "id": "2040339972549656964", "event_type": "MessageCreate", "text": "Halo!", "sender_id": "111" }\n  ],\n  "meta": { "result_count": 1 }\n}',
+    }),
+    'dm-conv-accept': ep({
+      method: 'POST', path: '/2/dm_conversations/:conversation_id/accept', name: 'Approve DM request (by conv)',
+      summary: 'Approve / terima DM message request berdasarkan `conversation_id` (memindahkan percakapan dari Untrusted Requests ke Primary Inbox). Alias: `POST /2/chat/requests/:conversation_id/accept`.',
+      params: [
+        { name: 'conversation_id', loc: 'path', type: 'string', required: true, desc: 'Conversation ID (mis. `1394249284736864258-1689088958729486336`).' },
+        P_RAW,
+      ],
+      engine: 'dm',
+      ok: '{\n  "data": {\n    "accepted": true,\n    "trusted": true,\n    "dm_conversation_id": "1394249284736864258-1689088958729486336"\n  }\n}',
+    }),
+    'dm-with-accept': ep({
+      method: 'POST', path: '/2/dm_conversations/with/:participant_id/accept', name: 'Approve DM request (by user)',
+      summary: 'Approve / terima DM message request 1-on-1 dari user tertentu (`participant_id`). Otomatis me-resolve `me` dan membentuk `conversation_id`.',
+      params: [
+        { name: 'participant_id', loc: 'path', type: 'string', required: true, desc: 'User ID pengirim request DM.' },
+        P_RAW,
+      ],
+      engine: 'dm',
+      ok: '{\n  "data": {\n    "accepted": true,\n    "trusted": true,\n    "dm_conversation_id": "1394249284736864258-1689088958729486336"\n  }\n}',
+    }),
+    'dm-conv-delete': ep({
+      method: 'DEL', path: '/2/dm_conversations/:conversation_id', name: 'Reject / Delete DM conversation',
+      summary: 'Tolak (reject) DM message request atau hapus/keluar dari percakapan DM. Alias: `POST /2/dm_conversations/:conversation_id/reject`, `DELETE /2/chat/requests/:conversation_id`, dan `DELETE /2/dm_conversations/with/:participant_id`.',
+      params: [
+        { name: 'conversation_id', loc: 'path', type: 'string', required: true, desc: 'Conversation ID.' },
+        P_RAW,
+      ],
+      engine: 'dm',
+      ok: '{\n  "data": {\n    "deleted": true,\n    "dm_conversation_id": "1394249284736864258-1689088958729486336"\n  }\n}',
     }),
     'dm-event-delete': ep({
       method: 'DEL', path: '/2/dm_events/:event_id', name: 'Delete DM event',

@@ -234,13 +234,15 @@ async def v2_chat_conversation_messages(
 async def v2_chat_requests(
     pagination_token: Optional[str] = Query(None),
     max_results: int = Query(50, ge=1, le=100),
+    include_low_quality: int = Query(1, description="1 = sertakan low quality / spam requests"),
     authorization: Optional[str] = Header(None),
     auth_token: Optional[str] = Query(None),
     raw: int = Query(0),
 ) -> JSONResponse:
     """
-    GET /2/chat/requests — ambil daftar message requests (untrusted inbox) via GraphQL.
-    Backend: GraphQL `GetMessageRequestsPageQuery` dengan fallback ke REST 1.1 `dm/inbox_timeline/untrusted.json`.
+    GET /2/chat/requests — ambil daftar message requests (untrusted & low-quality inbox) via GraphQL + REST 1.1.
+    Backend: GraphQL `GetMessageRequestsPageQuery` + REST 1.1 `dm/inbox_timeline/untrusted.json`
+    (& `dm/inbox_timeline/untrusted_low_quality.json`).
     """
     tok = extract_bearer(authorization, auth_token)
     variables: dict[str, Any] = {"count": max_results}
@@ -248,10 +250,30 @@ async def v2_chat_requests(
         variables["cursor"] = pagination_token
 
     result = await graphql_call("GetMessageRequestsPageQuery", variables, tok)
-    if not _has_gql_dm_data(result):
-        params: dict[str, Any] = {"max_id": pagination_token} if pagination_token else {}
-        rest_res = await dm_call("dm/inbox_timeline/untrusted.json", tok, params=params)
-        if rest_res.get("status") == "ok":
+
+    # Also query REST 1.1 untrusted & untrusted_low_quality timelines so plaintext requests are included
+    params: dict[str, Any] = {"max_id": pagination_token} if pagination_token else {}
+    rest_res = await dm_call("dm/inbox_timeline/untrusted.json", tok, params=params)
+    if rest_res.get("status") == "ok" and include_low_quality and not pagination_token:
+        lq_res = await dm_call("dm/inbox_timeline/untrusted_low_quality.json", tok)
+        if lq_res.get("status") == "ok":
+            rest_data = dict(rest_res.get("data") or {})
+            base_tl = dict(rest_data.get("inbox_timeline") or {})
+            lq_tl = (lq_res.get("data") or {}).get("inbox_timeline") or {}
+            if isinstance(lq_tl, dict):
+                base_tl["entries"] = list(base_tl.get("entries") or []) + list(lq_tl.get("entries") or [])
+                base_tl["users"] = {**(base_tl.get("users") or {}), **(lq_tl.get("users") or {})}
+                base_tl["conversations"] = {**(base_tl.get("conversations") or {}), **(lq_tl.get("conversations") or {})}
+                rest_data["inbox_timeline"] = base_tl
+                rest_res = {**rest_res, "data": rest_data}
+
+    if rest_res.get("status") == "ok":
+        rest_tl = (rest_res.get("data") or {}).get("inbox_timeline") or {}
+        if _has_gql_dm_data(result) and isinstance(result.get("data"), dict) and isinstance(rest_tl, dict):
+            result = {**result, "data": {"inbox_initial_state": rest_tl, **result["data"]}}
+        elif isinstance(rest_tl, dict) and rest_tl:
+            result = {**rest_res, "data": {"inbox_initial_state": rest_tl}}
+        elif not _has_gql_dm_data(result):
             result = rest_res
 
     return finalize(result, lambda d: format_dm_events(d, max_results=max_results), bool(raw))
@@ -905,3 +927,135 @@ async def v2_dm_unblock(
     if result["status"] == "ok":
         return JSONResponse(status_code=200, content={"data": {"blocking": False, "user_id": user_id}})
     return write_finalize(result, raw=False)
+
+
+# ──────────────────────────── Approve / Reject DM Requests ────────────────────────────
+
+
+async def _accept_dm_conversation(conv_id: str, tok: str, raw: int) -> JSONResponse:
+    """Helper internal: approve (accept) message request conversation_id."""
+    norm_conv_id = conv_id.replace(":", "-")
+    result = await dm_call(
+        f"dm/conversation/{norm_conv_id}/accept.json",
+        tok,
+        method="POST",
+        data={"request_id": secrets.token_hex(16)},
+        with_dm_defaults=False,
+    )
+    if result["status"] != "ok" and result.get("http_status") == 404:
+        result = await dm_call(
+            "dm/conversation/accept.json",
+            tok,
+            method="POST",
+            data={"conversation_id": norm_conv_id, "request_id": secrets.token_hex(16)},
+            with_dm_defaults=False,
+        )
+    if raw:
+        return wrap(result)
+    if result["status"] == "ok":
+        return JSONResponse(
+            status_code=200,
+            content={"data": {"accepted": True, "trusted": True, "dm_conversation_id": norm_conv_id}},
+        )
+    return write_finalize(result, raw=False)
+
+
+async def _delete_dm_conversation(conv_id: str, tok: str, raw: int) -> JSONResponse:
+    """Helper internal: reject / delete message request atau percakapan DM."""
+    norm_conv_id = conv_id.replace(":", "-")
+    result = await dm_call(
+        f"dm/conversation/{norm_conv_id}/delete.json",
+        tok,
+        method="POST",
+        data={"last_event_id": "0", "request_id": secrets.token_hex(16)},
+        with_dm_defaults=False,
+    )
+    if raw:
+        return wrap(result)
+    if result["status"] == "ok":
+        return JSONResponse(
+            status_code=200,
+            content={"data": {"deleted": True, "dm_conversation_id": norm_conv_id}},
+        )
+    return write_finalize(result, raw=False)
+
+
+@router.post("/2/dm_conversations/{conversation_id}/accept")
+@router.post("/2/chat/requests/{conversation_id}/accept")
+async def v2_dm_conv_accept(
+    conversation_id: str = PathParam(..., pattern=r"^\d+([:-]\d+)*$"),
+    authorization: Optional[str] = Header(None),
+    auth_token: Optional[str] = Query(None),
+    raw: int = Query(0),
+) -> JSONResponse:
+    """
+    POST /2/dm_conversations/{conversation_id}/accept (dan alias `/2/chat/requests/{conversation_id}/accept`)
+    — Approve / terima DM message request berdasarkan `conversation_id` (memindahkan dari Untrusted ke Primary Inbox).
+    Backend: REST 1.1 `POST dm/conversation/{conversation_id}/accept.json`.
+    """
+    tok = extract_bearer(authorization, auth_token)
+    return await _accept_dm_conversation(conversation_id, tok, raw)
+
+
+@router.post("/2/dm_conversations/with/{participant_id}/accept")
+async def v2_dm_with_user_accept(
+    participant_id: str = PathParam(..., pattern=r"^\d+$"),
+    authorization: Optional[str] = Header(None),
+    auth_token: Optional[str] = Query(None),
+    raw: int = Query(0),
+) -> JSONResponse:
+    """
+    POST /2/dm_conversations/with/{participant_id}/accept
+    — Approve / terima DM message request dari user tertentu (`participant_id`).
+    """
+    tok = extract_bearer(authorization, auth_token)
+    me = await resolve_me_id(tok)
+    if not me:
+        return JSONResponse(
+            status_code=401,
+            content=format_error("Unauthorized", "auth_token invalid/expired", "unauthorized", 401),
+        )
+    conv_id = dm_conv_id_for(me, participant_id)
+    return await _accept_dm_conversation(conv_id, tok, raw)
+
+
+@router.delete("/2/dm_conversations/{conversation_id}")
+@router.post("/2/dm_conversations/{conversation_id}/reject")
+@router.delete("/2/chat/requests/{conversation_id}")
+async def v2_dm_conv_delete(
+    conversation_id: str = PathParam(..., pattern=r"^\d+([:-]\d+)*$"),
+    authorization: Optional[str] = Header(None),
+    auth_token: Optional[str] = Query(None),
+    raw: int = Query(0),
+) -> JSONResponse:
+    """
+    DELETE /2/dm_conversations/{conversation_id} (dan alias `POST /2/dm_conversations/{conversation_id}/reject`,
+    `DELETE /2/chat/requests/{conversation_id}`)
+    — Reject / hapus DM message request atau keluar dari percakapan DM.
+    Backend: REST 1.1 `POST dm/conversation/{conversation_id}/delete.json`.
+    """
+    tok = extract_bearer(authorization, auth_token)
+    return await _delete_dm_conversation(conversation_id, tok, raw)
+
+
+@router.delete("/2/dm_conversations/with/{participant_id}")
+@router.post("/2/dm_conversations/with/{participant_id}/reject")
+async def v2_dm_with_user_delete(
+    participant_id: str = PathParam(..., pattern=r"^\d+$"),
+    authorization: Optional[str] = Header(None),
+    auth_token: Optional[str] = Query(None),
+    raw: int = Query(0),
+) -> JSONResponse:
+    """
+    DELETE /2/dm_conversations/with/{participant_id} (dan alias `POST /2/dm_conversations/with/{participant_id}/reject`)
+    — Reject / hapus DM message request atau percakapan 1-on-1 dengan user tertentu (`participant_id`).
+    """
+    tok = extract_bearer(authorization, auth_token)
+    me = await resolve_me_id(tok)
+    if not me:
+        return JSONResponse(
+            status_code=401,
+            content=format_error("Unauthorized", "auth_token invalid/expired", "unauthorized", 401),
+        )
+    conv_id = dm_conv_id_for(me, participant_id)
+    return await _delete_dm_conversation(conv_id, tok, raw)

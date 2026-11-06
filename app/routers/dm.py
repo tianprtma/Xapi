@@ -664,22 +664,30 @@ async def v2_dm_with_user_events(
 
 
 @router.get("/2/dm_conversations/media/{dm_id}/{media_id}/{resource_id}", response_model=None)
+@router.get("/2/dm_conversations/media/{dm_id}/{media_id:path}/{resource_id}", response_model=None)
 async def v2_dm_media_proxy(
     dm_id: str = PathParam(..., pattern=r"^\d+$"),
-    media_id: str = PathParam(..., pattern=r"^\d+$"),
-    resource_id: str = PathParam(..., description="Filename e.g. Z4k2_BaF.jpg"),
+    media_id: str = PathParam(..., pattern=r"^[A-Za-z0-9_/-]+$"),
+    resource_id: str = PathParam(..., pattern=r"^[A-Za-z0-9._-]+$", description="Filename e.g. Z4k2_BaF.jpg or vid.mp4"),
     authorization: Optional[str] = Header(None),
     auth_token: Optional[str] = Query(None),
 ) -> Response:
     """
     GET /2/dm_conversations/media/{dm_id}/{media_id}/{resource_id} — proxy download binary media DM
+    (foto, GIF, maupun video multi-segmen `.../vid/avc1/720x1280/xxx.mp4`)
     dari `https://ton.x.com/1.1/ton/data/dm/{dm_id}/{media_id}/{resource_id}` menggunakan sesi `auth_token`.
     """
     from ..auth import api_headers
     from ..client_pool import pooled_client
 
+    if ".." in media_id or ".." in resource_id:
+        return JSONResponse(
+            status_code=400,
+            content=format_error("Bad Request", "Invalid media path segment", "bad_request", 400),
+        )
+
     tok = extract_bearer(authorization, auth_token)
-    url = f"https://ton.x.com/1.1/ton/data/dm/{dm_id}/{media_id}/{resource_id}"
+    url = f"https://ton.x.com/1.1/ton/data/dm/{dm_id}/{media_id.strip('/')}/{resource_id}"
     async with pooled_client(tok) as client:
         ct0, cookies = await warm_session(client, tok)
         for k, v in cookies.items():

@@ -219,6 +219,11 @@ def _dm_attachment_obj(m: dict[str, Any]) -> dict[str, Any]:
         if mp4s:
             url = mp4s[0].get("url")
             mime = "video/mp4"
+    thumbnail_url = m.get("media_url_https") if kind in ("video", "animated_gif") else None
+    thumbnail_proxy_path: Optional[str] = None
+    if thumbnail_url and "/ton/data/dm/" in thumbnail_url:
+        t_suffix = thumbnail_url.split("/ton/data/dm/", 1)[1].split("?", 1)[0]
+        thumbnail_proxy_path = f"/2/dm_conversations/media/{t_suffix}"
     if kind == "photo" and url:
         # X serves DM photos at media_url_https; format is in `format` field
         # (jpg|png|gif|webp). MIME is best-guessed from extension.
@@ -238,6 +243,8 @@ def _dm_attachment_obj(m: dict[str, Any]) -> dict[str, Any]:
         "mime": mime,
         "url": url,
         "proxy_path": proxy_path,
+        "thumbnail_url": thumbnail_url,
+        "thumbnail_proxy_path": thumbnail_proxy_path,
         "width": width,
         "height": height,
         "duration_ms": duration_ms,

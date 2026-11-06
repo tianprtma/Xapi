@@ -34,15 +34,20 @@ def _user_result_to_obj(user_result: dict[str, Any]) -> Optional[dict[str, Any]]
         "id": user_result.get("rest_id"),
         "name": core.get("name") or legacy.get("name"),
         "username": core.get("screen_name") or legacy.get("screen_name"),
-        "created_at": core.get("created_at") or legacy.get("created_at"),
+        "created_at": core.get("created_at") or legacy.get("created_at") or _dm_ts_to_iso(core.get("created_at_ms")),
         "description": legacy.get("description"),
         "location": location,
         "url": legacy.get("url"),
-        "verified": user_result.get("is_blue_verified") or legacy.get("verified") or False,
-        "protected": legacy.get("protected", False),
+        "verified": (
+            user_result.get("is_blue_verified")
+            or (user_result.get("verification") or {}).get("is_blue_verified")
+            or legacy.get("verified")
+            or False
+        ),
+        "protected": (user_result.get("privacy") or {}).get("protected") if "privacy" in user_result else legacy.get("protected", False),
         "profile_image_url": avatar,
         "public_metrics": {
-            "followers_count": legacy.get("followers_count"),
+            "followers_count": legacy.get("followers_count") if legacy.get("followers_count") is not None else (user_result.get("relationship_counts") or {}).get("followers"),
             "following_count": legacy.get("friends_count"),
             "tweet_count": legacy.get("statuses_count"),
             "listed_count": legacy.get("listed_count"),
@@ -208,10 +213,16 @@ def _dm_attachment_obj(m: dict[str, Any]) -> dict[str, Any]:
     if isinstance(m.get("size"), int):
         byte_size = m.get("size")
 
+    proxy_path: Optional[str] = None
+    if url and "/ton/data/dm/" in url:
+        suffix = url.split("/ton/data/dm/", 1)[1].split("?", 1)[0]
+        proxy_path = f"/2/dm_conversations/media/{suffix}"
+
     return {
         "kind": kind,
         "mime": mime,
         "url": url,
+        "proxy_path": proxy_path,
         "width": width,
         "height": height,
         "duration_ms": duration_ms,
@@ -657,11 +668,13 @@ def _dm_event_to_obj(
         attach = msg_data.get("attachment") or {}
         media = attach.get("media") or attach.get("photo") or attach.get("video")
         if media and media.get("id_str"):
-            base["attachments"] = {"media_keys": [str(media["id_str"])]}
+            att_obj = _dm_attachment_obj(media)
+            m_v2 = _dm_media_v2_obj(att_obj)
+            base["attachments"] = {"media_keys": [str(m_v2.get("media_key") or media["id_str"])]}
             # Surface DL URL + type so consumers can fetch the binary without
             # re-walking includes. `_xapi_attachments` is non-spec; consumers
             # should treat it as best-effort.
-            base["_xapi_attachments"] = [_dm_attachment_obj(media)]
+            base["_xapi_attachments"] = [att_obj]
         # quoted/referenced tweet
         if attach.get("tweet"):
             tw = attach["tweet"]
@@ -696,16 +709,888 @@ _DM_EVENT_TYPE_MAP = {
 
 
 def _dm_ts_to_iso(ts: Any) -> Optional[str]:
-    """REST 1.1 dm timestamp (ms epoch string) → ISO 8601."""
+    """REST 1.1 / GraphQL DM timestamp (ms epoch string/int or ISO string) → ISO 8601."""
     if not ts:
         return None
+    if isinstance(ts, str) and "T" in ts and ts.endswith("Z"):
+        return ts
     try:
         from datetime import datetime, timezone
 
         ms = int(ts)
+        # Handle seconds vs milliseconds epoch
+        if ms < 10_000_000_000:
+            ms *= 1000
         return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
     except (ValueError, TypeError):
         return str(ts)
+
+
+def _decode_xchat_thrift_event(b64_str: str, default_conv_id: Optional[str] = None) -> Optional[dict[str, Any]]:
+    """
+    Decode a Base64-encoded Apache Thrift binary `XChatMessageEvent` blob from
+    `GetInitialXChatPageQuery` / `GetConversationPageQuery` (`latest_message_events`).
+
+    Thrift field layout in XChat:
+      1 (STRING): event_id (Snowflake ID string)
+      2 (STRING): request_id / UUID
+      3 (STRING): sender_id (User rest_id string)
+      4 (STRING): conversation_id ("<uid1>:<uid2>")
+      5 (STRING): juicebox JWT token
+      6 (STRING): created_timestamp_ms (epoch ms string)
+      7 (STRUCT): payload (field 1 = encrypted message struct -> field 100 = E2EE ciphertext bytes)
+    """
+    if not isinstance(b64_str, str) or len(b64_str) < 16:
+        return None
+    try:
+        import base64
+        import struct
+
+        padded = b64_str + "=" * ((4 - len(b64_str) % 4) % 4)
+        buf = base64.b64decode(padded)
+    except Exception:
+        return None
+
+    def _read_val(ftype: int, off: int) -> tuple[Any, int]:
+        if off >= len(buf):
+            raise ValueError("Thrift buffer underflow")
+        if ftype == 2 or ftype == 3:
+            return buf[off], off + 1
+        if ftype == 4:
+            if off + 8 > len(buf):
+                raise ValueError("Thrift DOUBLE underflow")
+            return struct.unpack(">d", buf[off : off + 8])[0], off + 8
+        if ftype == 6:
+            if off + 2 > len(buf):
+                raise ValueError("Thrift I16 underflow")
+            return struct.unpack(">h", buf[off : off + 2])[0], off + 2
+        if ftype == 8:
+            if off + 4 > len(buf):
+                raise ValueError("Thrift I32 underflow")
+            return struct.unpack(">i", buf[off : off + 4])[0], off + 4
+        if ftype == 10:
+            if off + 8 > len(buf):
+                raise ValueError("Thrift I64 underflow")
+            return struct.unpack(">q", buf[off : off + 8])[0], off + 8
+        if ftype == 11:
+            if off + 4 > len(buf):
+                raise ValueError("Thrift STRING length underflow")
+            ln = struct.unpack(">i", buf[off : off + 4])[0]
+            off += 4
+            if ln < 0 or off + ln > len(buf):
+                raise ValueError("Thrift STRING payload out of bounds")
+            raw_b = buf[off : off + ln]
+            off += ln
+            try:
+                return raw_b.decode("utf-8"), off
+            except UnicodeDecodeError:
+                return base64.b64encode(raw_b).decode("ascii"), off
+        if ftype == 12:
+            return _read_struct(off)
+        if ftype == 13:
+            if off + 6 > len(buf):
+                raise ValueError("Thrift MAP header underflow")
+            kt, vt = buf[off], buf[off + 1]
+            sz = struct.unpack(">i", buf[off + 2 : off + 6])[0]
+            off += 6
+            if sz < 0 or sz > 10000:
+                raise ValueError("Thrift MAP size out of bounds")
+            mp: dict[Any, Any] = {}
+            for _ in range(sz):
+                k, off = _read_val(kt, off)
+                v, off = _read_val(vt, off)
+                mp[k] = v
+            return mp, off
+        if ftype == 14 or ftype == 15:
+            if off + 5 > len(buf):
+                raise ValueError("Thrift LIST/SET header underflow")
+            et = buf[off]
+            sz = struct.unpack(">i", buf[off + 1 : off + 5])[0]
+            off += 5
+            if sz < 0 or sz > 10000:
+                raise ValueError("Thrift LIST/SET size out of bounds")
+            arr = []
+            for _ in range(sz):
+                v, off = _read_val(et, off)
+                arr.append(v)
+            return arr, off
+        raise ValueError(f"Unsupported thrift type {ftype}")
+
+    def _read_struct(off: int) -> tuple[dict[int, Any], int]:
+        out_f: dict[int, Any] = {}
+        while off < len(buf):
+            ft = buf[off]
+            off += 1
+            if ft == 0:
+                break
+            if off + 2 > len(buf):
+                raise ValueError("Thrift field ID underflow")
+            fid = struct.unpack(">h", buf[off : off + 2])[0]
+            off += 2
+            val, off = _read_val(ft, off)
+            out_f[fid] = val
+        return out_f, off
+
+    try:
+        parsed, _ = _read_struct(0)
+    except Exception:
+        return None
+
+    ev_id = parsed.get(1)
+    if not ev_id:
+        return None
+    sender_id = parsed.get(3)
+    conv_id = str(parsed.get(4) or default_conv_id or "").replace(":", "-")
+    ts = parsed.get(6)
+    payload_struct = parsed.get(7) if isinstance(parsed.get(7), dict) else {}
+    msg_struct = payload_struct.get(1) if isinstance(payload_struct.get(1), dict) else {}
+    ciphertext_b64 = msg_struct.get(100) if isinstance(msg_struct, dict) else None
+
+    # Field 12 inside payload_struct (7 -> 12) is MarkRead event
+    if 12 in payload_struct and not msg_struct:
+        return None
+
+    out: dict[str, Any] = {
+        "id": str(ev_id),
+        "event_type": "MessageCreate",
+        "created_at": _dm_ts_to_iso(ts),
+        "dm_conversation_id": conv_id or None,
+        "sender_id": str(sender_id) if sender_id else None,
+        "text": "[XChat E2EE Encrypted Message]" if ciphertext_b64 else None,
+        "_xchat_encrypted": bool(ciphertext_b64),
+    }
+    if ciphertext_b64:
+        out["encrypted_text"] = ciphertext_b64
+    return {k: v for k, v in out.items() if v is not None}
+
+
+def _gql_dm_event_to_obj(
+    ev: dict[str, Any],
+    default_conv_id: Optional[str] = None,
+    users_by_id: Optional[dict[str, dict[str, Any]]] = None,
+) -> Optional[dict[str, Any]]:
+    """
+    Convert GraphQL DM / XChat message or event node → X API v2 dm_events shape.
+    Supports:
+    - XChat `GetInitialXChatPageQuery` / `GetConversationPageQuery` / `GetMessageEventsPageQuery`
+      message event nodes (`id`/`event_id`/`rest_id`, `conversation_id`, `sender_id`/`sender_results`,
+      `text`/`content`/`message_data`, `created_at`/`created_timestamp`/`timestamp_ms`)
+    - Standard REST-like event nodes embedded in GraphQL responses
+    - `DmAllSearchSlice` / `DmGroupSearchSlice` message search items
+    """
+    if not isinstance(ev, dict) or not ev:
+        return None
+
+    # Unwrap nested message wrappers if present
+    inner = (
+        ev.get("message")
+        or ev.get("message_event")
+        or ev.get("event")
+        or ev.get("dm_event")
+        or ev
+    )
+    if not isinstance(inner, dict):
+        inner = ev
+
+    # Extract nested user if present on sender_results / user_results
+    for u_key in ("sender_results", "user_results", "sender", "user"):
+        u_node = inner.get(u_key) or ev.get(u_key)
+        if isinstance(u_node, dict):
+            res = u_node.get("result") if "result" in u_node else u_node
+            if isinstance(res, dict) and (res.get("rest_id") or res.get("id_str")):
+                u_obj = _user_result_to_obj(res) if "rest_id" in res else _dm_user_obj(res)
+                if u_obj and u_obj.get("id") and users_by_id is not None:
+                    users_by_id[str(u_obj["id"])] = u_obj
+
+    # If it looks like a standard REST 1.1 event dict, delegate to _dm_event_to_obj
+    if "message_create" in inner or ("message_data" in inner and ("id" in inner or "event_id" in inner)):
+        obj = _dm_event_to_obj(
+            {
+                **inner,
+                "type": inner.get("type") or inner.get("event_type") or "message_create",
+                "conversation_id": inner.get("conversation_id") or default_conv_id,
+            }
+        )
+        if obj and obj.get("id"):
+            return obj
+
+    ev_id = (
+        inner.get("id")
+        or inner.get("event_id")
+        or inner.get("message_id")
+        or inner.get("rest_id")
+        or inner.get("sequence_id")
+        or ev.get("id")
+        or ev.get("rest_id")
+    )
+    if not ev_id:
+        return None
+
+    conv_id = (
+        inner.get("conversation_id")
+        or inner.get("dm_conversation_id")
+        or (inner.get("conversation") or {}).get("conversation_id")
+        or (inner.get("conversation") or {}).get("id")
+        or ev.get("conversation_id")
+        or default_conv_id
+    )
+    if isinstance(conv_id, str) and ":" in conv_id:
+        conv_id = conv_id.replace(":", "-")
+
+    content = inner.get("content") if isinstance(inner.get("content"), dict) else {}
+    msg_data = inner.get("message_data") if isinstance(inner.get("message_data"), dict) else {}
+
+    sender_id = (
+        inner.get("sender_id")
+        or inner.get("sender_rest_id")
+        or inner.get("user_id")
+        or msg_data.get("sender_id")
+        or content.get("sender_id")
+        or ((inner.get("sender_results") or {}).get("result") or {}).get("rest_id")
+        or (inner.get("sender") or {}).get("id_str")
+        or (inner.get("sender") or {}).get("rest_id")
+        or (inner.get("sender") or {}).get("id")
+    )
+
+    text = (
+        inner.get("text")
+        or (inner.get("content") if isinstance(inner.get("content"), str) else None)
+        or content.get("text")
+        or content.get("body")
+        or msg_data.get("text")
+        or (inner.get("body") if isinstance(inner.get("body"), str) else None)
+    )
+
+    ts = (
+        inner.get("created_at")
+        or inner.get("created_timestamp")
+        or inner.get("timestamp_ms")
+        or inner.get("timestamp")
+        or inner.get("time")
+        or ev.get("created_at")
+        or ev.get("created_timestamp")
+    )
+
+    raw_type = (
+        inner.get("event_type")
+        or inner.get("type")
+        or inner.get("__typename")
+        or "MessageCreate"
+    )
+    event_type = _DM_EVENT_TYPE_MAP.get(raw_type, "MessageCreate" if "Message" in str(raw_type) or text is not None else str(raw_type))
+
+    out: dict[str, Any] = {
+        "id": str(ev_id),
+        "event_type": event_type,
+        "created_at": _dm_ts_to_iso(ts),
+        "dm_conversation_id": str(conv_id) if conv_id else None,
+        "sender_id": str(sender_id) if sender_id else None,
+        "text": text,
+    }
+
+    # Entities if present
+    entities = inner.get("entities") or msg_data.get("entities") or content.get("entities") or {}
+    if isinstance(entities, dict) and entities:
+        out["entities"] = {
+            "hashtags": [{"tag": h.get("text")} for h in entities.get("hashtags", []) if isinstance(h, dict)],
+            "mentions": [
+                {"username": m.get("screen_name"), "id": str(m.get("id_str") or m.get("id") or "")}
+                for m in entities.get("user_mentions", [])
+                if isinstance(m, dict)
+            ],
+            "urls": [
+                {
+                    "url": u.get("url"),
+                    "expanded_url": u.get("expanded_url"),
+                    "display_url": u.get("display_url"),
+                }
+                for u in entities.get("urls", [])
+                if isinstance(u, dict)
+            ],
+        }
+
+    # Media attachments if present
+    attach = inner.get("attachment") or msg_data.get("attachment") or content.get("attachment") or {}
+    if isinstance(attach, dict):
+        media = attach.get("media") or attach.get("photo") or attach.get("video")
+        if isinstance(media, dict) and (media.get("id_str") or media.get("id")):
+            att_obj = _dm_attachment_obj(media)
+            m_v2 = _dm_media_v2_obj(att_obj)
+            out["attachments"] = {"media_keys": [str(m_v2.get("media_key") or media.get("id_str") or media.get("id"))]}
+            out["_xapi_attachments"] = [att_obj]
+
+    # Participants if present
+    participants = inner.get("participants") or inner.get("participant_ids")
+    if isinstance(participants, list) and participants:
+        p_ids = []
+        for p in participants:
+            if isinstance(p, dict):
+                uid = p.get("user_id") or p.get("rest_id") or p.get("id") or ((p.get("user_results") or {}).get("result") or {}).get("rest_id")
+                if uid:
+                    p_ids.append(str(uid))
+                u_res = (p.get("user_results") or {}).get("result") or p.get("user")
+                if isinstance(u_res, dict) and users_by_id is not None:
+                    u_obj = _user_result_to_obj(u_res) if "rest_id" in u_res else _dm_user_obj(u_res)
+                    if u_obj and u_obj.get("id"):
+                        users_by_id[str(u_obj["id"])] = u_obj
+            elif p:
+                p_ids.append(str(p))
+        if p_ids and event_type in ("ParticipantsJoin", "ParticipantsLeave"):
+            out["participant_ids"] = p_ids
+
+    return {k: v for k, v in out.items() if v is not None}
+
+
+def _extract_gql_dm_conversations_and_events(
+    data: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], dict[str, dict[str, Any]], Optional[str], Optional[str]]:
+    """
+    Walk GraphQL DM / XChat response `data` and extract:
+    (events, users_by_id, conversations_by_id, next_token, prev_token).
+
+    Handles:
+    - `get_initial_chat_page` (`GetInitialXChatPageQuery`)
+    - `get_inbox_page` (`GetInboxPageRequestQuery`)
+    - `get_conversation_page` (`GetConversationPageQuery`)
+    - `get_message_events_page` (`GetMessageEventsPageQuery`)
+    - `get_message_requests_page` (`GetMessageRequestsPageQuery`)
+    - `dm_all_search_slice` / `dm_group_search_slice` / `dm_people_search_slice`
+    - `viewer.dm_inbox` / generic GraphQL DM containers
+    """
+    events: list[dict[str, Any]] = []
+    users_by_id: dict[str, dict[str, Any]] = {}
+    convs_by_id: dict[str, dict[str, Any]] = {}
+    next_token: Optional[str] = None
+    prev_token: Optional[str] = None
+
+    def _collect_user(u_node: Any) -> None:
+        if not isinstance(u_node, dict):
+            return
+        res = u_node.get("result") if "result" in u_node else u_node
+        if not isinstance(res, dict):
+            return
+        if res.get("rest_id") or res.get("__typename") == "User":
+            u_obj = _user_result_to_obj(res)
+        elif res.get("id_str") or res.get("screen_name"):
+            u_obj = _dm_user_obj(res)
+        else:
+            u_obj = None
+        if u_obj and u_obj.get("id"):
+            users_by_id[str(u_obj["id"])] = u_obj
+
+    def _collect_conv(c: dict[str, Any]) -> Optional[str]:
+        if not isinstance(c, dict):
+            return None
+        detail = c.get("conversation_detail") if isinstance(c.get("conversation_detail"), dict) else {}
+        cid = str(
+            c.get("conversation_id")
+            or detail.get("conversation_id")
+            or c.get("id")
+            or c.get("rest_id")
+            or ""
+        )
+        if ":" in cid:
+            cid = cid.replace(":", "-")
+        if not cid:
+            return None
+
+        parts_raw = (
+            c.get("participants")
+            or detail.get("participants_results")
+            or c.get("participants_results")
+            or c.get("members")
+            or c.get("users")
+            or []
+        )
+        part_ids: list[str] = []
+        if isinstance(parts_raw, list):
+            for p in parts_raw:
+                if isinstance(p, dict):
+                    _collect_user(p.get("user_results") or p.get("result") or p.get("user") or p)
+                    uid = (
+                        p.get("user_id")
+                        or p.get("rest_id")
+                        or p.get("id_str")
+                        or p.get("id")
+                        or ((p.get("user_results") or {}).get("result") or {}).get("rest_id")
+                        or (p.get("result") or {}).get("rest_id")
+                    )
+                    if uid:
+                        part_ids.append(str(uid))
+                elif p:
+                    part_ids.append(str(p))
+
+        ctype_raw = str(
+            c.get("type")
+            or c.get("conversation_type")
+            or detail.get("__typename")
+            or ""
+        ).upper()
+        ctype = "Group" if "GROUP" in ctype_raw or len(part_ids) > 2 else "OneToOne"
+
+        # Ensure both user IDs in a OneToOne `<uid1>-<uid2>` conversation are in participant_ids
+        if ctype == "OneToOne" and "-" in cid:
+            for p_uid in cid.split("-"):
+                if p_uid.isdigit() and p_uid not in part_ids:
+                    part_ids.append(p_uid)
+
+        convs_by_id[cid] = {
+            "id": cid,
+            "type": ctype,
+            "participant_ids": part_ids,
+            "name": c.get("name") or c.get("title") or detail.get("name"),
+            "trusted": c.get("trusted"),
+            "muted": c.get("muted") if c.get("muted") is not None else detail.get("is_muted"),
+            "last_read_event_id": c.get("last_read_event_id"),
+        }
+        convs_by_id[cid] = {k: v for k, v in convs_by_id[cid].items() if v is not None}
+
+        # Collect messages / latest_message inside conversation node
+        conv_msgs = (
+            c.get("messages")
+            or c.get("latest_message_events")
+            or c.get("message_events")
+            or c.get("events")
+            or c.get("items")
+            or []
+        )
+        if isinstance(conv_msgs, dict):
+            conv_msgs = conv_msgs.get("items") or conv_msgs.get("edges") or conv_msgs.get("entries") or []
+        if isinstance(conv_msgs, list):
+            for m in conv_msgs:
+                if isinstance(m, str):
+                    ev_obj = _decode_xchat_thrift_event(m, default_conv_id=cid)
+                    if ev_obj:
+                        events.append(ev_obj)
+                    continue
+                node = m.get("node") if isinstance(m, dict) and "node" in m else m
+                if isinstance(node, dict):
+                    ev_obj = _gql_dm_event_to_obj(node, default_conv_id=cid, users_by_id=users_by_id)
+                    if ev_obj:
+                        events.append(ev_obj)
+
+        for single_key in (
+            "latest_message",
+            "last_message",
+            "last_message_event",
+            "latest_notifiable_message_create_event",
+            "snippet",
+        ):
+            lm = c.get(single_key)
+            if isinstance(lm, str):
+                ev_obj = _decode_xchat_thrift_event(lm, default_conv_id=cid)
+                if ev_obj:
+                    events.append(ev_obj)
+            elif isinstance(lm, dict):
+                ev_obj = _gql_dm_event_to_obj(lm, default_conv_id=cid, users_by_id=users_by_id)
+                if ev_obj:
+                    events.append(ev_obj)
+
+        return cid
+
+    # Inspect known top-level GraphQL DM/XChat containers
+    containers: list[dict[str, Any]] = []
+    for key in (
+        "get_initial_chat_page",
+        "get_inbox_page",
+        "get_conversation_page",
+        "get_message_events_page",
+        "get_message_requests_page",
+        "get_message_events_by_sequence_id",
+        "dm_all_search_slice",
+        "dm_group_search_slice",
+        "dm_people_search_slice",
+        "xchat_send_create_message_event",
+    ):
+        node = data.get(key)
+        if isinstance(node, dict):
+            containers.append(node)
+
+    viewer = data.get("viewer")
+    if isinstance(viewer, dict):
+        for vkey in ("dm_inbox", "chat_inbox", "inbox"):
+            if isinstance(viewer.get(vkey), dict):
+                containers.append(viewer[vkey])
+
+    if not containers and isinstance(data, dict):
+        containers.append(data)
+
+    for container in containers:
+        # 1. Users list / map
+        users_node = container.get("users") or container.get("user_results")
+        if isinstance(users_node, dict):
+            for u in users_node.values():
+                _collect_user(u)
+        elif isinstance(users_node, list):
+            for u in users_node:
+                _collect_user(u)
+
+        # 2. Conversations list / map / single
+        conv_single = container.get("conversation")
+        default_cid: Optional[str] = None
+        if isinstance(conv_single, dict):
+            default_cid = _collect_conv(conv_single)
+        elif isinstance(container.get("conversation_id"), str):
+            default_cid = container["conversation_id"].replace(":", "-")
+
+        convs_node = (
+            container.get("conversations")
+            or container.get("inbox_conversations")
+            or container.get("conversation_slice")
+        )
+        if isinstance(convs_node, dict):
+            if "items" in convs_node and isinstance(convs_node["items"], list):
+                for c in convs_node["items"]:
+                    if isinstance(c, dict):
+                        _collect_conv(c)
+                s_info = convs_node.get("slice_info") or convs_node.get("page_info") or {}
+                if isinstance(s_info, dict):
+                    next_token = next_token or s_info.get("next_cursor") or s_info.get("end_cursor")
+            else:
+                for c in convs_node.values():
+                    if isinstance(c, dict):
+                        _collect_conv(c)
+        elif isinstance(convs_node, list):
+            for c in convs_node:
+                if isinstance(c, dict):
+                    _collect_conv(c)
+
+        # 3. Messages / events list / slice
+        for msg_key in ("messages", "message_events", "events", "entries", "items"):
+            msgs_node = container.get(msg_key)
+            if isinstance(msgs_node, dict):
+                s_info = msgs_node.get("slice_info") or msgs_node.get("page_info") or {}
+                if isinstance(s_info, dict):
+                    next_token = next_token or s_info.get("next_cursor") or s_info.get("end_cursor")
+                    prev_token = prev_token or s_info.get("previous_cursor") or s_info.get("start_cursor")
+                msgs_list = msgs_node.get("items") or msgs_node.get("edges") or msgs_node.get("entries") or []
+            elif isinstance(msgs_node, list):
+                msgs_list = msgs_node
+            else:
+                msgs_list = []
+
+            for item in msgs_list:
+                if isinstance(item, str):
+                    ev_obj = _decode_xchat_thrift_event(item, default_conv_id=default_cid)
+                    if ev_obj:
+                        events.append(ev_obj)
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                node = item.get("node") if "node" in item and isinstance(item["node"], dict) else item
+                # XChatGetInboxPageConversationData has `conversation_detail` + `latest_message_events`
+                if "conversation_detail" in node or node.get("__typename") == "XChatGetInboxPageConversationData":
+                    _collect_conv(node)
+                    continue
+                # Search slice items may wrap message/conversation/user
+                if "dm_convo_search_Metadata" in node or "conversation" in node:
+                    if isinstance(node.get("conversation"), dict):
+                        _collect_conv(node["conversation"])
+                if "user_results" in node or "user" in node:
+                    _collect_user(node.get("user_results") or node.get("user"))
+                ev_obj = _gql_dm_event_to_obj(node, default_conv_id=default_cid, users_by_id=users_by_id)
+                if ev_obj:
+                    events.append(ev_obj)
+
+        # 4. Cursors / pagination
+        for cur_key in ("inboxCursor", "next_cursor", "cursor", "continue_cursor", "bottom_cursor"):
+            c_val = container.get(cur_key)
+            if isinstance(c_val, dict):
+                c_val = c_val.get("cursor_id") or c_val.get("value") or c_val.get("next_cursor")
+            if isinstance(c_val, str) and c_val and not next_token:
+                next_token = c_val
+
+        s_info = container.get("slice_info") or container.get("page_info") or {}
+        if isinstance(s_info, dict):
+            next_token = next_token or s_info.get("next_cursor") or s_info.get("end_cursor")
+            prev_token = prev_token or s_info.get("previous_cursor") or s_info.get("start_cursor")
+
+    return events, users_by_id, convs_by_id, next_token, prev_token
+
+
+def _dm_media_v2_obj(a: dict[str, Any]) -> dict[str, Any]:
+    """Convert an `_xapi_attachments` item into an official X API v2 `includes.media` object."""
+    m_id = str(a.get("media_id") or "")
+    kind = a.get("kind") or "photo"
+    prefix = "3" if kind == "photo" else ("7" if kind == "video" else "16")
+    media_key = m_id if "_" in m_id else (f"{prefix}_{m_id}" if m_id else None)
+    out: dict[str, Any] = {
+        "media_key": media_key or m_id,
+        "id": m_id or None,
+        "type": kind,
+        "url": a.get("url"),
+        "preview_image_url": a.get("preview_image_url") or (a.get("url") if kind == "photo" else None),
+        "width": a.get("width"),
+        "height": a.get("height"),
+        "duration_ms": a.get("duration_ms"),
+    }
+    return {k: v for k, v in out.items() if v is not None}
+
+
+def format_dm_events(
+    payload: dict[str, Any],
+    event_types: Optional[str] = None,
+    dm_event_fields: Optional[str] = None,
+    expansions: Optional[str] = None,
+    max_results: Optional[int] = None,
+) -> dict[str, Any]:
+    """
+    Format DM response (supports BOTH GraphQL DM/XChat and REST 1.1 DM shapes) → official X API v2 shape:
+      {
+        "data": [dm_event_obj, ...],
+        "includes": {"users": [...], "media": [...], "tweets": [...], "conversations": [...]},
+        "meta": {"result_count": N, "next_token": ..., "previous_token": ...}
+      }
+    """
+    if not isinstance(payload, dict) or not payload:
+        return {"data": [], "meta": {"result_count": 0}}
+
+    # Check if this is a GraphQL response (has "data" key or GraphQL operation keys)
+    gql_data = payload.get("data") if isinstance(payload.get("data"), dict) else None
+    is_gql = gql_data is not None or any(
+        k in payload
+        for k in (
+            "get_initial_chat_page",
+            "get_inbox_page",
+            "get_conversation_page",
+            "get_message_events_page",
+            "get_message_requests_page",
+            "dm_all_search_slice",
+            "dm_group_search_slice",
+            "dm_people_search_slice",
+        )
+    )
+
+    events: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    users_map: dict[str, dict[str, Any]] = {}
+    convs_map: dict[str, dict[str, Any]] = {}
+    media_map: dict[str, dict[str, Any]] = {}
+    tweets_map: dict[str, dict[str, Any]] = {}
+    next_token: Optional[str] = None
+    prev_token: Optional[str] = None
+
+    if is_gql:
+        target_data = gql_data if gql_data is not None else payload
+        gql_events, gql_users, gql_convs, next_token, prev_token = _extract_gql_dm_conversations_and_events(target_data)
+        for ev in gql_events:
+            eid = ev.get("id")
+            if eid and eid not in seen_ids:
+                seen_ids.add(eid)
+                events.append(ev)
+        users_map.update(gql_users)
+        convs_map.update(gql_convs)
+
+    # Also support REST 1.1 DM sections (either standalone or merged with GraphQL)
+    sections = [
+        payload.get("inbox_initial_state"),
+        payload.get("user_events"),
+        payload.get("conversation_timeline"),
+        payload,
+    ]
+    inbox_timelines = (payload.get("inbox_initial_state") or {}).get("inbox_timelines") or {}
+    for tl in inbox_timelines.values():
+        if isinstance(tl, dict):
+            sections.append(tl)
+
+    entries: list[dict] = []
+    raw_users: dict[str, Any] = {}
+    raw_convs: dict[str, Any] = {}
+
+    for sec in sections:
+        if not isinstance(sec, dict):
+            continue
+        sec_entries = sec.get("entries")
+        if isinstance(sec_entries, list):
+            entries.extend(sec_entries)
+        if isinstance(sec.get("users"), dict):
+            raw_users.update(sec["users"])
+        if isinstance(sec.get("conversations"), dict):
+            raw_convs.update(sec["conversations"])
+        if not next_token:
+            next_token = sec.get("min_entry_id") or sec.get("cursor")
+        if not prev_token:
+            prev_token = sec.get("max_entry_id")
+
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        for kind, body in e.items():
+            if not isinstance(body, dict):
+                continue
+            ev_input = {**body, "type": body.get("type") or kind}
+            obj = _dm_event_to_obj(ev_input, users=raw_users)
+            if obj and obj.get("id") and obj["id"] not in seen_ids:
+                seen_ids.add(obj["id"])
+                events.append(obj)
+            # Extract quoted/shared tweet for includes.tweets if present in attachment
+            msg_data = body.get("message_data") or (body.get("message_create") or {}).get("message_data") or {}
+            tw_attach = (msg_data.get("attachment") or {}).get("tweet") or {}
+            tw_status = tw_attach.get("status")
+            if isinstance(tw_status, dict) and (tw_status.get("id_str") or tw_status.get("id")):
+                tid = str(tw_status.get("id_str") or tw_status.get("id"))
+                tweets_map[tid] = {
+                    "id": tid,
+                    "text": tw_status.get("full_text") or tw_status.get("text"),
+                    "author_id": str((tw_status.get("user") or {}).get("id_str") or ""),
+                    "created_at": tw_status.get("created_at"),
+                }
+
+    for uid, u in raw_users.items():
+        if isinstance(u, dict):
+            uo = _dm_user_obj(u)
+            if uo and uo.get("id"):
+                users_map[str(uo["id"])] = uo
+
+    for cid, c in raw_convs.items():
+        if not isinstance(c, dict):
+            continue
+        norm_cid = str(c.get("conversation_id") or cid).replace(":", "-")
+        parts = c.get("participants") or []
+        rest_part_ids = [str(p.get("user_id")) for p in parts if isinstance(p, dict) and p.get("user_id")]
+        existing_conv = convs_map.get(norm_cid) or {}
+        merged_parts = list(dict.fromkeys((existing_conv.get("participant_ids") or []) + rest_part_ids))
+        ctype = "Group" if c.get("type") == "GROUP_DM" or existing_conv.get("type") == "Group" else "OneToOne"
+        if ctype == "OneToOne" and "-" in norm_cid:
+            for p_uid in norm_cid.split("-"):
+                if p_uid.isdigit() and p_uid not in merged_parts:
+                    merged_parts.append(p_uid)
+        merged_conv = {
+            "id": norm_cid,
+            "type": ctype,
+            "participant_ids": merged_parts,
+            "name": c.get("name") or existing_conv.get("name"),
+            "trusted": c.get("trusted") if c.get("trusted") is not None else existing_conv.get("trusted"),
+            "muted": c.get("muted") if c.get("muted") is not None else existing_conv.get("muted"),
+            "last_read_event_id": c.get("last_read_event_id") or existing_conv.get("last_read_event_id"),
+        }
+        convs_map[norm_cid] = {k: v for k, v in merged_conv.items() if v is not None}
+
+    # Populate participant_ids on events from conversation map & collect includes.media
+    for ev in events:
+        cid = ev.get("dm_conversation_id")
+        if cid and "participant_ids" not in ev:
+            if cid in convs_map and convs_map[cid].get("participant_ids"):
+                ev["participant_ids"] = convs_map[cid]["participant_ids"]
+            elif "-" in cid and all(p.isdigit() for p in cid.split("-")):
+                ev["participant_ids"] = cid.split("-")
+        for att in ev.get("_xapi_attachments") or []:
+            if isinstance(att, dict) and att.get("media_id"):
+                m_v2 = _dm_media_v2_obj(att)
+                m_id = str(att["media_id"])
+                media_map[m_id] = m_v2
+
+    # Optional event_types filter (e.g. "MessageCreate,ParticipantsJoin")
+    if event_types:
+        allowed_types = {t.strip() for t in event_types.split(",") if t.strip()}
+        if allowed_types:
+            events = [e for e in events if e.get("event_type") in allowed_types]
+
+    # Sort events newest-first by id (Snowflake) or created_at
+    events.sort(
+        key=lambda x: (int(x["id"]) if str(x.get("id", "")).isdigit() else 0, x.get("created_at") or ""),
+        reverse=True,
+    )
+
+    if max_results and max_results > 0 and len(events) > max_results:
+        events = events[:max_results]
+        if events and events[-1].get("id"):
+            next_token = str(events[-1]["id"])
+
+    out: dict[str, Any] = {
+        "data": events,
+        "meta": {"result_count": len(events)},
+    }
+    if next_token:
+        out["meta"]["next_token"] = str(next_token)
+    if prev_token:
+        out["meta"]["previous_token"] = str(prev_token)
+    if users_map or convs_map or media_map or tweets_map:
+        out["includes"] = {}
+        if users_map:
+            out["includes"]["users"] = list(users_map.values())
+        if media_map:
+            out["includes"]["media"] = list(media_map.values())
+        if tweets_map:
+            out["includes"]["tweets"] = list(tweets_map.values())
+        if convs_map:
+            out["includes"]["conversations"] = list(convs_map.values())
+    return out
+
+
+def format_dm_conversations(payload: dict[str, Any], max_results: Optional[int] = None) -> dict[str, Any]:
+    """
+    Format GraphQL / REST DM inbox response into a conversation-centric X API v2 list:
+      {
+        "data": [conversation_obj, ...],
+        "includes": {"users": [...], "dm_events": [...]},
+        "meta": {"result_count": N, "next_token": ...}
+      }
+    """
+    formatted = format_dm_events(payload)
+    includes = formatted.get("includes") or {}
+    convs = includes.get("conversations") or []
+    events = formatted.get("data") or []
+    users = includes.get("users") or []
+
+    # Attach latest message preview to each conversation if available
+    latest_by_conv: dict[str, dict[str, Any]] = {}
+    for ev in events:
+        cid = ev.get("dm_conversation_id")
+        if cid and cid not in latest_by_conv:
+            latest_by_conv[cid] = ev
+
+    conv_list: list[dict[str, Any]] = []
+    for c in convs:
+        c_copy = dict(c)
+        cid = c_copy.get("id")
+        if cid and cid in latest_by_conv:
+            c_copy["last_message_event"] = latest_by_conv[cid]
+        conv_list.append(c_copy)
+
+    if max_results and max_results > 0 and len(conv_list) > max_results:
+        conv_list = conv_list[:max_results]
+
+    out: dict[str, Any] = {
+        "data": conv_list,
+        "meta": {
+            "result_count": len(conv_list),
+            **({"next_token": formatted["meta"]["next_token"]} if formatted.get("meta", {}).get("next_token") else {}),
+        },
+    }
+    inc_out: dict[str, Any] = {}
+    if users:
+        inc_out["users"] = users
+    if events:
+        inc_out["dm_events"] = events
+    if inc_out:
+        out["includes"] = inc_out
+    return out
+
+
+def format_public_keys(gql: dict[str, Any]) -> dict[str, Any]:
+    """Format GraphQL `GetPublicKeys` (`data.user_results_by_rest_ids`) → X API v2 shape."""
+    data = (gql or {}).get("data") or {}
+    results = data.get("user_results_by_rest_ids") or []
+    items: list[dict[str, Any]] = []
+    for r in results:
+        if not isinstance(r, dict):
+            continue
+        res = r.get("result") if "result" in r else r
+        if not isinstance(res, dict):
+            continue
+        uid = res.get("rest_id") or res.get("id")
+        keys = res.get("public_keys") or res.get("encryption_public_keys") or res.get("chat_public_keys") or []
+        entry: dict[str, Any] = {
+            "user_id": str(uid) if uid else None,
+            "public_keys": keys,
+        }
+        if "has_juicebox_secret" in res:
+            entry["has_juicebox_secret"] = res.get("has_juicebox_secret")
+        if "juicebox_token" in res:
+            entry["juicebox_token"] = res.get("juicebox_token")
+        items.append({k: v for k, v in entry.items() if v is not None})
+    return {"data": items, "meta": {"result_count": len(items)}}
 
 
 def format_dm_send_result(payload: dict[str, Any]) -> dict[str, Any]:
@@ -719,8 +1604,8 @@ def format_dm_send_result(payload: dict[str, Any]) -> dict[str, Any]:
             return {"data": {"dm_conversation_id": obj.get("dm_conversation_id"), "dm_event_id": obj["id"]}}
     # fallback shapes: dm/new2.json {entries:[{message:{...}}]} atau
     # {user_events:{entries:[{message_create:{...}}]}}
-    entries = (payload or {}).get("entries") or []
-    entries = entries + (((payload or {}).get("user_events") or {}).get("entries") or [])
+    entries = list((payload or {}).get("entries") or [])
+    entries.extend(((payload or {}).get("user_events") or {}).get("entries") or [])
     for e in entries:
         if not isinstance(e, dict):
             continue
@@ -729,9 +1614,12 @@ def format_dm_send_result(payload: dict[str, Any]) -> dict[str, Any]:
                 obj = _dm_event_to_obj({**v, "type": k})
                 if obj and obj.get("id"):
                     return {"data": {"dm_conversation_id": obj.get("dm_conversation_id"), "dm_event_id": obj["id"]}}
-    entries = ((payload or {}).get("user_events") or {}).get("entries") or []
     for e in entries:
+        if not isinstance(e, dict):
+            continue
         for k, v in e.items():
+            if not isinstance(v, dict):
+                continue
             obj = _dm_event_to_obj({**v, "type": k})
             if obj and obj.get("id"):
                 return {"data": {"dm_conversation_id": obj.get("dm_conversation_id"), "dm_event_id": obj["id"]}}

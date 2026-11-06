@@ -43,7 +43,8 @@ ROUTER_PATCHES: dict[str, set[str]] = {m: {
     "resolve_screen_name", "tweet_author_handle",
     # Formatters — mock at router level so finalize() gets expected shape
     "format_tweet", "format_tweet_collection", "format_user",
-    "format_dm_send_result", "format_community",
+    "format_dm_send_result", "format_dm_events", "format_dm_conversations", "format_public_keys",
+    "format_community",
     "format_birdwatch_note_result", "format_birdwatch_notes_slice", "format_birdwatch_batsignal",
     "format_bookmark_folders", "format_error",
 } for m in ROUTER_MODS}
@@ -73,7 +74,8 @@ def _make_router_mocks() -> dict[str, Any]:
         "extract_bearer": eb, "login_with_auth_token": login, "resolve_me_id": rme,
         "resolve_screen_name": rsn, "tweet_author_handle": tah,
         "format_tweet": fmt, "format_tweet_collection": fmt, "format_user": fmt,
-        "format_dm_send_result": fmt, "format_community": fmt,
+        "format_dm_send_result": fmt, "format_dm_events": fmt, "format_dm_conversations": fmt, "format_public_keys": fmt,
+        "format_community": fmt,
         "format_birdwatch_note_result": fmt, "format_birdwatch_notes_slice": fmt,
         "format_birdwatch_batsignal": fmt, "format_bookmark_folders": fmt,
         "format_error": fmt,
@@ -410,6 +412,39 @@ class TestDM:
 
     def test_dm_unblock(self, app_client):
         assert app_client.post("/2/users/456/dm/unblock", headers=AH).status_code == 200
+
+    def test_dm_events(self, app_client):
+        assert app_client.get("/2/dm_events", headers=AH).status_code == 200
+
+    def test_dm_events_graphql_mode(self, app_client):
+        assert app_client.get("/2/dm_events?mode=graphql&include_requests=1", headers=AH).status_code == 200
+
+    def test_dm_events_rest_mode(self, app_client):
+        assert app_client.get("/2/dm_events?mode=rest&include_requests=1", headers=AH).status_code == 200
+
+    def test_dm_events_search(self, app_client):
+        assert app_client.get("/2/dm_events/search?query=hello&search_type=all", headers=AH).status_code == 200
+
+    def test_dm_conv_events(self, app_client):
+        assert app_client.get("/2/dm_conversations/123-456/dm_events", headers=AH).status_code == 200
+
+    def test_dm_with_user_events(self, app_client):
+        assert app_client.get("/2/dm_conversations/with/456/dm_events", headers=AH).status_code == 200
+
+    def test_chat_conversations(self, app_client):
+        assert app_client.get("/2/chat/conversations", headers=AH).status_code == 200
+
+    def test_chat_conversation_messages(self, app_client):
+        assert app_client.get("/2/chat/conversations/123-456/messages", headers=AH).status_code == 200
+
+    def test_chat_requests(self, app_client):
+        assert app_client.get("/2/chat/requests", headers=AH).status_code == 200
+
+    def test_chat_permissions(self, app_client):
+        assert app_client.get("/2/chat/permissions?recipient_ids=456", headers=AH).status_code == 200
+
+    def test_chat_public_keys(self, app_client):
+        assert app_client.get("/2/chat/public_keys?ids=123,456", headers=AH).status_code == 200
 
 
 # ────────────────────── Bookmarks (5) ──────────────────────

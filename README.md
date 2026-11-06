@@ -1,8 +1,10 @@
 # Xapi — X (Twitter) Cookie API
 
-Mirror endpoint X API v2 (`docs.x.com/x-api`) lewat cookie `auth_token`. Backend: GraphQL via httpx + Playwright fallback untuk endpoint CF-gated.
+Mirror endpoint X API v2 (`docs.x.com/x-api`) lewat cookie `auth_token`. Backend: GraphQL & REST 1.1 via `curl_cffi` (Chrome TLS/JA3 impersonation + Anti-Detect) + Playwright fallback untuk endpoint CF-gated.
 
-- **~115 routes** mirror v2 (read + write + DM + lists + media + community notes + trends)
+- **~120 routes** mirror v2 (read + write + DM/XChat + lists + media + community notes + trends)
+- **Anti-Detect Engine** bawaan: profil browser deterministik per `auth_token` (`curl_cffi` Chrome 124/131/136 TLS JA3/JA4 + HTTP/2 frame + sinkronisasi `User-Agent`, `Sec-CH-UA`, `Sec-Fetch-*`, `x-client-transaction-id` HMAC, dan sticky proxy)
+- **Full Direct Messages & XChat**: GraphQL DM/XChat (`GetInitialXChatPageQuery`, `GetConversationPageQuery`, `DmAllSearchSlice`, dll.) + dekoder binary Apache Thrift XChat + REST 1.1 merge + proxy download media DM (`ton.x.com`)
 - **Docs UI** built-in di `/` (interactive reference + try-it console)
 - **OpenAPI/Swagger** di `/docs`
 - **Agent Skill** di [`SKILL.md`](SKILL.md) — dipakai agent (Claude Code, opencode, dll) untuk memanggil API ini; katalog endpoint lengkap di [`references/`](references/)
@@ -74,48 +76,59 @@ Semua endpoint butuh `auth_token` cookie. Token di-pass via:
 
 | Method | Path | Engine | Note |
 |---|---|---|---|
-| GET | `/2/users/me` | httpx | current user profile |
-| GET | `/2/users/by/username/{username}` | httpx | UserByScreenName |
-| GET | `/2/users/by?usernames=` | httpx | bulk by handle (max 100) |
+| GET | `/2/users/me` | curl_cffi | current user profile |
+| GET | `/2/users/by/username/{username}` | curl_cffi | UserByScreenName |
+| GET | `/2/users/by?usernames=` | curl_cffi | bulk by handle (max 100) |
 | GET | `/2/users?ids=` | playwright | bulk by id (max 100) |
 | GET | `/2/users/{id}` | playwright | UserByRestId (CF-gated) |
 | GET | `/2/users/search?query=` | playwright | search users |
-| GET | `/2/users/{id}/tweets` | httpx | UserTweets |
+| GET | `/2/users/{id}/tweets` | curl_cffi | UserTweets |
 | GET | `/2/users/{id}/tweets/replies` | playwright* | UserTweetsAndReplies |
 | GET | `/2/users/{id}/mentions` | playwright | SearchTimeline @handle |
-| GET | `/2/users/{id}/media` | httpx | UserMedia |
-| GET | `/2/users/{id}/liked_tweets` | httpx | Likes |
+| GET | `/2/users/{id}/media` | curl_cffi | UserMedia |
+| GET | `/2/users/{id}/liked_tweets` | curl_cffi | Likes |
 | GET | `/2/users/{id}/followers` | playwright* | Followers |
-| GET | `/2/users/{id}/following` | httpx | Following |
-| GET | `/2/users/{id}/blocking` | httpx | own blocking list |
-| GET | `/2/users/{id}/muting` | httpx | own muting list |
+| GET | `/2/users/{id}/following` | curl_cffi | Following |
+| GET | `/2/users/{id}/blocking` | curl_cffi | own blocking list |
+| GET | `/2/users/{id}/muting` | curl_cffi | own muting list |
 | GET | `/2/users/{id}/affiliates` | playwright | affiliations / highlights |
 | GET | `/2/users/reposts_of_me` | playwright | search nativeretweets |
-| GET | `/2/users/{id}/timelines/reverse_chronological` | httpx | HomeLatestTimeline |
-| GET | `/2/home_timeline` | httpx | HomeTimeline (For You) |
-| GET | `/2/tweets?ids=` | httpx | bulk lookup (max 100) |
-| GET | `/2/tweets/{id}` | httpx | TweetResultByRestId |
-| GET | `/2/tweets/{id}/detail` | httpx | TweetDetail + replies |
-| GET | `/2/tweets/{id}/liking_users` | httpx | Favoriters |
-| GET | `/2/tweets/{id}/retweeted_by` | httpx | Retweeters |
+| GET | `/2/users/{id}/timelines/reverse_chronological` | curl_cffi | HomeLatestTimeline |
+| GET | `/2/home_timeline` | curl_cffi | HomeTimeline (For You) |
+| GET | `/2/tweets?ids=` | curl_cffi | bulk lookup (max 100) |
+| GET | `/2/tweets/{id}` | curl_cffi | TweetResultByRestId |
+| GET | `/2/tweets/{id}/detail` | curl_cffi | TweetDetail + replies |
+| GET | `/2/tweets/{id}/liking_users` | curl_cffi | Favoriters |
+| GET | `/2/tweets/{id}/retweeted_by` | curl_cffi | Retweeters |
 | GET | `/2/tweets/{id}/quote_tweets` | playwright | SearchTimeline (`quoted_tweet_id:`) |
 | GET | `/2/tweets/search/recent?query=` | playwright | SearchTimeline |
-| GET | `/2/lists/{id}` | httpx | ListByRestId |
-| GET | `/2/lists/{id}/tweets` | httpx | ListLatestTweetsTimeline |
-| GET | `/2/lists/{id}/members` | httpx | ListMembers |
-| GET | `/2/lists/{id}/followers` | httpx | ListSubscribers |
-| GET | `/2/users/{id}/owned_lists` | httpx | ListsManagementPageTimeline |
-| GET | `/2/users/{id}/list_memberships` | httpx | ListMemberships |
-| GET | `/2/users/{id}/pinned_lists` | httpx | PinnedTimelines |
-| GET | `/2/users/{id}/bookmarks` | httpx | Bookmarks (own only) |
-| GET | `/2/users/{id}/bookmarks/folders` | httpx | BookmarkFoldersSlice |
-| GET | `/2/users/{id}/bookmarks/folders/{folder_id}` | httpx | BookmarkFolderTimeline |
-| GET | `/2/communities/{id}` | httpx | CommunityByRestId |
-| GET | `/2/notes/search/notes_written?alias=` | httpx | Birdwatch contributor notes |
-| GET | `/2/notes/search/posts_eligible_for_notes?tweet_id=` | httpx | Birdwatch BatSignal |
+| GET | `/2/lists/{id}` | curl_cffi | ListByRestId |
+| GET | `/2/lists/{id}/tweets` | curl_cffi | ListLatestTweetsTimeline |
+| GET | `/2/lists/{id}/members` | curl_cffi | ListMembers |
+| GET | `/2/lists/{id}/followers` | curl_cffi | ListSubscribers |
+| GET | `/2/users/{id}/owned_lists` | curl_cffi | ListsManagementPageTimeline |
+| GET | `/2/users/{id}/list_memberships` | curl_cffi | ListMemberships |
+| GET | `/2/users/{id}/pinned_lists` | curl_cffi | PinnedTimelines |
+| GET | `/2/users/{id}/bookmarks` | curl_cffi | Bookmarks (own only) |
+| GET | `/2/users/{id}/bookmarks/folders` | curl_cffi | BookmarkFoldersSlice |
+| GET | `/2/users/{id}/bookmarks/folders/{folder_id}` | curl_cffi | BookmarkFolderTimeline |
+| GET | `/2/communities/{id}` | curl_cffi | CommunityByRestId |
+| GET | `/2/notes/search/notes_written?alias=` | curl_cffi | Birdwatch contributor notes |
+| GET | `/2/notes/search/posts_eligible_for_notes?tweet_id=` | curl_cffi | Birdwatch BatSignal |
 | GET | `/2/trends?woeid=` / `/2/trends/by/woeid/{woeid}` | REST 1.1 | trends/place.json |
+| GET | `/2/dm_events` | GraphQL + DM | GetInitialXChatPageQuery / GetInboxPageRequestQuery + fallback |
+| GET | `/2/dm_events/search?query=` | GraphQL | DmAllSearchSlice / DmGroupSearchSlice / DmPeopleSearchSlice |
+| GET | `/2/dm_events/{event_id}` | GraphQL + DM | GetMessageEventsPageQuery / GetInitialXChatPageQuery |
+| GET | `/2/dm_conversations/{conversation_id}/dm_events` | GraphQL + DM | GetConversationPageQuery / GetMessageEventsPageQuery |
+| GET | `/2/dm_conversations/with/{participant_id}/dm_events` | GraphQL + DM | 1-on-1 DM events via GraphQL / REST fallback |
+| GET | `/2/dm_conversations/media/{dm_id}/{media_id}/{resource_id}` | DM Media | Proxy download gambar/video DM (`ton.x.com`) |
+| GET | `/2/chat/conversations` | GraphQL | XChat inbox conversations |
+| GET | `/2/chat/conversations/{conversation_id}/messages` | GraphQL | XChat conversation messages (alias `/events`) |
+| GET | `/2/chat/requests` | GraphQL + DM | GetMessageRequestsPageQuery |
+| GET | `/2/chat/permissions` | GraphQL | DmAvPermissionsQuery |
+| GET | `/2/chat/public_keys?ids=` | GraphQL | GetPublicKeys |
 
-\*Coba httpx dulu, auto-fallback Playwright kalau CF block.
+\*Coba `curl_cffi` dulu, auto-fallback Playwright kalau CF block.
 
 ### Write
 
@@ -225,6 +238,17 @@ curl -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8000/2/users/44196397/t
 
 # Search
 curl -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8000/2/tweets/search/recent?query=bitcoin&type=Latest"
+
+# Direct Messages (GraphQL XChat + REST 1.1 merged, official v2 shape + media attachments)
+curl -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8000/2/dm_events?max_results=20"
+
+# 1-on-1 DM history dengan user tertentu
+curl -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8000/2/dm_conversations/with/44196397/dm_events"
+
+# Download gambar/video dari DM (proxy ke ton.x.com dengan cookie auth_token)
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://127.0.0.1:8000/2/dm_conversations/media/2040339972549656964/1786394285310038016/photo.jpg" \
+  -o dm_photo.jpg
 ```
 
 ### Write contoh
@@ -377,11 +401,17 @@ curl http://127.0.0.1:8000/admin/stats -H "X-Admin-Token: $ADMIN_TOKEN"
 
 Return: session cache, TID provider, client pool, response cache (with hit/miss + hit_rate), v2 route inventory.
 
-## Security
+## Security & Anti-Detect
 
+- **Deterministic Browser Fingerprinting (`BROWSER_PROFILES`):** Setiap `auth_token` dipetakan secara deterministik (`SHA-256`) ke satu profil perangkat tetap yang menyelaraskan:
+  1. **TLS JA3/JA4 & HTTP/2 AKAMAI Fingerprint** via `curl_cffi` (`chrome124`, `chrome131`, `chrome136`)
+  2. **`User-Agent`** yang persis cocok dengan versi Chrome & OS profil TLS
+  3. **Client Hints (`Sec-CH-UA`, `Sec-CH-UA-Platform`, `Sec-CH-UA-Mobile`)** dan **Fetch Metadata (`Sec-Fetch-Dest`, `Sec-Fetch-Mode`, `Sec-Fetch-Site`, `Priority`)**
+  4. **Sticky Proxy (`proxy_for_token`)**: Akun yang sama selalu keluar lewat proxy IP yang sama.
+- **`x-client-transaction-id` (TID):** Dihasilkan secara lokal menggunakan HMAC + animasi key `ondemand.s` dari `x.com`. Bila masuk mode fallback, generator menghasilkan 70-byte random Base64 (94 karakter, tanpa prefix `fallback-`).
+- **Playwright Stealth:** Context headless Chrome menginjeksi script inisialisasi untuk menyembunyikan `navigator.webdriver`, mengisi `window.chrome` & `navigator.plugins`, serta menyamakan `User-Agent` dan `Sec-CH-UA` dengan sesi `curl_cffi`.
 - Bearer token publik web client X.com hardcoded — sama untuk semua user (extracted dari bundle x.com).
-- `ct0` di-generate lokal (random hex), di-sync dengan response server.
-- API stateless — tiap request bikin session baru (di-cache 5 min).
+- `ct0` di-generate lokal (32 hex chars / 16 bytes sesuai standar X web), lalu di-sync dengan cookie `.x.com` dari server saat `warm_session`.
 - Security headers default: HSTS, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy, CSP.
 - Body limit double-guard: `Content-Length` cek + stream-count untuk chunked TE.
 - Admin token compare pakai `secrets.compare_digest` (constant-time).

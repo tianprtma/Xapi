@@ -125,7 +125,7 @@ app = FastAPI(
         "Search Counts/All, Insights, Analytics, News, Media library) sudah dihapus karena "
         "butuh OAuth2 app-only bearer + subscription dev portal."
     ),
-    version="2.3.0",
+    version="2.4.0",
     lifespan=lifespan,
     openapi_tags=OPENAPI_TAGS,
     docs_url=None,

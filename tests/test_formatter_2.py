@@ -12,7 +12,10 @@ from formatter import (
     format_tweet_collection,
     format_community,
     format_bookmark_folders,
+    format_dm_conversations,
+    format_dm_events,
     format_dm_send_result,
+    format_public_keys,
     format_birdwatch_note_result,
     format_birdwatch_notes_slice,
     format_birdwatch_batsignal,
@@ -382,6 +385,102 @@ class TestFormatDmSendResult:
     def test_empty(self):
         out = format_dm_send_result({})
         assert out == {"data": {}}
+
+
+class TestFormatDmEventsAndConversations:
+    def test_graphql_initial_xchat_page(self):
+        gql = {
+            "data": {
+                "get_initial_chat_page": {
+                    "conversations": [
+                        {
+                            "conversation_id": "111:222",
+                            "type": "ONE_TO_ONE",
+                            "participants": [
+                                {"user_id": "111", "user_results": {"result": {"rest_id": "111", "core": {"screen_name": "u1"}, "legacy": {}}}},
+                                {"user_id": "222", "user_results": {"result": {"rest_id": "222", "core": {"screen_name": "u2"}, "legacy": {}}}},
+                            ],
+                            "messages": [
+                                {
+                                    "id": "9001",
+                                    "sender_id": "111",
+                                    "text": "Halo dari GraphQL!",
+                                    "created_at": "1700000000000",
+                                }
+                            ],
+                        }
+                    ],
+                    "next_cursor": "cur_next_1",
+                }
+            }
+        }
+        out = format_dm_events(gql)
+        assert len(out["data"]) == 1
+        assert out["data"][0]["id"] == "9001"
+        assert out["data"][0]["dm_conversation_id"] == "111-222"
+        assert out["data"][0]["text"] == "Halo dari GraphQL!"
+        assert out["meta"]["next_token"] == "cur_next_1"
+        assert len(out["includes"]["users"]) == 2
+        assert len(out["includes"]["conversations"]) == 1
+
+        conv_out = format_dm_conversations(gql)
+        assert len(conv_out["data"]) == 1
+        assert conv_out["data"][0]["id"] == "111-222"
+        assert conv_out["data"][0]["last_message_event"]["id"] == "9001"
+
+    def test_rest_inbox_initial_state(self):
+        payload = {
+            "inbox_initial_state": {
+                "cursor": "rest_cur_1",
+                "entries": [
+                    {
+                        "message": {
+                            "id": "8001",
+                            "conversation_id": "111-222",
+                            "time": "1700000000000",
+                            "message_data": {
+                                "sender_id": "222",
+                                "text": "Halo dari REST!",
+                            },
+                        }
+                    }
+                ],
+                "users": {
+                    "222": {"id_str": "222", "name": "User 2", "screen_name": "u2", "followed_by": True}
+                },
+                "conversations": {
+                    "111-222": {
+                        "conversation_id": "111-222",
+                        "type": "ONE_TO_ONE",
+                        "participants": [{"user_id": "111"}, {"user_id": "222"}],
+                    }
+                },
+            }
+        }
+        out = format_dm_events(payload)
+        assert len(out["data"]) == 1
+        assert out["data"][0]["id"] == "8001"
+        assert out["data"][0]["_sender_follows_owner"] is True
+        assert out["meta"]["next_token"] == "rest_cur_1"
+
+    def test_public_keys(self):
+        gql = {
+            "data": {
+                "user_results_by_rest_ids": [
+                    {
+                        "result": {
+                            "rest_id": "111",
+                            "public_keys": [{"key": "pk1"}],
+                            "has_juicebox_secret": True,
+                        }
+                    }
+                ]
+            }
+        }
+        out = format_public_keys(gql)
+        assert len(out["data"]) == 1
+        assert out["data"][0]["user_id"] == "111"
+        assert out["data"][0]["has_juicebox_secret"] is True
 
 
 # ──────────────── Birdwatch ────────────────

@@ -256,17 +256,33 @@ class PlaywrightPool:
 
 
 async def _new_context(browser: Browser, auth_token: str) -> BrowserContext:
+    from app.config import gen_ct0, profile_for_token
+
+    prof = profile_for_token(auth_token)
+    ua = prof["user_agent"]
+    is_win = "Windows" in prof["sec_ch_ua_platform"]
     context = await browser.new_context(
-        user_agent=(
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        viewport={"width": 1280, "height": 800},
+        user_agent=ua,
+        viewport={"width": 1366, "height": 768} if is_win else {"width": 1440, "height": 900},
         locale="en-US",
+        timezone_id="America/New_York",
+        extra_http_headers={
+            "sec-ch-ua": prof["sec_ch_ua"],
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": prof["sec_ch_ua_platform"],
+        },
+    )
+    # Stealth init script: sembunyikan indikator headless Chrome / Playwright
+    await context.add_init_script(
+        """
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+        window.chrome = window.chrome || { runtime: {}, loadTimes: function() {}, csi: function() {}, app: {} };
+        """
     )
     # ct0 — X CSRF token, needed by ton.twitter.com alongside auth_token
-    _ct0 = secrets.token_hex(16)
+    _ct0 = gen_ct0()
     await context.add_cookies(
         [
             {
@@ -286,6 +302,15 @@ async def _new_context(browser: Browser, auth_token: str) -> BrowserContext:
                 "httpOnly": True,
                 "secure": True,
                 "sameSite": "None",
+            },
+            {
+                "name": "ct0",
+                "value": _ct0,
+                "domain": ".x.com",
+                "path": "/",
+                "httpOnly": False,
+                "secure": True,
+                "sameSite": "Lax",
             },
             {
                 "name": "ct0",

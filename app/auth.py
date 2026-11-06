@@ -26,8 +26,9 @@ from .config import (
     VIEWER_FIELD_TOGGLES,
     WEB_BEARER,
     gen_ct0,
+    headers_for_token,
+    profile_for_token,
     proxy_for_token,
-    random_user_agent,
 )
 
 
@@ -111,17 +112,15 @@ def extract_bearer(authorization: Optional[str], auth_token_q: Optional[str]) ->
 
 
 def make_client(auth_token: str) -> AsyncSession:
-    """AsyncSession dengan TLS impersonation Chrome 124 (lolos JA3 fingerprint check X).
-
-    Per-request: random UA dari pool + random proxy dari PROXY_LIST (kalau set).
-    """
-    headers = {**DEFAULT_HEADERS, "user-agent": random_user_agent()}
+    """AsyncSession dengan TLS impersonation & Client Hints deterministik per `auth_token`."""
+    prof = profile_for_token(auth_token)
+    headers = headers_for_token(auth_token)
     proxy = proxy_for_token(auth_token)
     kwargs: dict[str, Any] = dict(
         cookies={"auth_token": auth_token, "ct0": gen_ct0()},
         headers=headers,
         timeout=20.0,
-        impersonate="chrome124",
+        impersonate=prof["impersonate"],
         allow_redirects=True,
     )
     if proxy:
@@ -129,10 +128,11 @@ def make_client(auth_token: str) -> AsyncSession:
     return AsyncSession(**kwargs)
 
 
-def api_headers(ct0: str) -> dict[str, str]:
-    """Standard headers untuk GraphQL/REST 1.1 calls."""
+def api_headers(ct0: str, auth_token: Optional[str] = None) -> dict[str, str]:
+    """Standard headers untuk GraphQL/REST 1.1 calls, sinkron dengan profil `auth_token`."""
+    base = headers_for_token(auth_token) if auth_token else DEFAULT_HEADERS
     return {
-        **DEFAULT_HEADERS,
+        **base,
         "authorization": f"Bearer {WEB_BEARER}",
         "x-csrf-token": ct0,
         "content-type": "application/json",
@@ -247,7 +247,7 @@ async def login_with_auth_token(auth_token: str) -> dict[str, Any]:
 
         viewer_resp = await client.get(
             VIEWER_URL,
-            headers=api_headers(ct0),
+            headers=api_headers(ct0, auth_token),
             params={
                 "variables": json.dumps({"withCommunitiesMemberships": True}),
                 "features": json.dumps(VIEWER_FEATURES),

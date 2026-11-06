@@ -41,6 +41,8 @@ from .config import (
     UPLOAD_BASE,
     WEB_BEARER,
     gen_ct0,
+    headers_for_token,
+    profile_for_token,
     random_user_agent,
 )
 from .response_cache import ResponseCache
@@ -123,7 +125,7 @@ async def _graphql_call_once(
         if meta.get("fieldToggles"):
             params["fieldToggles"] = json.dumps(meta["fieldToggles"])
 
-        headers = api_headers(ct0)
+        headers = api_headers(ct0, auth_token)
         try:
             tid = await TIDProvider.get().generate(method, _urlparse(url).path, auth_token)
             if tid:
@@ -220,7 +222,7 @@ async def _rest_call_once(
             }
 
         headers = {
-            **DEFAULT_HEADERS,
+            **headers_for_token(auth_token),
             "authorization": f"Bearer {WEB_BEARER}",
             "x-csrf-token": ct0,
         }
@@ -317,9 +319,10 @@ async def _dm_call_once(
             }
 
         headers = {
-            **DEFAULT_HEADERS,
+            **headers_for_token(auth_token),
             "authorization": f"Bearer {WEB_BEARER}",
             "x-csrf-token": ct0,
+            "referer": "https://x.com/messages",
         }
         try:
             tid = await TIDProvider.get().generate(method, _urlparse(url).path, auth_token)
@@ -363,14 +366,15 @@ async def _dm_call_once(
         }
 
 
+def _safe_sort_key(x: str) -> tuple[int, str]:
+    s = str(x)
+    if s.isdigit():
+        return (0, s.zfill(30))
+    return (1, s)
+
+
 def dm_conv_id_for(me: str, other: str) -> str:
     """1-1 DM conversation_id format = sorted(me, other) joined dengan '-'."""
-    def _safe_sort_key(x: str) -> tuple[int, str]:
-        try:
-            return (0, int(x))
-        except (ValueError, TypeError):
-            return (1, x)
-
     a, b = sorted([str(me), str(other)], key=_safe_sort_key)
     return f"{a}-{b}"
 
@@ -484,7 +488,7 @@ async def media_upload(
                 pass
 
     base_headers = {
-        **DEFAULT_HEADERS,
+        **headers_for_token(auth_token),
         "authorization": f"Bearer {WEB_BEARER}",
         "x-csrf-token": ct0,
     }
@@ -512,13 +516,14 @@ async def media_upload(
 
 def _direct_session(auth_token: str, jar: dict[str, str],
                     timeout: float) -> Any:
-    """Session curl_cffi TANPA proxy — untuk jalur media (hemat kuota)."""
+    """Session curl_cffi TANPA proxy — untuk jalur media (hemat kuota), tetap sinkron dengan profil browser."""
+    prof = profile_for_token(auth_token)
     cookies = {"auth_token": auth_token, "ct0": gen_ct0()}
     cookies.update(jar or {})
     sess = CurlAsyncSession(
         cookies=cookies,
-        headers={**DEFAULT_HEADERS, "user-agent": random_user_agent()},
-        impersonate="chrome124",
+        headers=headers_for_token(auth_token),
+        impersonate=prof["impersonate"],
         timeout=timeout,
         allow_redirects=True,
     )

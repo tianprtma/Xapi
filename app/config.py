@@ -33,51 +33,106 @@ DM_BASE = REST_BASE  # alias
 UPLOAD_BASE = "https://upload.x.com/i/media/upload.json"
 CHUNK_SIZE = 4 * 1024 * 1024  # 4 MB
 
-# ──────────────────────────── User-Agent pool ────────────────────────────
-# Mix Chrome desktop versi 124-132 di Mac/Windows/Linux. Random per request
-# supaya traffic tidak terlihat 1-UA-only (red flag anti-bot).
+# ──────────────────────────── Browser Fingerprint Profiles (Anti-Detect) ────────────────────────────
+# Setiap profil menyelaraskan:
+#   1. curl_cffi TLS JA3/JA4 + HTTP/2 AKAMAI fingerprint (`impersonate`)
+#   2. `User-Agent` (versi Chrome & OS persis sama dengan profil TLS)
+#   3. Client Hints (`sec-ch-ua`, `sec-ch-ua-platform`, `sec-ch-ua-mobile`)
+# Dipilih secara DETERMINISTIK per `auth_token` agar 1 akun selalu konsisten
+# memakai perangkat/browser yang sama (mencegah deteksi session hijack / bot).
 
-USER_AGENT_POOL: tuple[str, ...] = (
-    # Mac (M1+)
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-    # Windows
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    # Linux
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+BROWSER_PROFILES: tuple[dict[str, str], ...] = (
+    {
+        "impersonate": "chrome131",
+        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+        "sec_ch_ua_platform": '"Windows"',
+    },
+    {
+        "impersonate": "chrome131",
+        "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+        "sec_ch_ua_platform": '"macOS"',
+    },
+    {
+        "impersonate": "chrome136",
+        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"',
+        "sec_ch_ua_platform": '"Windows"',
+    },
+    {
+        "impersonate": "chrome136",
+        "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"',
+        "sec_ch_ua_platform": '"macOS"',
+    },
+    {
+        "impersonate": "chrome124",
+        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+        "sec_ch_ua_platform": '"Windows"',
+    },
+    {
+        "impersonate": "chrome124",
+        "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+        "sec_ch_ua_platform": '"macOS"',
+    },
 )
+
+USER_AGENT_POOL: tuple[str, ...] = tuple(p["user_agent"] for p in BROWSER_PROFILES)
+
+
+def profile_for_token(auth_token: str | None = None) -> dict[str, str]:
+    """Pilih profil browser deterministik berdasarkan `auth_token`."""
+    if not auth_token:
+        return BROWSER_PROFILES[0]
+    import hashlib
+    idx = int(hashlib.sha256(f"fp:{auth_token}".encode()).hexdigest(), 16) % len(BROWSER_PROFILES)
+    return BROWSER_PROFILES[idx]
+
+
+def headers_for_token(auth_token: str | None = None) -> dict[str, str]:
+    """Bangun default HTTP headers yang sinkron dengan profil TLS & UA milik `auth_token`."""
+    prof = profile_for_token(auth_token)
+    return {
+        **DEFAULT_HEADERS,
+        "user-agent": prof["user_agent"],
+        "sec-ch-ua": prof["sec_ch_ua"],
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": prof["sec_ch_ua_platform"],
+    }
 
 
 def random_user_agent() -> str:
-    """Random pick UA dari pool (anti-detect: avoid 1-UA-only fingerprint)."""
+    """Random pick UA dari pool (fallback jika tidak ada auth_token)."""
     return random.choice(USER_AGENT_POOL)
 
 
 def gen_ct0() -> str:
-    """Generate placeholder ct0 (server akan override saat warmup)."""
-    return secrets.token_hex(80)
+    """Generate 32-char (16 bytes) hex ct0 — sesuai panjang cookie ct0 asli X web."""
+    return secrets.token_hex(16)
 
 
 # ──────────────────────────── Default headers ────────────────────────────
 
-# UA di-override per-request (lihat make_client). Header lain konstan.
+# Header dasar X web client (Fetch API + CORS preflight).
 DEFAULT_HEADERS: dict[str, str] = {
-    "user-agent": USER_AGENT_POOL[0],  # default fallback
+    "user-agent": BROWSER_PROFILES[0]["user_agent"],
     "accept": "*/*",
     "accept-language": "en-US,en;q=0.9",
     "origin": "https://x.com",
-    "referer": "https://x.com/",
+    "referer": "https://x.com/home",
     "x-twitter-active-user": "yes",
     "x-twitter-auth-type": "OAuth2Session",
     "x-twitter-client-language": "en",
-    "apollo-require-preflight": "true",
-    "sec-ch-ua": '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
+    "sec-ch-ua": BROWSER_PROFILES[0]["sec_ch_ua"],
     "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": '"macOS"',
+    "sec-ch-ua-platform": BROWSER_PROFILES[0]["sec_ch_ua_platform"],
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-origin",
+    "priority": "u=1, i",
 }
 
 # ──────────────────────────── Viewer / Search features ────────────────────────────

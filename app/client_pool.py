@@ -20,10 +20,10 @@ from curl_cffi.requests import AsyncSession
 from .config import (
     CLIENT_POOL_MAX,
     CLIENT_POOL_TTL,
-    DEFAULT_HEADERS,
     gen_ct0,
+    headers_for_token,
+    profile_for_token,
     proxy_for_token,
-    random_user_agent,
     token_key,
 )
 
@@ -82,14 +82,15 @@ class ClientPool:
                 entry.last_used = now
                 return entry.session, entry.lock
 
-            # Build new session with random UA + proxy
-            headers = {**DEFAULT_HEADERS, "user-agent": random_user_agent()}
+            # Build new session with deterministic browser profile (TLS + UA + sec-ch-ua) + proxy
+            prof = profile_for_token(auth_token)
+            headers = headers_for_token(auth_token)
             proxy = proxy_for_token(auth_token)
             kwargs: dict[str, Any] = dict(
                 cookies={"auth_token": auth_token, "ct0": gen_ct0()},
                 headers=headers,
                 timeout=20.0,
-                impersonate="chrome124",
+                impersonate=prof["impersonate"],
                 allow_redirects=True,
             )
             if proxy:

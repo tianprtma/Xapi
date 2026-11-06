@@ -104,19 +104,22 @@ class TIDProvider:
             try:
                 from curl_cffi.requests import AsyncSession
 
-                from .config import gen_ct0, random_proxy, random_user_agent
+                from app.config import (
+                    gen_ct0,
+                    headers_for_token,
+                    profile_for_token,
+                    proxy_for_token,
+                )
 
+                prof = profile_for_token(auth_token)
                 kwargs: dict[str, Any] = dict(
                     cookies={"auth_token": auth_token, "ct0": gen_ct0()},
-                    headers={
-                        "user-agent": random_user_agent(),
-                        "Referer": "https://x.com/",
-                    },
+                    headers=headers_for_token(auth_token),
                     timeout=20.0,
-                    impersonate="chrome124",
+                    impersonate=prof["impersonate"],
                     allow_redirects=True,
                 )
-                proxy = random_proxy()
+                proxy = proxy_for_token(auth_token)
                 if proxy:
                     kwargs["proxies"] = {"http": proxy, "https": proxy}
                 sess = AsyncSession(**kwargs)
@@ -280,13 +283,16 @@ class TIDProvider:
         )
 
     def _fallback_tid(self, method: str, path: str) -> str:
-        """UUID-based TID when xclienttransaction is unavailable.
+        """Realistic Base64 TID when xclienttransaction is unavailable.
 
-        Format: fallback-{uuid}
-        X does NOT reject non-standard TID formats — the header is
-        primarily a telemetry/anti-bot signal, not a strict validation gate.
+        Real X `x-client-transaction-id` is a ~70-byte binary blob encoded as
+        standard Base64 (94 chars, no `=` padding). Never emit a literal
+        `fallback-...` prefix which is an obvious bot signature.
         """
-        return f"fallback-{uuid.uuid4().hex}"
+        import base64
+        import os
+
+        return base64.b64encode(os.urandom(70)).decode("ascii").rstrip("=")
 
     async def stats(self) -> dict:
         return {

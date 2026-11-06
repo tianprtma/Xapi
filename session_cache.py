@@ -40,7 +40,7 @@ class Session:
         return (time.time() - self.last_used) < ttl
 
     def viewer_alive(self, ttl: float = TTL_SECONDS) -> bool:
-        return self.viewer is not None and (time.time() - self.last_used) < ttl
+        return self.viewer is not None and (time.time() - self.viewer_at) < ttl
 
 
 class SessionStore:

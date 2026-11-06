@@ -44,7 +44,7 @@ function Topbar({ variant, onSearch, onToggleTheme, theme, query }) {
             <span className="brand-mark">𝕏</span>
             <div className="brand-stack">
               <span className="brand-name">Xapi</span>
-              <span className="brand-tag">X v2 mirror · cookie auth_token · v2.3.0</span>
+              <span className="brand-tag">X v2 mirror · cookie auth_token · v2.4.0</span>
             </div>
           </div>
         )}
@@ -159,7 +159,7 @@ function Sidebar({ variant, sidebarVariant, query, current, onSelect, openMap, o
         </div>
         <div className="sidebar-foot-row">
           <span className="sidebar-foot-dim">build</span>
-          <span>2.3.0 · fastapi</span>
+          <span>2.4.0 · fastapi · curl_cffi</span>
         </div>
       </div>
     </aside>
@@ -255,7 +255,7 @@ function OverviewPage({ variant, heroStyle, onSelect }) {
           <ConvRow k="Raw payload" v="?raw=1 → bypass formatter v2 (disable di prod via ENABLE_RAW=0)" />
           <ConvRow k="Pagination" v="Cursor via meta.next_token / pagination_token" />
           <ConvRow k="Errors" v="problem+json on 4xx/5xx · 401 = invalid token · 502 = upstream" />
-          <ConvRow k="Engine" v="GraphQL (httpx) + Playwright fallback untuk CF-gated routes" />
+          <ConvRow k="Engine" v="GraphQL & REST 1.1 (curl_cffi Chrome TLS + Anti-Detect) + Playwright fallback" />
         </div>
       </Section>
     </div>
@@ -279,7 +279,7 @@ function HeroPrompt({ variant }) {
         X API v2, powered by<br />your auth_token cookie.
       </h1>
       <p className="hero-sub">
-        FastAPI mirror of X API v2 — backed by GraphQL via httpx and Playwright fallback for CF-gated endpoints. No OAuth2, no dev portal.
+        FastAPI mirror of X API v2 — backed by GraphQL &amp; XChat via curl_cffi (Chrome TLS/JA3 impersonation + Anti-Detect) and Playwright fallback. No OAuth2, no dev portal.
       </p>
       <div className="hero-prompt-line">
         <span className="hero-prompt-prefix">$</span>

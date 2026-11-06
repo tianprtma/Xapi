@@ -144,13 +144,24 @@ Common query params: `max_results` (1–100, default 20) and a cursor — usuall
 
 | Method | Path | Notes |
 |---|---|---|
+| GET | `/2/dm_events` | List DM events via GraphQL (`GetInitialXChatPageQuery` / `GetInboxPageRequestQuery`) + REST fallback (`mode=auto\|graphql\|rest`, `include_requests=1`) |
+| GET | `/2/dm_events/search` | Search DM messages/groups/people via GraphQL (`DmAllSearchSlice` / `DmGroupSearchSlice` / `DmPeopleSearchSlice`) |
+| GET | `/2/dm_events/{event_id}` | Single DM event via GraphQL (`GetMessageEventsPageQuery` / `GetInitialXChatPageQuery`) + inbox fallback |
+| GET | `/2/dm_conversations/{conversation_id}/dm_events` | Conversation DM events via GraphQL (`GetConversationPageQuery` / `GetMessageEventsPageQuery`) + REST fallback |
+| GET | `/2/dm_conversations/with/{participant_id}/dm_events` | 1-on-1 DM events with participant via GraphQL + REST fallback |
+| GET | `/2/dm_conversations/media/{dm_id}/{media_id}/{resource_id}` | Proxy download binary media DM (`ton.x.com`) |
+| GET | `/2/chat/conversations` | XChat conversations list via GraphQL (`GetInitialXChatPageQuery` / `GetInboxPageRequestQuery`) |
+| GET | `/2/chat/conversations/{conversation_id}/messages` | XChat conversation messages via GraphQL (`GetConversationPageQuery`, alias `/events`) |
+| GET | `/2/chat/requests` | XChat message requests via GraphQL (`GetMessageRequestsPageQuery`) |
+| GET | `/2/chat/permissions` | DM / AV permissions via GraphQL (`DmAvPermissionsQuery`) |
+| GET | `/2/chat/public_keys` | XChat user public keys via GraphQL (`GetPublicKeys`, `?ids=123,456`) |
 | POST | `/2/dm_conversations` | Body `{conversation_type, participant_ids, message:{text}}` |
 | POST | `/2/dm_conversations/with/{participant_id}/messages` | Body `{text, media_id?, attachments?, reply_to_dm_event_id?}` |
 | POST | `/2/dm_conversations/{conversation_id}/messages` | Same body |
 | DELETE | `/2/dm_events/{event_id}` | Delete own message |
 | POST | `/2/users/{user_id}/dm/block` | Block in DM |
 | POST | `/2/users/{user_id}/dm/unblock` | Unblock in DM |
-| POST | `/2/chat/conversations/*` | 501 stubs (XChat needs OAuth2) |
+| POST | `/2/chat/conversations/*` | 501 stubs (XChat write ops need OAuth2) |
 | POST | `/2/chat/media/upload/*` | 501 stubs |
 
 ## Media

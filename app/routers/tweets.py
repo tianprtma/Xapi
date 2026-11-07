@@ -121,7 +121,15 @@ async def v2_tweets_bulk(
     errors: list[dict] = []
     for tid, r in zip(id_list, results):
         if isinstance(r, Exception) or (isinstance(r, dict) and r.get("status") != "ok"):
-            errors.append({"id": tid, "title": "Lookup Failed", "detail": str(r)[:200], "type": "not_found"})
+            http_st = (r.get("http_status") if isinstance(r, dict) else None) or 502
+            err_type = "rate_limit_exceeded" if http_st == 429 else "upstream_error"
+            errors.append({
+                "id": tid,
+                "title": "Too Many Requests" if http_st == 429 else "Upstream Lookup Failed",
+                "detail": str(r.get("error") if isinstance(r, dict) else r)[:200],
+                "type": err_type,
+                "status": http_st,
+            })
             continue
         formatted = format_tweet(r.get("data") or {})
         if "errors" in formatted:

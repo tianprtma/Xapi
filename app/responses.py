@@ -66,12 +66,14 @@ def finalize(
             ),
         )
 
+    upstream_http = result.get("http_status")
+    out_status = 429 if upstream_http == 429 else 502
     return JSONResponse(
-        status_code=502,
+        status_code=out_status,
         content=build_error(
             "UPSTREAM_ERROR",
             detail=str(result.get("error") or "GraphQL call failed")[:500],
-            http_status=str(result.get("http_status") or "unknown"),
+            http_status=str(upstream_http or "unknown"),
             reason=str(result.get("error") or "upstream failure")[:200],
         ),
     )
@@ -184,12 +186,29 @@ def batch_finalize(content: dict[str, Any]) -> JSONResponse:
     """Batch read finalizer.
 
     Per Twitter API v2 spec partial failures stay 200 (errors array in body).
-    But when *every* item failed (no data, only errors) we surface 404 so the
-    caller doesn't have to introspect the body to detect a total miss.
+    When *every* item failed (no data, only errors):
+    - If items failed due to upstream rate-limit (429) or upstream 5xx error,
+      surface 429 / 502 so callers (e.g. jkt48history delete sweep) never
+      mistake a rate-limit or network outage for 404 Not Found (deleted tweet).
+    - Otherwise surface 404 for genuine not-found misses.
     """
     data = content.get("data")
     errors = content.get("errors")
     if errors and not data:
+        statuses = [
+            e.get("status")
+            for e in errors
+            if isinstance(e, dict) and isinstance(e.get("status"), int)
+        ]
+        types = [
+            e.get("type")
+            for e in errors
+            if isinstance(e, dict) and isinstance(e.get("type"), str)
+        ]
+        if 429 in statuses or "rate_limit_exceeded" in types:
+            return JSONResponse(status_code=429, content=content)
+        if statuses and all(s >= 500 for s in statuses):
+            return JSONResponse(status_code=502, content=content)
         return JSONResponse(status_code=404, content=content)
     return JSONResponse(status_code=200, content=content)
 

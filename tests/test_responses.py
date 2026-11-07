@@ -104,3 +104,23 @@ def test_batch_finalize_keeps_empty_success_200():
     response = batch_finalize({"data": [], "meta": {"result_count": 0}})
 
     assert response.status_code == 200
+
+
+def test_batch_finalize_preserves_429_and_502_on_upstream_failure():
+    resp_429 = batch_finalize(
+        {
+            "data": [],
+            "meta": {"result_count": 0},
+            "errors": [{"id": "1", "title": "Too Many Requests", "type": "rate_limit_exceeded", "status": 429}],
+        }
+    )
+    assert resp_429.status_code == 429
+
+    resp_502 = batch_finalize(
+        {
+            "data": [],
+            "meta": {"result_count": 0},
+            "errors": [{"id": "1", "title": "Upstream Lookup Failed", "type": "upstream_error", "status": 502}],
+        }
+    )
+    assert resp_502.status_code == 502

@@ -108,9 +108,15 @@ async def v2_users_bulk(
         try:
             async with fanout_semaphore():
                 r = await graphql_call("UserByRestId", {"userId": uid, "withSafetyModeUserFields": True}, tok)
-            return {"id": uid, "data": r.get("data"), "status": r.get("status", "ok")}
+            return {
+                "id": uid,
+                "data": r.get("data"),
+                "status": r.get("status", "ok"),
+                "http_status": r.get("http_status"),
+                "error": r.get("error"),
+            }
         except Exception as e:  # noqa: BLE001
-            return {"id": uid, "status": "error", "error": str(e)}
+            return {"id": uid, "status": "error", "http_status": 502, "error": str(e)}
 
     results = await asyncio.gather(*[_one(u) for u in id_list])
 
@@ -120,7 +126,17 @@ async def v2_users_bulk(
     data, errors = [], []
     for r in results:
         if r.get("status") != "ok":
-            errors.append({"id": r["id"], "title": "Lookup Failed", "type": "not_found"})
+            cached = _cached_profile(r["id"])
+            if cached is not None:
+                data.append(cached)
+                continue
+            http_st = r.get("http_status") or 502
+            errors.append({
+                "id": r["id"],
+                "title": "Too Many Requests" if http_st == 429 else "Upstream Lookup Failed",
+                "type": "rate_limit_exceeded" if http_st == 429 else "upstream_error",
+                "status": http_st,
+            })
             continue
         formatted = format_user(r.get("data") or {})
         if "errors" in formatted:
@@ -414,7 +430,7 @@ async def v2_user_by_id(
     if result.get("status") != "ok":
         # Fallback TANPA Playwright (hemat RAM — Chromium besar dan sering
         # terpicu saat rate limit): serve dari cache snapshot profil.
-        cached = await _cached_profile(user_id)
+        cached = _cached_profile(user_id)
         if cached is not None:
             return JSONResponse(content={"data": cached})
         # Playwright hanya bila diizinkan eksplisit (PLAYWRIGHT_FALLBACK=1)

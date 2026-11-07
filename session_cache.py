@@ -79,11 +79,14 @@ class SessionStore:
     ) -> Session:
         key = token_key(auth_token)
         async with self._lock:
+            existing = self._cache.get(key)
             sess = Session(
                 auth_token=auth_token,
                 ct0=ct0,
                 cookies=cookies,
-                user_id=user_id,
+                user_id=user_id or (existing.user_id if existing else None),
+                viewer=existing.viewer if existing else None,
+                viewer_at=existing.viewer_at if existing else 0.0,
             )
             self._cache[key] = sess
             self._cache.move_to_end(key)
@@ -118,7 +121,6 @@ class SessionStore:
 
     async def stats(self) -> dict[str, int]:
         async with self._lock:
-            now = time.time()
             alive = sum(1 for s in self._cache.values() if s.is_alive())
             viewers = sum(1 for s in self._cache.values() if s.viewer_alive())
             return {

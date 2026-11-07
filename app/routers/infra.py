@@ -118,7 +118,11 @@ async def admin_stats(
             src = inspect.getsource(r.endpoint)
         except (OSError, TypeError):
             src = ""
-        bucket = "stub_501" if "stub_501(" in src else "implemented"
+        has_impl = any(
+            fn in src
+            for fn in ("graphql_call(", "rest_call(", "dm_call(", "media_upload(", "extract_bearer(")
+        )
+        bucket = "stub_501" if ("stub_501(" in src and not has_impl) else "implemented"
         for m in r.methods:
             if m == "HEAD":
                 continue

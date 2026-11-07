@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import secrets
+import time
 from typing import Any, Optional
 from urllib.parse import urlparse as _urlparse
 
@@ -241,6 +242,8 @@ async def _rest_call_once(
             resp = await client.request(method, url, headers=headers, data=data or {})
 
         if resp.status_code >= 400:
+            if resp.status_code in (401, 403):
+                await SessionStore.get().invalidate(auth_token)
             return {
                 "status": "error",
                 "http_status": resp.status_code,
@@ -497,7 +500,7 @@ async def media_upload(
         direct = _direct_session(auth_token, jar, timeout)
         try:
             return await _upload_chunks(
-                direct, base_headers, file_bytes, media_type, media_category)
+                direct, base_headers, file_bytes, media_type, media_category, max_poll_seconds=timeout)
         except Exception as exc:  # noqa: BLE001
             logging.getLogger("xapi.upload").warning(
                 "upload direct gagal (%s: %s) — fallback ke proxy",
@@ -509,9 +512,13 @@ async def media_upload(
                 pass
 
     async with pooled_client(auth_token) as client:
+        old_timeout = getattr(client, "timeout", 20.0)
         client.timeout = timeout
-        return await _upload_chunks(
-            client, base_headers, file_bytes, media_type, media_category)
+        try:
+            return await _upload_chunks(
+                client, base_headers, file_bytes, media_type, media_category, max_poll_seconds=timeout)
+        finally:
+            client.timeout = old_timeout
 
 
 def _direct_session(auth_token: str, jar: dict[str, str],
@@ -536,6 +543,8 @@ async def _upload_chunks(
     file_bytes: bytes,
     media_type: str,
     media_category: Optional[str],
+    *,
+    max_poll_seconds: float = 120.0,
 ) -> dict[str, Any]:
     """INIT/APPEND/FINALIZE/STATUS memakai session yang diberikan."""
     # 1. INIT
@@ -550,8 +559,13 @@ async def _upload_chunks(
     init_resp = await client.post(UPLOAD_BASE, headers=base_headers, data=init_params)
     if init_resp.status_code >= 400:
         return _upload_error(init_resp, "INIT")
-    init_json = init_resp.json()
-    media_id = init_json.get("media_id_string") or str(init_json.get("media_id"))
+    try:
+        init_json = init_resp.json()
+    except json.JSONDecodeError:
+        return _upload_error(init_resp, "INIT")
+    media_id = init_json.get("media_id_string") or str(init_json.get("media_id") or "")
+    if not media_id:
+        return _upload_error(init_resp, "INIT")
 
     # 2. APPEND chunks
     seg = 0
@@ -589,12 +603,25 @@ async def _upload_chunks(
     )
     if fin_resp.status_code >= 400:
         return _upload_error(fin_resp, "FINALIZE", media_id=media_id)
-    fin_json = fin_resp.json()
+    try:
+        fin_json = fin_resp.json()
+    except json.JSONDecodeError:
+        return _upload_error(fin_resp, "FINALIZE", media_id=media_id)
 
-    # 4. STATUS polling kalau processing async
+    # 4. STATUS polling kalau processing async (dibatasi max_poll_seconds)
     info = fin_json.get("processing_info")
+    poll_deadline = time.monotonic() + max_poll_seconds
     while info and info.get("state") in ("pending", "in_progress"):
-        await asyncio.sleep(int(info.get("check_after_secs") or 2))
+        if time.monotonic() >= poll_deadline:
+            return {
+                "status": "error",
+                "error": f"media processing timed out after {max_poll_seconds}s",
+                "stage": "PROCESSING",
+                "media_id": media_id,
+                "data": fin_json,
+            }
+        wait_secs = max(1, min(int(info.get("check_after_secs") or 2), 15))
+        await asyncio.sleep(wait_secs)
         st_resp = await client.get(
             UPLOAD_BASE,
             headers=base_headers,
@@ -602,7 +629,10 @@ async def _upload_chunks(
         )
         if st_resp.status_code >= 400:
             return _upload_error(st_resp, "STATUS", media_id=media_id)
-        fin_json = st_resp.json()
+        try:
+            fin_json = st_resp.json()
+        except json.JSONDecodeError:
+            return _upload_error(st_resp, "STATUS", media_id=media_id)
         info = fin_json.get("processing_info")
 
     if info and info.get("state") == "failed":

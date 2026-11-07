@@ -67,6 +67,13 @@ from ..config import (
 )
 from ..playwright_helpers import resolve_screen_name, tweet_author_handle
 from ..responses import finalize, stub_501, wrap, write_finalize
+from ..xchat_e2ee import (
+    get_cached_e2ee_media,
+    resolve_dm_pin,
+    send_xchat_dm_via_browser,
+    unlock_and_read_xchat_conversation,
+    unlock_and_read_xchat_inbox,
+)
 
 
 router = APIRouter(tags=["Direct Messages"])
@@ -106,7 +113,40 @@ async def v2_chat_members(conversation_id: str = PathParam(..., pattern=r"^\d+$"
 
 
 @router.post("/2/chat/conversations/{conversation_id}/messages")
-async def v2_chat_messages(conversation_id: str = PathParam(..., pattern=r"^\d+$")) -> JSONResponse:
+async def v2_chat_messages(
+    conversation_id: str = PathParam(..., pattern=r"^\d+([:-]\d+)*$"),
+    body: Optional[DMSendBody] = None,
+    dm_pin: Optional[str] = Query(None, description="Opsional 4-8 digit PIN XChat E2EE"),
+    x_dm_pin: Optional[str] = Header(None, alias="X-DM-Pin"),
+    authorization: Optional[str] = Header(None),
+    auth_token: Optional[str] = Query(None),
+    raw: int = Query(0),
+) -> JSONResponse:
+    if body is None:
+        return stub_501(feature="chat_messages", reason=OAUTH2_USER_CTX_REASON)
+    tok = extract_bearer(authorization, auth_token)
+    pin = resolve_dm_pin(dm_pin, x_dm_pin)
+    me = await resolve_me_id(tok)
+    norm_conv_id = conversation_id.replace(":", "-")
+    if me:
+        media_id = body.media_id or ((body.attachments[0] or {}).get("media_id") if body.attachments else None)
+        payload = build_dm_new2_payload(
+            me=me,
+            conv_id=norm_conv_id,
+            recipient_ids=None,
+            text=body.text,
+            media_id=media_id,
+            reply_to=body.reply_to_dm_event_id,
+        )
+        result = await dm_call("dm/new2.json", tok, method="POST", json_body=payload, with_dm_defaults=False)
+        if result.get("status") == "ok":
+            if raw:
+                return wrap(result)
+            return JSONResponse(status_code=201, content=format_dm_send_result(result.get("data") or {}))
+    if pin:
+        pw_res = await send_xchat_dm_via_browser(tok, pin, norm_conv_id, body.text)
+        if pw_res.get("status") == "ok":
+            return JSONResponse(status_code=201, content={"data": pw_res.get("data")})
     return stub_501(feature="chat_messages", reason=OAUTH2_USER_CTX_REASON)
 
 
@@ -150,21 +190,219 @@ def _has_gql_dm_data(result: dict[str, Any]) -> bool:
     return True
 
 
+def _format_dm_events_smart(
+    payload: dict[str, Any],
+    event_types: Optional[str] = None,
+    dm_event_fields: Optional[str] = None,
+    expansions: Optional[str] = None,
+    max_results: Optional[int] = None,
+) -> dict[str, Any]:
+    """Format DM events and upgrade any GraphQL `_xchat_encrypted` placeholders with REST 1.1 plaintext if present."""
+    formatted = format_dm_events(
+        payload,
+        event_types=event_types,
+        dm_event_fields=dm_event_fields,
+        expansions=expansions,
+        max_results=None,
+    )
+    if not isinstance(payload, dict):
+        return formatted
+    rest_only = {
+        k: payload[k]
+        for k in ("inbox_initial_state", "user_events", "conversation_timeline", "entries", "users", "conversations")
+        if k in payload
+    }
+    if rest_only:
+        rest_fmt = format_dm_events(rest_only, event_types=event_types, max_results=None)
+        rest_by_id = {str(e["id"]): e for e in (rest_fmt.get("data") or []) if isinstance(e, dict) and e.get("id")}
+        if rest_by_id:
+            upgraded = []
+            for ev in formatted.get("data") or []:
+                eid = str(ev.get("id") or "")
+                r_ev = rest_by_id.get(eid)
+                if r_ev and (
+                    ev.get("_xchat_encrypted")
+                    or not ev.get("text")
+                    or (r_ev.get("_xapi_attachments") and not ev.get("_xapi_attachments"))
+                    or (r_ev.get("referenced_tweets") and not ev.get("referenced_tweets"))
+                    or (r_ev.get("entities") and not ev.get("entities"))
+                ):
+                    merged = {**ev, **r_ev}
+                    if not r_ev.get("_xchat_encrypted"):
+                        merged.pop("_xchat_encrypted", None)
+                        merged.pop("encrypted_text", None)
+                    upgraded.append(merged)
+                else:
+                    upgraded.append(ev)
+            formatted["data"] = upgraded
+        rest_inc = rest_fmt.get("includes") or {}
+        if isinstance(rest_inc, dict) and rest_inc:
+            fmt_inc = formatted.setdefault("includes", {})
+            for inc_key, id_field in (("media", "media_key"), ("tweets", "id")):
+                if rest_inc.get(inc_key):
+                    existing_list = list(fmt_inc.get(inc_key) or [])
+                    seen_keys = {str(item.get(id_field)) for item in existing_list if isinstance(item, dict) and item.get(id_field)}
+                    for item in rest_inc[inc_key]:
+                        if isinstance(item, dict) and str(item.get(id_field)) not in seen_keys:
+                            existing_list.append(item)
+                            seen_keys.add(str(item.get(id_field)))
+                    fmt_inc[inc_key] = existing_list
+
+    events = formatted.get("data") or []
+    events.sort(
+        key=lambda x: (str(x.get("created_at") or ""), int(x["id"]) if str(x.get("id", "")).isdigit() else 0),
+        reverse=True,
+    )
+    if max_results and max_results > 0 and len(events) > max_results:
+        events = events[:max_results]
+        if events and events[-1].get("id"):
+            formatted.setdefault("meta", {})["next_token"] = str(events[-1]["id"])
+    formatted["data"] = events
+    formatted.setdefault("meta", {})["result_count"] = len(events)
+    return formatted
+
+
+def _format_dm_conversations_smart(
+    payload: dict[str, Any],
+    max_results: Optional[int] = None,
+) -> dict[str, Any]:
+    """Format DM conversations using _format_dm_events_smart (upgrading GraphQL encrypted events with REST 1.1 plaintext) and sort newest-first."""
+    formatted = _format_dm_events_smart(payload)
+    includes = formatted.get("includes") or {}
+    convs = includes.get("conversations") or []
+    events = formatted.get("data") or []
+    users = includes.get("users") or []
+
+    latest_by_conv: dict[str, dict[str, Any]] = {}
+    for ev in events:
+        cid = ev.get("dm_conversation_id")
+        if not cid:
+            continue
+        existing = latest_by_conv.get(cid)
+        if not existing:
+            latest_by_conv[cid] = ev
+        elif existing.get("event_type") != "MessageCreate" and ev.get("event_type") == "MessageCreate":
+            latest_by_conv[cid] = ev
+
+    conv_list: list[dict[str, Any]] = []
+    for c in convs:
+        c_copy = dict(c)
+        cid = c_copy.get("id")
+        if cid and cid in latest_by_conv:
+            c_copy["last_message_event"] = latest_by_conv[cid]
+        conv_list.append(c_copy)
+
+    # Sort conversations newest-first by created_at (ISO 8601 UTC) then Snowflake id
+    def _conv_sort_key(c_obj: dict[str, Any]) -> tuple[str, int]:
+        lme = c_obj.get("last_message_event") or {}
+        eid = str(lme.get("id") or c_obj.get("last_read_event_id") or "")
+        return (str(lme.get("created_at") or ""), int(eid) if eid.isdigit() else 0)
+
+    conv_list.sort(key=_conv_sort_key, reverse=True)
+
+    if max_results and max_results > 0 and len(conv_list) > max_results:
+        conv_list = conv_list[:max_results]
+
+    out: dict[str, Any] = {
+        "data": conv_list,
+        "meta": {
+            "result_count": len(conv_list),
+            **({"next_token": formatted["meta"]["next_token"]} if formatted.get("meta", {}).get("next_token") else {}),
+        },
+    }
+    inc_out: dict[str, Any] = {}
+    if users:
+        inc_out["users"] = users
+    if events:
+        inc_out["dm_events"] = events
+    if inc_out:
+        out["includes"] = inc_out
+    return out
+
+
+async def _enrich_conv_events_with_e2ee(
+    formatted: dict[str, Any],
+    tok: str,
+    pin: Optional[str],
+    conv_id: str,
+    max_results: int = 50,
+) -> dict[str, Any]:
+    """If `pin` is available and the latest conversation event is encrypted (or events are empty), unlock via XChat E2EE resolver."""
+    if not pin:
+        return formatted
+    events = formatted.get("data") or []
+    # Only invoke Playwright E2EE decryption if there are no events or the LATEST event (events[0]) is encrypted
+    latest_is_encrypted = bool(events and isinstance(events[0], dict) and events[0].get("_xchat_encrypted"))
+    if events and not latest_is_encrypted:
+        return formatted
+
+    me = await resolve_me_id(tok)
+    decrypted_events = await unlock_and_read_xchat_conversation(
+        auth_token=tok,
+        dm_pin=pin,
+        conversation_id=conv_id,
+        my_user_id=me,
+        max_results=max_results,
+    )
+    if not decrypted_events:
+        return formatted
+
+    # If we had no events at all, use decrypted DOM rows directly; otherwise merge aligned MessageCreate events
+    if not events:
+        new_events = decrypted_events[:max_results]
+    else:
+        # Both `events` and `decrypted_events` are ordered newest-first; align MessageCreate events by message index
+        new_events = []
+        msg_idx = 0
+        for ev in events:
+            is_msg = ev.get("event_type") in (None, "MessageCreate")
+            if is_msg:
+                if ev.get("_xchat_encrypted") and msg_idx < len(decrypted_events):
+                    d_ev = decrypted_events[msg_idx]
+                    merged = {**ev, **d_ev, "id": ev.get("id") or d_ev.get("id")}
+                    if str(ev.get("sender_id") or "").isdigit():
+                        merged["sender_id"] = ev["sender_id"]
+                        if me:
+                            merged["is_outgoing"] = str(ev["sender_id"]) == str(me)
+                    if ev.get("created_at"):
+                        merged["created_at"] = ev["created_at"]
+                    merged.pop("_xchat_encrypted", None)
+                    merged.pop("encrypted_text", None)
+                    new_events.append(merged)
+                else:
+                    new_events.append(ev)
+                msg_idx += 1
+            else:
+                new_events.append(ev)
+        # If GraphQL only returned the latest 1 message in conversation_timeline while DOM has older messages, append them
+        if msg_idx < len(decrypted_events) and len(new_events) < max_results:
+            new_events.extend(decrypted_events[msg_idx : msg_idx + (max_results - len(new_events))])
+
+    formatted["data"] = new_events[:max_results]
+    formatted["meta"] = {
+        **(formatted.get("meta") or {}),
+        "result_count": len(formatted["data"]),
+        "xchat_decrypted": True,
+    }
+    return formatted
+
+
 @router.get("/2/chat/conversations")
 async def v2_chat_conversations(
     pagination_token: Optional[str] = Query(None),
     max_results: int = Query(50, ge=1, le=100),
-    mode: str = Query("graphql", description="graphql | rest | auto"),
+    mode: str = Query("auto", description="graphql | rest | auto"),
+    dm_pin: Optional[str] = Query(None, description="Opsional 4-8 digit PIN XChat E2EE"),
+    x_dm_pin: Optional[str] = Header(None, alias="X-DM-Pin"),
     authorization: Optional[str] = Header(None),
     auth_token: Optional[str] = Query(None),
     raw: int = Query(0),
 ) -> JSONResponse:
     """
-    GET /2/chat/conversations — ambil daftar percakapan DM / XChat via GraphQL.
-    Backend: GraphQL `GetInboxPageRequestQuery` (jika ada pagination_token) atau
-    `GetInitialXChatPageQuery`, dengan fallback opsional ke REST 1.1 `dm/user_updates.json`.
+    GET /2/chat/conversations — ambil daftar percakapan DM / XChat via GraphQL + REST 1.1 (+ E2EE PIN fallback).
     """
     tok = extract_bearer(authorization, auth_token)
+    pin = resolve_dm_pin(dm_pin, x_dm_pin)
     result: dict[str, Any] = {}
 
     if mode.lower() in ("graphql", "auto"):
@@ -200,7 +438,61 @@ async def v2_chat_conversations(
         elif not result:
             result = rest_res
 
-    return finalize(result, lambda d: format_dm_conversations(d, max_results=max_results), bool(raw))
+    if raw:
+        return wrap(result)
+
+    formatted = _format_dm_conversations_smart(result.get("data") or {}, max_results=max_results)
+    convs = formatted.get("data") or []
+    needs_e2ee = pin and (
+        not convs
+        or any(((c.get("last_message_event") or {}).get("_xchat_encrypted")) for c in convs if isinstance(c, dict))
+    )
+    if needs_e2ee and pin:
+        me = await resolve_me_id(tok)
+        inbox_items = await unlock_and_read_xchat_inbox(tok, pin, my_user_id=me, max_results=max_results)
+        if inbox_items:
+            by_cid = {item["id"]: item for item in inbox_items if item.get("id")}
+            merged_convs = []
+            seen_cids = set()
+            for c in convs:
+                cid = str(c.get("id") or "").replace(":", "-")
+                seen_cids.add(cid)
+                item = by_cid.get(cid)
+                if item:
+                    non_null_item = {k: v for k, v in item.items() if v is not None}
+                    # Preserve non-intent profile_href if c already has one
+                    if c.get("profile_href") and str(item.get("profile_href") or "").startswith("/intent/user"):
+                        non_null_item.pop("profile_href", None)
+                    c = {**c, **non_null_item}
+                    lme = dict(c.get("last_message_event") or {})
+                    if (lme.get("_xchat_encrypted") or not lme.get("text")) and item.get("preview_text"):
+                        lme["id"] = lme.get("id") or cid
+                        lme["dm_conversation_id"] = lme.get("dm_conversation_id") or cid
+                        lme["text"] = item["preview_text"]
+                        lme.pop("_xchat_encrypted", None)
+                        lme["_xchat_decrypted"] = True
+                        c["last_message_event"] = lme
+                merged_convs.append(c)
+            for cid, item in by_cid.items():
+                if cid not in seen_cids:
+                    merged_convs.append(
+                        {
+                            "id": cid,
+                            "type": "OneToOne",
+                            "participant_ids": cid.split("-") if "-" in cid else [],
+                            **item,
+                            "last_message_event": {
+                                "id": cid,
+                                "dm_conversation_id": cid,
+                                "text": item.get("preview_text"),
+                                "_xchat_decrypted": True,
+                            },
+                        }
+                    )
+            formatted["data"] = merged_convs[:max_results]
+            formatted["meta"] = {**(formatted.get("meta") or {}), "result_count": len(formatted["data"])}
+
+    return JSONResponse(status_code=200, content=formatted)
 
 
 @router.get("/2/chat/conversations/{conversation_id}/messages")
@@ -227,7 +519,7 @@ async def v2_chat_conversation_messages(
     if not _has_gql_dm_data(result):
         result = await graphql_call("GetMessageEventsPageQuery", variables, tok)
 
-    return finalize(result, lambda d: format_dm_events(d, max_results=max_results), bool(raw))
+    return finalize(result, lambda d: _format_dm_events_smart(d, max_results=max_results), bool(raw))
 
 
 @router.get("/2/chat/requests")
@@ -276,7 +568,7 @@ async def v2_chat_requests(
         elif not _has_gql_dm_data(result):
             result = rest_res
 
-    return finalize(result, lambda d: format_dm_events(d, max_results=max_results), bool(raw))
+    return finalize(result, lambda d: _format_dm_events_smart(d, max_results=max_results), bool(raw))
 
 
 @router.get("/2/chat/permissions")
@@ -419,7 +711,7 @@ async def v2_dm_events(
 
     return finalize(
         result,
-        lambda d: format_dm_events(
+        lambda d: _format_dm_events_smart(
             d,
             event_types=event_types,
             dm_event_fields=dm_event_fields,
@@ -464,7 +756,7 @@ async def v2_dm_events_search(
         variables["cursor"] = pagination_token
 
     result = await graphql_call(operation, variables, tok)
-    return finalize(result, lambda d: format_dm_events(d, max_results=max_results), bool(raw))
+    return finalize(result, lambda d: _format_dm_events_smart(d, max_results=max_results), bool(raw))
 
 
 @router.get("/2/dm_events/{event_id}")
@@ -542,6 +834,8 @@ async def v2_dm_conv_events(
     user_fields: Optional[str] = Query(None, alias="user.fields"),
     tweet_fields: Optional[str] = Query(None, alias="tweet.fields"),
     mode: str = Query("auto", description="graphql | rest | auto"),
+    dm_pin: Optional[str] = Query(None, description="Opsional 4-8 digit PIN XChat E2EE"),
+    x_dm_pin: Optional[str] = Header(None, alias="X-DM-Pin"),
     authorization: Optional[str] = Header(None),
     auth_token: Optional[str] = Query(None),
     raw: int = Query(0),
@@ -549,9 +843,10 @@ async def v2_dm_conv_events(
     """
     GET /2/dm_conversations/{conversation_id}/dm_events — semua event dalam 1 conversation.
     Backend: GraphQL `GetConversationPageQuery` / `GetMessageEventsPageQuery`,
-    dengan fallback ke REST 1.1 `dm/conversation/{conv_id}.json`.
+    dengan fallback ke REST 1.1 `dm/conversation/{conv_id}.json` + XChat E2EE `dm_pin` resolver.
     """
     tok = extract_bearer(authorization, auth_token)
+    pin = resolve_dm_pin(dm_pin, x_dm_pin)
     conv_id = conversation_id.replace(":", "-")
     gql_conv_id = conv_id.replace("-", ":")
     result: dict[str, Any] = {}
@@ -581,17 +876,19 @@ async def v2_dm_conv_events(
         elif not result:
             result = rest_res
 
-    return finalize(
-        result,
-        lambda d: format_dm_events(
-            d,
-            event_types=event_types,
-            dm_event_fields=dm_event_fields,
-            expansions=expansions,
-            max_results=max_results,
-        ),
-        bool(raw),
+    if raw:
+        return wrap(result)
+
+    formatted = _format_dm_events_smart(
+        result.get("data") or {},
+        event_types=event_types,
+        dm_event_fields=dm_event_fields,
+        expansions=expansions,
+        max_results=max_results,
     )
+    if pin:
+        formatted = await _enrich_conv_events_with_e2ee(formatted, tok, pin, conv_id, max_results=max_results)
+    return JSONResponse(status_code=200, content=formatted)
 
 
 @router.get("/2/dm_conversations/with/{participant_id}/dm_events")
@@ -606,15 +903,18 @@ async def v2_dm_with_user_events(
     user_fields: Optional[str] = Query(None, alias="user.fields"),
     tweet_fields: Optional[str] = Query(None, alias="tweet.fields"),
     mode: str = Query("auto", description="graphql | rest | auto"),
+    dm_pin: Optional[str] = Query(None, description="Opsional 4-8 digit PIN XChat E2EE"),
+    x_dm_pin: Optional[str] = Header(None, alias="X-DM-Pin"),
     authorization: Optional[str] = Header(None),
     auth_token: Optional[str] = Query(None),
     raw: int = Query(0),
 ) -> JSONResponse:
     """
     GET /2/dm_conversations/with/{participant_id}/dm_events — 1-on-1 DM history dengan user tertentu.
-    Resolve `me` → hitung `conv_id = "{min(me, them)}-{max(me, them)}"` → ambil via GraphQL / REST.
+    Resolve `me` → hitung `conv_id = "{min(me, them)}-{max(me, them)}"` → ambil via GraphQL / REST / E2EE.
     """
     tok = extract_bearer(authorization, auth_token)
+    pin = resolve_dm_pin(dm_pin, x_dm_pin)
     me = await resolve_me_id(tok)
     if not me:
         return JSONResponse(
@@ -650,23 +950,25 @@ async def v2_dm_with_user_events(
         elif not result:
             result = rest_res
 
-    return finalize(
-        result,
-        lambda d: format_dm_events(
-            d,
-            event_types=event_types,
-            dm_event_fields=dm_event_fields,
-            expansions=expansions,
-            max_results=max_results,
-        ),
-        bool(raw),
+    if raw:
+        return wrap(result)
+
+    formatted = _format_dm_events_smart(
+        result.get("data") or {},
+        event_types=event_types,
+        dm_event_fields=dm_event_fields,
+        expansions=expansions,
+        max_results=max_results,
     )
+    if pin:
+        formatted = await _enrich_conv_events_with_e2ee(formatted, tok, pin, conv_id, max_results=max_results)
+    return JSONResponse(status_code=200, content=formatted)
 
 
 @router.get("/2/dm_conversations/media/{dm_id}/{media_id}/{resource_id}", response_model=None)
 @router.get("/2/dm_conversations/media/{dm_id}/{media_id:path}/{resource_id}", response_model=None)
 async def v2_dm_media_proxy(
-    dm_id: str = PathParam(..., pattern=r"^\d+$"),
+    dm_id: str = PathParam(..., pattern=r"^(\d+(-\d+)*|xchat)$"),
     media_id: str = PathParam(..., pattern=r"^[A-Za-z0-9_/-]+$"),
     resource_id: str = PathParam(..., pattern=r"^[A-Za-z0-9._-]+$", description="Filename e.g. Z4k2_BaF.jpg or vid.mp4"),
     authorization: Optional[str] = Header(None),
@@ -674,8 +976,7 @@ async def v2_dm_media_proxy(
 ) -> Response:
     """
     GET /2/dm_conversations/media/{dm_id}/{media_id}/{resource_id} — proxy download binary media DM
-    (foto, GIF, maupun video multi-segmen `.../vid/avc1/720x1280/xxx.mp4`)
-    dari `https://ton.x.com/1.1/ton/data/dm/{dm_id}/{media_id}/{resource_id}` menggunakan sesi `auth_token`.
+    (foto, GIF, video dari `ton.x.com` maupun gambar `blob:` XChat E2EE yang di-cache di memori).
     """
     from ..auth import api_headers
     from ..client_pool import pooled_client
@@ -685,6 +986,16 @@ async def v2_dm_media_proxy(
             status_code=400,
             content=format_error("Bad Request", "Invalid media path segment", "bad_request", 400),
         )
+
+    if dm_id == "xchat":
+        cached = get_cached_e2ee_media(media_id.strip("/"))
+        if not cached:
+            return JSONResponse(
+                status_code=404,
+                content=format_error("Not Found", "Cached XChat E2EE media expired or not found", "not_found", 404),
+            )
+        raw_bytes, mime = cached
+        return Response(content=raw_bytes, media_type=mime)
 
     tok = extract_bearer(authorization, auth_token)
     url = f"https://ton.x.com/1.1/ton/data/dm/{dm_id}/{media_id.strip('/')}/{resource_id}"
@@ -756,15 +1067,18 @@ async def v2_dm_conv_create(
 async def v2_dm_send(
     participant_id: str = PathParam(..., pattern=r"^\d+$"),
     body: DMSendBody = ...,
+    dm_pin: Optional[str] = Query(None, description="Opsional 4-8 digit PIN XChat E2EE"),
+    x_dm_pin: Optional[str] = Header(None, alias="X-DM-Pin"),
     authorization: Optional[str] = Header(None),
     auth_token: Optional[str] = Query(None),
     raw: int = Query(0),
 ) -> JSONResponse:
     """
     POST /2/dm_conversations/with/{participant_id}/messages — kirim DM 1-1.
-    Backend: REST 1.1 dm/new2.json (auto-create conv kalau belum ada).
+    Backend: REST 1.1 dm/new2.json (auto-create conv kalau belum ada), dengan fallback XChat E2EE bila dm_pin tersedia.
     """
     tok = extract_bearer(authorization, auth_token)
+    pin = resolve_dm_pin(dm_pin, x_dm_pin)
     me = await resolve_me_id(tok)
     if not me:
         return JSONResponse(
@@ -788,6 +1102,11 @@ async def v2_dm_send(
     if raw:
         return wrap(result)
     if result["status"] != "ok":
+        if pin:
+            conv_id = dm_conv_id_for(me, participant_id)
+            pw_res = await send_xchat_dm_via_browser(tok, pin, conv_id, body.text)
+            if pw_res.get("status") == "ok":
+                return JSONResponse(status_code=201, content={"data": pw_res.get("data")})
         return write_finalize(result, raw=False)
     return JSONResponse(status_code=201, content=format_dm_send_result(result.get("data") or {}))
 
@@ -797,15 +1116,18 @@ async def v2_dm_send_to_conv(
     # 1-1 atau group conversation id ("<uid1>-<uid2>" atau "<uid1>-<uid2>-<uid3>" atau XChat ":")
     conversation_id: str = PathParam(..., pattern=r"^\d+([:-]\d+)*$"),
     body: DMSendBody = ...,
+    dm_pin: Optional[str] = Query(None, description="Opsional 4-8 digit PIN XChat E2EE"),
+    x_dm_pin: Optional[str] = Header(None, alias="X-DM-Pin"),
     authorization: Optional[str] = Header(None),
     auth_token: Optional[str] = Query(None),
     raw: int = Query(0),
 ) -> JSONResponse:
     """
     POST /2/dm_conversations/{conversation_id}/messages — kirim ke conv tertentu (1-1 atau group).
-    Backend: REST 1.1 dm/new2.json
+    Backend: REST 1.1 dm/new2.json + fallback XChat E2EE bila dm_pin tersedia.
     """
     tok = extract_bearer(authorization, auth_token)
+    pin = resolve_dm_pin(dm_pin, x_dm_pin)
     me = await resolve_me_id(tok)
     if not me:
         return JSONResponse(
@@ -828,6 +1150,10 @@ async def v2_dm_send_to_conv(
     if raw:
         return wrap(result)
     if result["status"] != "ok":
+        if pin:
+            pw_res = await send_xchat_dm_via_browser(tok, pin, norm_conv_id, body.text)
+            if pw_res.get("status") == "ok":
+                return JSONResponse(status_code=201, content={"data": pw_res.get("data")})
         return write_finalize(result, raw=False)
     return JSONResponse(status_code=201, content=format_dm_send_result(result.get("data") or {}))
 

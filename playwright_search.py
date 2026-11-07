@@ -64,6 +64,15 @@ PLAYWRIGHT_ENABLED = os.environ.get("PLAYWRIGHT_ENABLED", "0") == "1"
 # ──────────────────────────── In-flight coalescer ────────────────────────────
 
 
+class _Flight:
+    __slots__ = ("event", "result", "exc")
+
+    def __init__(self) -> None:
+        self.event = asyncio.Event()
+        self.result: dict[str, Any] | None = None
+        self.exc: BaseException | None = None
+
+
 class _InFlightCoalescer:
     """Deduplicate identical concurrent Playwright calls.
 
@@ -73,8 +82,7 @@ class _InFlightCoalescer:
     """
 
     def __init__(self) -> None:
-        self._pending: dict[str, asyncio.Event] = {}
-        self._results: dict[str, dict[str, Any]] = {}
+        self._pending: dict[str, _Flight] = {}
         self._lock = asyncio.Lock()
 
     async def run(
@@ -88,53 +96,44 @@ class _InFlightCoalescer:
         result. Otherwise execute and broadcast.
         """
         async with self._lock:
-            existing = self._pending.get(key)
-            if existing is not None:
-                pass  # Another caller is running — wait below
-            else:
-                self._pending[key] = asyncio.Event()
+            flight = self._pending.get(key)
+            is_owner = flight is None
+            if is_owner:
+                flight = _Flight()
+                self._pending[key] = flight
 
-        if existing is not None:
-            # Waiter path: block until executor stores result, then take it
-            await existing.wait()
-            stored = self._results.pop(key, None)
-            if stored is None:
+        if not is_owner:
+            # Waiter path: block until executor finishes, then read from flight
+            await flight.event.wait()
+            if flight.exc is not None:
+                raise flight.exc
+            if flight.result is None:
                 raise RuntimeError(f"coalesced call for {key} failed upstream")
-            if isinstance(stored, Exception):
-                raise stored
-            return stored
+            return flight.result
 
-        # Executor path: run fn(), store result (or exception), wake waiters
-        exc: BaseException | None = None
-        result: dict[str, Any] | None = None
+        # Executor path: run fn(), store result (or exception) on flight, wake waiters
         try:
             result = await fn()
+            flight.result = result
             return result
         except BaseException as e:
-            exc = e
+            flight.exc = e
             raise
         finally:
-            # Always store something before setting event, so waiters never
-            # hang. Store exception object on failure so waiters see it.
             async with self._lock:
-                if exc is not None:
-                    self._results[key] = exc  # waiter will re-raise
-                elif result is not None:
-                    self._results[key] = result
-                self._pending.pop(key, None).set()
+                self._pending.pop(key, None)
+                flight.event.set()
 
 
 _coalescer = _InFlightCoalescer()
 
 
 def _search_key(auth_token: str, q: str, search_type: SearchType) -> str:
-    import hashlib
     from app.config import token_key
     return f"search:{token_key(auth_token)}:{q}:{search_type}"
 
 
 def _fetch_key(auth_token: str, navigate_url: str, match_path: str | list[str], click_selector: str | None = None) -> str:
-    import hashlib
     from app.config import token_key
     cs = click_selector or ""
     mp = match_path if isinstance(match_path, str) else "|".join(sorted(match_path))
@@ -142,7 +141,6 @@ def _fetch_key(auth_token: str, navigate_url: str, match_path: str | list[str], 
 
 
 def _click_key(auth_token: str, navigate_url: str, click_selector: str, match_response_substr: str | list[str] | None = None) -> str:
-    import hashlib
     from app.config import token_key
     mr = ""
     if match_response_substr:
@@ -194,6 +192,18 @@ class PlaywrightPool:
         async with self._lock:
             if self._browser is not None and self._browser.is_connected():
                 return self._browser
+            if self._browser is not None:
+                try:
+                    await self._browser.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._browser = None
+            if self._pw is not None:
+                try:
+                    await self._pw.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._pw = None
             try:
                 self._pw = await async_playwright().start()
                 self._browser = await self._pw.chromium.launch(
@@ -697,6 +707,15 @@ async def _fetch_via_browser_impl(
                 "data": None,
             }
 
+        if captured.get("status", 0) >= 400:
+            return {
+                "status": "error",
+                "http_status": captured.get("status"),
+                "captured_url": captured.get("url"),
+                "error": captured.get("data") or captured.get("raw"),
+                "data": None,
+            }
+
         return {
             "status": "ok",
             "http_status": captured.get("status", 200),
@@ -793,6 +812,15 @@ async def _search_via_browser_impl(
                 "captured_url": captured.get("url"),
                 "http_status": captured.get("status"),
                 "raw": captured.get("raw"),
+                "data": None,
+            }
+
+        if captured.get("status", 0) >= 400:
+            return {
+                "status": "error",
+                "http_status": captured.get("status"),
+                "captured_url": captured.get("url"),
+                "error": captured.get("data") or captured.get("raw"),
                 "data": None,
             }
 

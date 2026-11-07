@@ -30,13 +30,14 @@ def _user_result_to_obj(user_result: dict[str, Any]) -> Optional[dict[str, Any]]
               or legacy.get("profile_image_url_https"))
     location = (user_result.get("location") or {}).get("location") or legacy.get("location")
     rel_persp = user_result.get("relationship_perspectives") or {}
-    following = rel_persp.get("following") if "following" in rel_persp else legacy.get("following")
-    followed_by = rel_persp.get("followed_by") if "followed_by" in rel_persp else legacy.get("followed_by")
-    blocking = rel_persp.get("blocking") if "blocking" in rel_persp else legacy.get("blocking")
-    muting = rel_persp.get("muting") if "muting" in rel_persp else legacy.get("muting")
+    following = rel_persp.get("following") if rel_persp.get("following") is not None else legacy.get("following")
+    followed_by = rel_persp.get("followed_by") if rel_persp.get("followed_by") is not None else legacy.get("followed_by")
+    blocking = rel_persp.get("blocking") if rel_persp.get("blocking") is not None else legacy.get("blocking")
+    muting = rel_persp.get("muting") if rel_persp.get("muting") is not None else legacy.get("muting")
     default_avatar = legacy.get("default_profile_image")
     if default_avatar is None and isinstance(avatar, str):
         default_avatar = "default_profile" in avatar
+    priv_prot = (user_result.get("privacy") or {}).get("protected")
 
     return {
         "id": user_result.get("rest_id"),
@@ -52,7 +53,7 @@ def _user_result_to_obj(user_result: dict[str, Any]) -> Optional[dict[str, Any]]
             or legacy.get("verified")
             or False
         ),
-        "protected": (user_result.get("privacy") or {}).get("protected") if "privacy" in user_result else legacy.get("protected", False),
+        "protected": priv_prot if priv_prot is not None else legacy.get("protected", False),
         "profile_image_url": avatar,
         "default_profile_image": bool(default_avatar) if default_avatar is not None else False,
         "relationship": {
@@ -653,16 +654,18 @@ def _dm_event_to_obj(
     # Account Activity API (`message_create.message_data`), keep nested fallback.
     msg_data = ev.get("message_data") or msg.get("message_data") or {}
 
+    raw_conv_id = ev.get("conversation_id") or msg.get("target", {}).get("conversation_id")
     base: dict[str, Any] = {
         "id": str(ev.get("id") or ev.get("event_id") or ""),
         "event_type": _DM_EVENT_TYPE_MAP.get(et, et),
         "created_at": _dm_ts_to_iso(ev.get("created_timestamp") or ev.get("time")),
-        "dm_conversation_id": ev.get("conversation_id") or msg.get("target", {}).get("conversation_id"),
+        "dm_conversation_id": str(raw_conv_id).replace(":", "-") if raw_conv_id else None,
     }
 
     if et in ("message_create", "Message", "message"):
         sender = msg_data.get("sender_id") or msg.get("sender_id") or ev.get("sender_id")
-        text = msg_data.get("text") or ev.get("text")
+        raw_text = msg_data.get("text") if msg_data.get("text") is not None else ev.get("text")
+        text = raw_text if raw_text is not None else ""
         base.update(
             {
                 "event_type": "MessageCreate",
@@ -674,49 +677,90 @@ def _dm_event_to_obj(
         # 1.1's "this user follows the bot owner". Missing/None → unknown.
         if sender and users:
             sender_obj = users.get(str(sender)) or {}
-            fb = sender_obj.get("followed_by")
+            s_rel = sender_obj.get("relationship") if isinstance(sender_obj.get("relationship"), dict) else {}
+            fb = sender_obj.get("followed_by") if sender_obj.get("followed_by") is not None else s_rel.get("followed_by")
             if fb is True:
                 base["_sender_follows_owner"] = True
             elif fb is False:
                 base["_sender_follows_owner"] = False
-            fw = sender_obj.get("following")
+            fw = sender_obj.get("following") if sender_obj.get("following") is not None else s_rel.get("following")
             if fw is True:
                 base["_owner_follows_sender"] = True
             elif fw is False:
                 base["_owner_follows_sender"] = False
         # entities
         entities = msg_data.get("entities") or {}
-        if entities:
-            base["entities"] = {
-                "hashtags": [{"tag": h.get("text")} for h in entities.get("hashtags", [])],
-                "mentions": [
-                    {"username": m.get("screen_name"), "id": str(m.get("id_str") or "")}
-                    for m in entities.get("user_mentions", [])
-                ],
-                "urls": [
-                    {
-                        "url": u.get("url"),
-                        "expanded_url": u.get("expanded_url"),
-                        "display_url": u.get("display_url"),
-                    }
-                    for u in entities.get("urls", [])
-                ],
+        urls_list: list[dict[str, Any]] = [
+            {
+                "url": u.get("url"),
+                "expanded_url": u.get("expanded_url"),
+                "display_url": u.get("display_url"),
             }
+            for u in (entities.get("urls") or [])
+            if isinstance(u, dict)
+        ]
+        seen_tco = {u.get("url") for u in urls_list if u.get("url")}
+
+        def _add_entity_url(item: Any) -> None:
+            if not isinstance(item, dict):
+                return
+            u_short = item.get("url")
+            u_exp = item.get("expanded_url")
+            if u_short and u_exp and u_short not in seen_tco:
+                seen_tco.add(u_short)
+                urls_list.append({
+                    "url": u_short,
+                    "expanded_url": u_exp,
+                    "display_url": item.get("display_url"),
+                })
+
         # attachments (media in DM message_data)
         attach = msg_data.get("attachment") or {}
-        media = attach.get("media") or attach.get("photo") or attach.get("video")
-        if media and media.get("id_str"):
-            att_obj = _dm_attachment_obj(media)
-            m_v2 = _dm_media_v2_obj(att_obj)
-            base["attachments"] = {"media_keys": [str(m_v2.get("media_key") or media["id_str"])]}
+        media_raw = (
+            attach.get("media")
+            or attach.get("photo")
+            or attach.get("video")
+            or attach.get("animated_gif")
+            or (msg_data.get("extended_entities") or {}).get("media")
+            or entities.get("media")
+        )
+        media_items = media_raw if isinstance(media_raw, list) else ([media_raw] if isinstance(media_raw, dict) else [])
+        att_objs = []
+        media_keys = []
+        for m_item in media_items:
+            if isinstance(m_item, dict):
+                _add_entity_url(m_item)
+                if m_item.get("id_str") or m_item.get("id"):
+                    att_obj = _dm_attachment_obj(m_item)
+                    m_v2 = _dm_media_v2_obj(att_obj)
+                    att_objs.append(att_obj)
+                    media_keys.append(str(m_v2.get("media_key") or m_item.get("id_str") or m_item.get("id")))
+        if att_objs:
+            base["attachments"] = {"media_keys": media_keys}
             # Surface DL URL + type so consumers can fetch the binary without
             # re-walking includes. `_xapi_attachments` is non-spec; consumers
             # should treat it as best-effort.
-            base["_xapi_attachments"] = [att_obj]
+            base["_xapi_attachments"] = att_objs
         # quoted/referenced tweet
-        if attach.get("tweet"):
+        if isinstance(attach.get("tweet"), dict):
             tw = attach["tweet"]
-            base["referenced_tweets"] = [{"type": "quoted", "id": str(tw.get("id") or "")}]
+            _add_entity_url(tw)
+            if isinstance(tw.get("status"), dict):
+                _add_entity_url(tw["status"])
+            tid_val = tw.get("id") or tw.get("id_str") or (tw.get("status") or {}).get("id_str") or (tw.get("status") or {}).get("id")
+            if tid_val:
+                base["referenced_tweets"] = [{"type": "quoted", "id": str(tid_val)}]
+
+        if entities or urls_list:
+            base["entities"] = {
+                "hashtags": [{"tag": h.get("text")} for h in entities.get("hashtags", []) if isinstance(h, dict)],
+                "mentions": [
+                    {"username": m.get("screen_name"), "id": str(m.get("id_str") or "")}
+                    for m in entities.get("user_mentions", [])
+                    if isinstance(m, dict)
+                ],
+                "urls": urls_list,
+            }
 
     elif et in ("conversation_join_events", "ParticipantsJoin", "participants_join"):
         base["event_type"] = "ParticipantsJoin"
@@ -759,7 +803,8 @@ def _dm_ts_to_iso(ts: Any) -> Optional[str]:
         # Handle seconds vs milliseconds epoch
         if ms < 10_000_000_000:
             ms *= 1000
-        return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        dt = datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+        return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{ms % 1000:03d}Z"
     except (ValueError, TypeError):
         return str(ts)
 
@@ -902,6 +947,25 @@ def _decode_xchat_thrift_event(b64_str: str, default_conv_id: Optional[str] = No
     return {k: v for k, v in out.items() if v is not None}
 
 
+def _merge_user_obj(existing: Optional[dict[str, Any]], new_obj: dict[str, Any]) -> dict[str, Any]:
+    """Merge two user objects without overwriting non-None fields (including nested public_metrics/relationship) with None."""
+    if not existing:
+        return dict(new_obj)
+    merged = dict(existing)
+    for k, v in new_obj.items():
+        if v is None:
+            continue
+        if isinstance(v, dict) and isinstance(merged.get(k), dict):
+            sub = dict(merged[k])
+            for sk, sv in v.items():
+                if sv is not None:
+                    sub[sk] = sv
+            merged[k] = sub
+        else:
+            merged[k] = v
+    return merged
+
+
 def _gql_dm_event_to_obj(
     ev: dict[str, Any],
     default_conv_id: Optional[str] = None,
@@ -938,7 +1002,8 @@ def _gql_dm_event_to_obj(
             if isinstance(res, dict) and (res.get("rest_id") or res.get("id_str")):
                 u_obj = _user_result_to_obj(res) if "rest_id" in res else _dm_user_obj(res)
                 if u_obj and u_obj.get("id") and users_by_id is not None:
-                    users_by_id[str(u_obj["id"])] = u_obj
+                    uid_str = str(u_obj["id"])
+                    users_by_id[uid_str] = _merge_user_obj(users_by_id.get(uid_str), u_obj)
 
     # If it looks like a standard REST 1.1 event dict, delegate to _dm_event_to_obj
     if "message_create" in inner or ("message_data" in inner and ("id" in inner or "event_id" in inner)):
@@ -947,7 +1012,8 @@ def _gql_dm_event_to_obj(
                 **inner,
                 "type": inner.get("type") or inner.get("event_type") or "message_create",
                 "conversation_id": inner.get("conversation_id") or default_conv_id,
-            }
+            },
+            users=users_by_id,
         )
         if obj and obj.get("id"):
             return obj
@@ -1001,13 +1067,25 @@ def _gql_dm_event_to_obj(
 
     ts = (
         inner.get("created_at")
+        or inner.get("created_at_ms")
         or inner.get("created_timestamp")
         or inner.get("timestamp_ms")
         or inner.get("timestamp")
         or inner.get("time")
+        or msg_data.get("created_at")
+        or msg_data.get("time")
+        or content.get("created_at")
         or ev.get("created_at")
+        or ev.get("created_at_ms")
         or ev.get("created_timestamp")
     )
+    if ts is None and str(ev_id).isdigit() and len(str(ev_id)) >= 15:
+        try:
+            snowflake_ms = (int(str(ev_id)) >> 22) + 1288834974657
+            if 1288834974657 < snowflake_ms < 4102444800000:
+                ts = snowflake_ms
+        except Exception:
+            pass
 
     raw_type = (
         inner.get("event_type")
@@ -1026,36 +1104,90 @@ def _gql_dm_event_to_obj(
         "text": text,
     }
 
+    if sender_id and isinstance(users_by_id, dict):
+        s_obj = users_by_id.get(str(sender_id))
+        if isinstance(s_obj, dict):
+            s_rel = s_obj.get("relationship") if isinstance(s_obj.get("relationship"), dict) else {}
+            fb = s_obj.get("followed_by") if s_obj.get("followed_by") is not None else s_rel.get("followed_by")
+            if fb is True:
+                out["_sender_follows_owner"] = True
+            elif fb is False:
+                out["_sender_follows_owner"] = False
+            fw = s_obj.get("following") if s_obj.get("following") is not None else s_rel.get("following")
+            if fw is True:
+                out["_owner_follows_sender"] = True
+            elif fw is False:
+                out["_owner_follows_sender"] = False
+
     # Entities if present
     entities = inner.get("entities") or msg_data.get("entities") or content.get("entities") or {}
-    if isinstance(entities, dict) and entities:
-        out["entities"] = {
-            "hashtags": [{"tag": h.get("text")} for h in entities.get("hashtags", []) if isinstance(h, dict)],
-            "mentions": [
-                {"username": m.get("screen_name"), "id": str(m.get("id_str") or m.get("id") or "")}
-                for m in entities.get("user_mentions", [])
-                if isinstance(m, dict)
-            ],
-            "urls": [
-                {
-                    "url": u.get("url"),
-                    "expanded_url": u.get("expanded_url"),
-                    "display_url": u.get("display_url"),
-                }
-                for u in entities.get("urls", [])
-                if isinstance(u, dict)
-            ],
+    gql_urls: list[dict[str, Any]] = [
+        {
+            "url": u.get("url"),
+            "expanded_url": u.get("expanded_url"),
+            "display_url": u.get("display_url"),
         }
+        for u in (entities.get("urls") or [])
+        if isinstance(u, dict)
+    ] if isinstance(entities, dict) else []
+    seen_gql_tco = {u.get("url") for u in gql_urls if u.get("url")}
 
-    # Media attachments if present
+    def _add_gql_url(item: Any) -> None:
+        if not isinstance(item, dict):
+            return
+        u_short = item.get("url")
+        u_exp = item.get("expanded_url")
+        if u_short and u_exp and u_short not in seen_gql_tco:
+            seen_gql_tco.add(u_short)
+            gql_urls.append({
+                "url": u_short,
+                "expanded_url": u_exp,
+                "display_url": item.get("display_url"),
+            })
+
+    # Media & tweet attachments if present
     attach = inner.get("attachment") or msg_data.get("attachment") or content.get("attachment") or {}
     if isinstance(attach, dict):
-        media = attach.get("media") or attach.get("photo") or attach.get("video")
-        if isinstance(media, dict) and (media.get("id_str") or media.get("id")):
-            att_obj = _dm_attachment_obj(media)
-            m_v2 = _dm_media_v2_obj(att_obj)
-            out["attachments"] = {"media_keys": [str(m_v2.get("media_key") or media.get("id_str") or media.get("id"))]}
-            out["_xapi_attachments"] = [att_obj]
+        media_raw = (
+            attach.get("media")
+            or attach.get("photo")
+            or attach.get("video")
+            or attach.get("animated_gif")
+            or (entities.get("media") if isinstance(entities, dict) else None)
+        )
+        media_items = media_raw if isinstance(media_raw, list) else ([media_raw] if isinstance(media_raw, dict) else [])
+        att_objs = []
+        media_keys = []
+        for m_item in media_items:
+            if isinstance(m_item, dict):
+                _add_gql_url(m_item)
+                if m_item.get("id_str") or m_item.get("id"):
+                    att_obj = _dm_attachment_obj(m_item)
+                    m_v2 = _dm_media_v2_obj(att_obj)
+                    att_objs.append(att_obj)
+                    media_keys.append(str(m_v2.get("media_key") or m_item.get("id_str") or m_item.get("id")))
+        if att_objs:
+            out["attachments"] = {"media_keys": media_keys}
+            out["_xapi_attachments"] = att_objs
+        if isinstance(attach.get("tweet"), dict):
+            tw = attach["tweet"]
+            _add_gql_url(tw)
+            if isinstance(tw.get("status"), dict):
+                _add_gql_url(tw["status"])
+            tid_val = tw.get("id") or tw.get("id_str") or tw.get("rest_id") or (tw.get("status") or {}).get("id_str") or (tw.get("status") or {}).get("id")
+            if tid_val:
+                out["referenced_tweets"] = [{"type": "quoted", "id": str(tid_val)}]
+
+    if (isinstance(entities, dict) and entities) or gql_urls:
+        out["entities"] = {
+            "hashtags": [{"tag": h.get("text")} for h in (entities.get("hashtags") or []) if isinstance(h, dict)] if isinstance(entities, dict) else [],
+            "mentions": [
+                {"username": m.get("screen_name"), "id": str(m.get("id_str") or m.get("id") or "")}
+                for m in (entities.get("user_mentions") or [])
+                if isinstance(m, dict)
+            ] if isinstance(entities, dict) else [],
+            "urls": gql_urls,
+        }
 
     # Participants if present
     participants = inner.get("participants") or inner.get("participant_ids")
@@ -1070,7 +1202,8 @@ def _gql_dm_event_to_obj(
                 if isinstance(u_res, dict) and users_by_id is not None:
                     u_obj = _user_result_to_obj(u_res) if "rest_id" in u_res else _dm_user_obj(u_res)
                     if u_obj and u_obj.get("id"):
-                        users_by_id[str(u_obj["id"])] = u_obj
+                        uid_str = str(u_obj["id"])
+                        users_by_id[uid_str] = _merge_user_obj(users_by_id.get(uid_str), u_obj)
             elif p:
                 p_ids.append(str(p))
         if p_ids and event_type in ("ParticipantsJoin", "ParticipantsLeave"):
@@ -1114,7 +1247,8 @@ def _extract_gql_dm_conversations_and_events(
         else:
             u_obj = None
         if u_obj and u_obj.get("id"):
-            users_by_id[str(u_obj["id"])] = u_obj
+            uid_str = str(u_obj["id"])
+            users_by_id[uid_str] = _merge_user_obj(users_by_id.get(uid_str), u_obj)
 
     def _collect_conv(c: dict[str, Any]) -> Optional[str]:
         if not isinstance(c, dict):
@@ -1172,14 +1306,20 @@ def _extract_gql_dm_conversations_and_events(
                 if p_uid.isdigit() and p_uid not in part_ids:
                     part_ids.append(p_uid)
 
+        existing_conv = convs_by_id.get(cid) or {}
+        merged_parts = list(existing_conv.get("participant_ids") or [])
+        for p_uid in part_ids:
+            if p_uid not in merged_parts:
+                merged_parts.append(p_uid)
+        merged_ctype = "Group" if existing_conv.get("type") == "Group" or ctype == "Group" or len(merged_parts) > 2 else "OneToOne"
         convs_by_id[cid] = {
             "id": cid,
-            "type": ctype,
-            "participant_ids": part_ids,
-            "name": c.get("name") or c.get("title") or detail.get("name"),
-            "trusted": c.get("trusted"),
-            "muted": c.get("muted") if c.get("muted") is not None else detail.get("is_muted"),
-            "last_read_event_id": c.get("last_read_event_id"),
+            "type": merged_ctype,
+            "participant_ids": merged_parts,
+            "name": c.get("name") or c.get("title") or detail.get("name") or existing_conv.get("name"),
+            "trusted": c.get("trusted") if c.get("trusted") is not None else (detail.get("trusted") if detail.get("trusted") is not None else existing_conv.get("trusted")),
+            "muted": c.get("muted") if c.get("muted") is not None else (detail.get("is_muted") if detail.get("is_muted") is not None else existing_conv.get("muted")),
+            "last_read_event_id": c.get("last_read_event_id") or detail.get("last_read_event_id") or existing_conv.get("last_read_event_id"),
         }
         convs_by_id[cid] = {k: v for k, v in convs_by_id[cid].items() if v is not None}
 
@@ -1458,9 +1598,25 @@ def format_dm_events(
                 continue
             ev_input = {**body, "type": body.get("type") or kind}
             obj = _dm_event_to_obj(ev_input, users=raw_users)
-            if obj and obj.get("id") and obj["id"] not in seen_ids:
-                seen_ids.add(obj["id"])
-                events.append(obj)
+            if obj and obj.get("id"):
+                if obj["id"] not in seen_ids:
+                    seen_ids.add(obj["id"])
+                    events.append(obj)
+                else:
+                    for idx_ev, existing_ev in enumerate(events):
+                        if existing_ev.get("id") == obj["id"] and (
+                            existing_ev.get("_xchat_encrypted")
+                            or not existing_ev.get("text")
+                            or (obj.get("_xapi_attachments") and not existing_ev.get("_xapi_attachments"))
+                            or (obj.get("referenced_tweets") and not existing_ev.get("referenced_tweets"))
+                            or (obj.get("entities") and not existing_ev.get("entities"))
+                        ):
+                            merged_ev = {**existing_ev, **obj}
+                            if not obj.get("_xchat_encrypted"):
+                                merged_ev.pop("_xchat_encrypted", None)
+                                merged_ev.pop("encrypted_text", None)
+                            events[idx_ev] = merged_ev
+                            break
             # Extract quoted/shared tweet for includes.tweets if present in attachment
             msg_data = body.get("message_data") or (body.get("message_create") or {}).get("message_data") or {}
             tw_attach = (msg_data.get("attachment") or {}).get("tweet") or {}
@@ -1478,7 +1634,8 @@ def format_dm_events(
         if isinstance(u, dict):
             uo = _dm_user_obj(u)
             if uo and uo.get("id"):
-                users_map[str(uo["id"])] = uo
+                uid_str = str(uo["id"])
+                users_map[uid_str] = _merge_user_obj(users_map.get(uid_str), uo)
 
     for cid, c in raw_convs.items():
         if not isinstance(c, dict):
@@ -1524,9 +1681,9 @@ def format_dm_events(
         if allowed_types:
             events = [e for e in events if e.get("event_type") in allowed_types]
 
-    # Sort events newest-first by id (Snowflake) or created_at
+    # Sort events newest-first by created_at (ISO 8601 UTC) then Snowflake id
     events.sort(
-        key=lambda x: (int(x["id"]) if str(x.get("id", "")).isdigit() else 0, x.get("created_at") or ""),
+        key=lambda x: (str(x.get("created_at") or ""), int(x["id"]) if str(x.get("id", "")).isdigit() else 0),
         reverse=True,
     )
 
@@ -1585,6 +1742,14 @@ def format_dm_conversations(payload: dict[str, Any], max_results: Optional[int] 
         if cid and cid in latest_by_conv:
             c_copy["last_message_event"] = latest_by_conv[cid]
         conv_list.append(c_copy)
+
+    # Sort conversations newest-first by created_at (ISO 8601 UTC) then Snowflake id
+    def _conv_sort_key(c_obj: dict[str, Any]) -> tuple[str, int]:
+        lme = c_obj.get("last_message_event") or {}
+        eid = str(lme.get("id") or c_obj.get("last_read_event_id") or "")
+        return (str(lme.get("created_at") or ""), int(eid) if eid.isdigit() else 0)
+
+    conv_list.sort(key=_conv_sort_key, reverse=True)
 
     if max_results and max_results > 0 and len(conv_list) > max_results:
         conv_list = conv_list[:max_results]
@@ -1662,4 +1827,3 @@ def format_dm_send_result(payload: dict[str, Any]) -> dict[str, Any]:
             if obj and obj.get("id"):
                 return {"data": {"dm_conversation_id": obj.get("dm_conversation_id"), "dm_event_id": obj["id"]}}
     return {"data": payload}
-

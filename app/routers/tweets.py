@@ -74,6 +74,7 @@ router = APIRouter(tags=["Tweets"])
 class CreateTweetBody(BaseModel):
     text: str = Field(..., max_length=4000)
     reply_to: Optional[str] = Field(None, description="in_reply_to_tweet_id")
+    reply_to_tweet_id: Optional[str] = Field(None, description="alias for reply_to")
     quote_tweet_id: Optional[str] = None
     media_ids: Optional[list[str]] = None
 
@@ -139,7 +140,9 @@ async def v2_tweets_bulk(
         if d:
             data.append(d)
         for k, lst in (formatted.get("includes") or {}).items():
-            target = {"users": users, "media": media, "tweets": refs}[k]
+            target = {"users": users, "media": media, "tweets": refs}.get(k)
+            if target is None:
+                continue
             for item in lst:
                 key = item.get("id") or item.get("media_key")
                 if key and key not in target:
@@ -175,9 +178,10 @@ async def v2_create_tweet(
         variables["media"]["media_entities"] = [
             {"media_id": mid, "tagged_users": []} for mid in body.media_ids
         ]
-    if body.reply_to:
+    reply_target = body.reply_to or body.reply_to_tweet_id
+    if reply_target:
         variables["reply"] = {
-            "in_reply_to_tweet_id": body.reply_to,
+            "in_reply_to_tweet_id": reply_target,
             "exclude_reply_user_ids": [],
         }
     if body.quote_tweet_id:
@@ -225,6 +229,7 @@ async def v2_tweets_search_recent(
         fmt = format_tweet_collection if type != "People" else (lambda g: format_tweet_collection(g, item="user"))
         return finalize(result, fmt, raw=bool(raw))
     # fallback Playwright bila GraphQL gagal (rate limit / challenge)
+    fmt = format_tweet_collection if type != "People" else (lambda g: format_tweet_collection(g, item="user"))
     try:
         pw = await search_via_browser(auth_token=tok, q=query, search_type=type)
         result = {
@@ -234,12 +239,8 @@ async def v2_tweets_search_recent(
             "data": pw.get("data"),
             "error": pw.get("error"),
         }
-    except httpx.HTTPError as e:
-        return JSONResponse(
-            status_code=502,
-            content=format_error("Upstream Error", str(e), "upstream_error", 502),
-        )
-    fmt = format_tweet_collection if type != "People" else (lambda g: format_tweet_collection(g, item="user"))
+    except Exception:
+        return finalize(gql, fmt, raw=bool(raw))
     return finalize(result, fmt, raw=bool(raw))
 
 

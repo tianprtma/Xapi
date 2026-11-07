@@ -175,7 +175,15 @@ async def v2_users_by_usernames(
     data, errors = [], []
     for n, r in zip(name_list, results):
         if isinstance(r, Exception) or (isinstance(r, dict) and r.get("status") != "ok"):
-            errors.append({"username": n, "title": "Lookup Failed", "type": "not_found"})
+            http_st = r.get("http_status", 502) if isinstance(r, dict) else 502
+            err_type = "rate_limit_exceeded" if http_st == 429 else ("not_found" if http_st == 404 else "upstream_error")
+            errors.append({
+                "username": n,
+                "title": "Rate Limit Exceeded" if http_st == 429 else "Lookup Failed",
+                "detail": str(r.get("error") if isinstance(r, dict) else r)[:200],
+                "type": err_type,
+                "status": http_st,
+            })
             continue
         f = format_user(r.get("data") or {})
         if "errors" in f:
@@ -311,14 +319,17 @@ async def v2_users_search(
             "error": None,
         }
         return finalize(result, lambda g: format_tweet_collection(g, item="user"), raw=bool(raw))
-    pw = await search_via_browser(auth_token=tok, q=query, search_type="People")
-    result = {
-        "engine": "playwright",
-        "status": pw["status"],
-        "http_status": pw.get("http_status", 200),
-        "data": pw.get("data"),
-        "error": pw.get("error"),
-    }
+    try:
+        pw = await search_via_browser(auth_token=tok, q=query, search_type="People")
+        result = {
+            "engine": "playwright",
+            "status": pw["status"],
+            "http_status": pw.get("http_status", 200),
+            "data": pw.get("data"),
+            "error": pw.get("error"),
+        }
+    except Exception:
+        return finalize(gql, lambda g: format_tweet_collection(g, item="user"), raw=bool(raw))
     return finalize(result, lambda g: format_tweet_collection(g, item="user"), raw=bool(raw))
 
 
@@ -546,22 +557,27 @@ async def v2_user_followers(
     result = await graphql_call("Followers", variables, tok)
     if result["status"] == "ok":
         return finalize(result, lambda g: format_tweet_collection(g, item="user"), raw=bool(raw))
-    handle = await resolve_screen_name(user_id, tok)
-    if not handle:
-        return JSONResponse(status_code=404, content=format_error("Not Found", "user_id not found", "not_found", 404))
-    pw = await fetch_via_browser(
-        auth_token=tok,
-        navigate_url=f"https://x.com/{handle}/followers",
-        match_path="/Followers",
-    )
-    result = {
-        "status": pw["status"],
-        "http_status": pw.get("http_status", 200),
-        "operation": "Followers",
-        "engine": "playwright",
-        "data": pw.get("data"),
-        "error": pw.get("error"),
-    }
+    try:
+        handle = await resolve_screen_name(user_id, tok)
+        if not handle:
+            if result.get("http_status") and result.get("http_status") != 200:
+                return finalize(result, lambda g: format_tweet_collection(g, item="user"), raw=bool(raw))
+            return JSONResponse(status_code=404, content=format_error("Not Found", "user_id not found", "not_found", 404))
+        pw = await fetch_via_browser(
+            auth_token=tok,
+            navigate_url=f"https://x.com/{handle}/followers",
+            match_path="/Followers",
+        )
+        result = {
+            "status": pw["status"],
+            "http_status": pw.get("http_status", 200),
+            "operation": "Followers",
+            "engine": "playwright",
+            "data": pw.get("data"),
+            "error": pw.get("error"),
+        }
+    except Exception:
+        pass
     return finalize(result, lambda g: format_tweet_collection(g, item="user"), raw=bool(raw))
 
 
@@ -804,22 +820,27 @@ async def v2_user_tweets_replies(
     result = await graphql_call("UserTweetsAndReplies", variables, tok)
     if result["status"] == "ok":
         return finalize(result, format_tweet_collection, raw=bool(raw))
-    handle = await resolve_screen_name(user_id, tok)
-    if not handle:
-        return JSONResponse(status_code=404, content=format_error("Not Found", "user_id not found", "not_found", 404))
-    pw = await fetch_via_browser(
-        auth_token=tok,
-        navigate_url=f"https://x.com/{handle}/with_replies",
-        match_path=["/UserTweetsAndReplies", "/UserRepliesTimeline"],
-        timeout=30.0,
-    )
-    result = {
-        "status": pw["status"],
-        "http_status": pw.get("http_status", 200),
-        "operation": "UserTweetsAndReplies",
-        "engine": "playwright",
-        "data": pw.get("data"),
-        "error": pw.get("error"),
-    }
+    try:
+        handle = await resolve_screen_name(user_id, tok)
+        if not handle:
+            if result.get("http_status") and result.get("http_status") != 200:
+                return finalize(result, format_tweet_collection, raw=bool(raw))
+            return JSONResponse(status_code=404, content=format_error("Not Found", "user_id not found", "not_found", 404))
+        pw = await fetch_via_browser(
+            auth_token=tok,
+            navigate_url=f"https://x.com/{handle}/with_replies",
+            match_path=["/UserTweetsAndReplies", "/UserRepliesTimeline"],
+            timeout=30.0,
+        )
+        result = {
+            "status": pw["status"],
+            "http_status": pw.get("http_status", 200),
+            "operation": "UserTweetsAndReplies",
+            "engine": "playwright",
+            "data": pw.get("data"),
+            "error": pw.get("error"),
+        }
+    except Exception:
+        pass
     return finalize(result, format_tweet_collection, raw=bool(raw))
 

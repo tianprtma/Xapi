@@ -1,0 +1,32 @@
+# /etc/systemd/system/xapi.service
+# Salin ke VPS: sudo cp deploy/xapi.service /etc/systemd/system/
+# Sesuaikan User & path bila lokasi repo bukan /opt/xapi.
+
+[Unit]
+Description=Xapi - X (Twitter) Cookie API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=xapi
+Group=xapi
+WorkingDirectory=/opt/xapi
+Environment=HOME=/opt/xapi
+# Wajib 1 untuk ambil DM XChat E2EE (env systemd menang atas .env).
+# Hapus baris ini bila ingin mengikuti nilai .env.
+Environment=PLAYWRIGHT_ENABLED=1
+# .env dimuat otomatis oleh main.py (setdefault: env systemd menang).
+# EnvironmentFile=-/opt/xapi/.env
+ExecStart=/opt/xapi/.venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 8000 --no-access-log
+# uvicorn access log dimatikan: query string penuh membocorkan
+# ?dm_pin=/?auth_token= (observability cukup dari AccessLogMiddleware JSON).
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=25
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

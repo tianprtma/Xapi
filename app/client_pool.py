@@ -29,20 +29,35 @@ from .config import (
 
 
 class _Entry:
-    __slots__ = ("session", "last_used", "lock")
+    __slots__ = ("session", "last_used", "lock", "in_use", "dropped")
 
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
         self.last_used: float = time.time()
         self.lock = asyncio.Lock()
+        # Jumlah coroutine yang memegang session ini via pooled_client().
+        # Di-increment DI DALAM acquire() (di bawah pool lock) supaya eviction
+        # / TTL-sweep tidak pernah menutup session di antara acquire() dan
+        # request pertama. Di-decrement di release().
+        self.in_use: int = 0
+        # True kalau entry dihapus dari pool saat masih dipakai
+        # (invalidate / eviction race) — holder terakhir yang menutup.
+        self.dropped: bool = False
+
+    async def close(self) -> None:
+        try:
+            await self.session.close()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 class ClientPool:
     """LRU pool of AsyncSession keyed by auth_token.
 
     Sessions are reused across requests to skip cold TLS handshake. When the
-    pool exceeds `CLIENT_POOL_MAX`, the least-recently-used entry is evicted
-    and its session closed.
+    pool exceeds `CLIENT_POOL_MAX`, the least-recently-used IDLE entry is
+    evicted and its session closed — entries yang masih in-use tidak pernah
+    ditutup (pool boleh melebihi max sementara).
     """
 
     _instance: "ClientPool | None" = None
@@ -57,68 +72,88 @@ class ClientPool:
             cls._instance = cls()
         return cls._instance
 
-    async def acquire(self, auth_token: str) -> tuple[AsyncSession, asyncio.Lock]:
+    async def acquire(self, auth_token: str) -> tuple[AsyncSession, _Entry]:
         """Get or create a pooled session.
 
         Returns:
-            (session, per_token_lock) — caller must hold the lock for the
-            duration of the request to avoid concurrent use of one session.
+            (session, entry) — caller harus memegang `entry.lock` selama
+            request (hindari race cookie jar) dan memanggil
+            `release(entry)` setelah selesai. `entry.in_use` sudah
+            di-increment di sini di bawah pool lock.
         """
         key = token_key(auth_token)
         async with self._lock:
             now = time.time()
-            # Expire stale entries first
-            stale = [k for k, e in self._cache.items() if (now - e.last_used) > CLIENT_POOL_TTL]
+            # Expire stale entries first (skip entries currently in use)
+            stale = [k for k, e in self._cache.items() if e.in_use == 0 and (now - e.last_used) > CLIENT_POOL_TTL]
             for k in stale:
                 old = self._cache.pop(k)
-                try:
-                    await old.session.close()
-                except Exception:  # noqa: BLE001
-                    pass
+                await old.close()
 
             entry = self._cache.get(key)
             if entry:
                 self._cache.move_to_end(key)
                 entry.last_used = now
-                return entry.session, entry.lock
+            else:
+                # Build new session with deterministic browser profile (TLS + UA + sec-ch-ua) + proxy
+                prof = profile_for_token(auth_token)
+                headers = headers_for_token(auth_token)
+                proxy = proxy_for_token(auth_token)
+                kwargs: dict[str, Any] = dict(
+                    cookies={"auth_token": auth_token, "ct0": gen_ct0()},
+                    headers=headers,
+                    timeout=20.0,
+                    impersonate=prof["impersonate"],
+                    allow_redirects=True,
+                )
+                if proxy:
+                    kwargs["proxies"] = {"http": proxy, "https": proxy}
+                entry = _Entry(AsyncSession(**kwargs))
+                self._cache[key] = entry
 
-            # Build new session with deterministic browser profile (TLS + UA + sec-ch-ua) + proxy
-            prof = profile_for_token(auth_token)
-            headers = headers_for_token(auth_token)
-            proxy = proxy_for_token(auth_token)
-            kwargs: dict[str, Any] = dict(
-                cookies={"auth_token": auth_token, "ct0": gen_ct0()},
-                headers=headers,
-                timeout=20.0,
-                impersonate=prof["impersonate"],
-                allow_redirects=True,
-            )
-            if proxy:
-                kwargs["proxies"] = {"http": proxy, "https": proxy}
-            session = AsyncSession(**kwargs)
-            entry = _Entry(session)
-            self._cache[key] = entry
+            # Tandai in-use SEBELUM pool lock dilepas — eviction/TTL-sweep
+            # berjalan di bawah lock yang sama, jadi tidak ada window di mana
+            # session bisa ditutup di antara acquire() dan request pertama.
+            entry.in_use += 1
 
-            # Evict LRU if over capacity
+            # Evict LRU if over capacity (skip entries currently in use)
             while len(self._cache) > CLIENT_POOL_MAX:
-                lru_key, lru_entry = self._cache.popitem(last=False)
-                try:
-                    await lru_entry.session.close()
-                except Exception:  # noqa: BLE001
-                    pass
+                # Find the least-recently-used entry that is NOT in use
+                evict_key = None
+                for k, e in self._cache.items():
+                    if e.in_use == 0:
+                        evict_key = k
+                        break
+                if evict_key is None:
+                    break  # all entries are in use, cannot evict
+                lru_entry = self._cache.pop(evict_key)
+                await lru_entry.close()
 
-            return session, entry.lock
+            return entry.session, entry
+
+    async def release(self, entry: _Entry) -> None:
+        """Lepas entry hasil acquire(); tutup session kalau entry di-drop
+        dari pool saat masih dipakai (invalidate) dan ini holder terakhir."""
+        async with self._lock:
+            entry.in_use = max(0, entry.in_use - 1)
+            should_close = entry.dropped and entry.in_use == 0
+        if should_close:
+            await entry.close()
 
     async def invalidate(self, auth_token: str) -> None:
-        """Drop session (e.g., on 401/403) so next request gets fresh TLS."""
+        """Drop session (e.g., on 401/403) so next request gets fresh TLS.
+
+        If the session is currently in use, it is removed from the pool (so no
+        new caller can acquire it) and close() is deferred to release().
+        """
         key = token_key(auth_token)
         async with self._lock:
             entry = self._cache.pop(key, None)
+            if entry and entry.in_use > 0:
+                entry.dropped = True  # holder terakhir menutup via release()
+                entry = None
         if entry:
-            try:
-                await entry.session.close()
-            except Exception:  # noqa: BLE001
-                pass
+            await entry.close()
 
     async def close_all(self) -> None:
         """Shutdown hook."""
@@ -151,9 +186,15 @@ async def pooled_client(auth_token: str) -> AsyncIterator[AsyncSession]:
     Lock prevents two concurrent requests on the same token from racing on
     the shared cookie jar. (Same-token concurrency is rare in practice — one
     user = one request flow — so contention is low.)
+
+    The in_use counter prevents eviction/TTL-sweep from closing a session
+    that is still mid-flight.
     """
     pool = ClientPool.get()
-    session, lock = await pool.acquire(auth_token)
-    async with lock:
-        yield session
+    session, entry = await pool.acquire(auth_token)
+    try:
+        async with entry.lock:
+            yield session
+    finally:
+        await pool.release(entry)
 

@@ -125,6 +125,51 @@ print(post.json())
 Video/GIF: same endpoint with `media_type=video/mp4` or `image/gif`; the server performs chunked
 upload and STATUS polling. Allow up to a few minutes.
 
+## XChat E2EE DMs (with PIN)
+
+Encrypted XChat DMs need the account's XChat PIN (`dm_pin`) and
+`PLAYWRIGHT_ENABLED=1` on the server. Xapi drives headless Chromium through
+x.com/i/chat; the PIN unlock persists in a per-account browser profile
+(`.xchat_profiles/`), but X may re-serve the gate anytime — always pass
+`dm_pin` when available.
+
+```bash
+B="$XAPI_BASE_URL"; H="Authorization: Bearer $XAPI_TOKEN"; P="X-DM-Pin: 1234"
+
+# PRODUKSI: pakai header X-DM-Pin — ?dm_pin= di query string bocor di access log.
+# Inbox XChat — decrypted previews, unread flags, ages
+curl -s -H "$H" -H "$P" "$B/2/chat/conversations?max_results=20"
+
+# Full decrypted conversation (id from the inbox above)
+curl -s -H "$H" -H "$P" \
+  "$B/2/dm_conversations/1394249284736864258-1831953836929638400/dm_events"
+```
+
+Media:
+```bash
+# Plain DM media — proxy to ton.x.com (stateless, full-res)
+curl -s -H "$H" \
+  "$B/2/dm_conversations/media/{dm_id}/{media_id}/{resource_id}" -o media.jpg
+
+# XChat E2EE media — from the server's in-memory cache (TTL 15 min, images
+# only); populated after the server itself ran the conversation flow above
+# for that account.
+curl -s -H "$H" \
+  "$B/2/dm_conversations/media/xchat/{media_id}/img_{media_id}.jpg" -o xchat.jpg
+```
+
+**Standalone script** (no server needed): `python3 fetch_dm_pin.py` at the repo
+root — login + inbox REST/GraphQL + browser E2EE + media-to-disk:
+
+```bash
+PROXY_LIST="" python3 fetch_dm_pin.py --pin 1234 --max 20
+PROXY_LIST="" python3 fetch_dm_pin.py --pin 1234 --save-media ./media --scan-limit 19
+PROXY_LIST="" python3 fetch_dm_pin.py --pin 1234 \
+  --conversation 1394249284736864258-1831953836929638400 --save-media ./media
+```
+
+Never log the PIN or the token.
+
 ## JavaScript (fetch)
 
 ```javascript

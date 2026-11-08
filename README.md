@@ -5,6 +5,7 @@ Mirror endpoint X API v2 (`docs.x.com/x-api`) lewat cookie `auth_token`. Backend
 - **~120 routes** mirror v2 (read + write + DM/XChat + lists + media + community notes + trends)
 - **Anti-Detect Engine** bawaan: profil browser deterministik per `auth_token` (`curl_cffi` Chrome 124/131/136 TLS JA3/JA4 + HTTP/2 frame + sinkronisasi `User-Agent`, `Sec-CH-UA`, `Sec-Fetch-*`, `x-client-transaction-id` HMAC, dan sticky proxy)
 - **Full Direct Messages & XChat**: GraphQL DM/XChat (`GetInitialXChatPageQuery`, `GetConversationPageQuery`, `DmAllSearchSlice`, dll.) + dekoder binary Apache Thrift XChat + REST 1.1 merge + proxy download media DM (`ton.x.com`)
+- **XChat E2EE via PIN** (`?dm_pin=`): buka `x.com/i/chat` headless, unlock PIN, pesan terdekripsi + gambar media E2EE tersimpan/sajikan — dengan **profil browser persist per akun** (unlock bertahan antar run)
 - **Docs UI** built-in di `/` (interactive reference + try-it console)
 - **OpenAPI/Swagger** di `/docs`
 - **Agent Skill** di [`SKILL.md`](SKILL.md) — dipakai agent (Claude Code, opencode, dll) untuk memanggil API ini; katalog endpoint lengkap di [`references/`](references/)
@@ -12,14 +13,16 @@ Mirror endpoint X API v2 (`docs.x.com/x-api`) lewat cookie `auth_token`. Backend
 ## Setup
 
 ```bash
-# 1. virtualenv (Python 3.11+)
+# 1. virtualenv (Python 3.9+ — pin requirements sudah py3.9-compatible;
+#    di py>=3.10, versi lebih baru otomatis ter-install)
 uv venv --python 3.11
 source .venv/bin/activate
 
 # 2. install deps
 uv pip install -r requirements.txt
 
-# 3. install Chromium untuk Playwright (sekali)
+# 3. install Chromium untuk Playwright (sekali) — wajib untuk XChat E2EE
+#    dan endpoint CF-gated
 playwright install chromium
 ```
 
@@ -53,8 +56,10 @@ export ENABLE_RAW=0                  # disable ?raw=1 (raw payload bocor cookie)
 export ADMIN_TOKEN="$(openssl rand -hex 32)"
 export ALLOWED_ORIGINS="https://yourdomain.com"
 
-# 3. Run (workers=1 — caches per-worker)
-uvicorn main:app --host 0.0.0.0 --port 8000
+# 3. Run (workers=1 — caches per-worker; --no-access-log: uvicorn access log
+#    mencantumkan query string penuh = bocor ?dm_pin=/?auth_token=; observability
+#    cukup dari JSON access log bawaan yang path-only)
+uvicorn main:app --host 0.0.0.0 --port 8000 --no-access-log
 ```
 
 ## Auth
@@ -119,10 +124,10 @@ Semua endpoint butuh `auth_token` cookie. Token di-pass via:
 | GET | `/2/dm_events` | GraphQL + DM | GetInitialXChatPageQuery / GetInboxPageRequestQuery + fallback |
 | GET | `/2/dm_events/search?query=` | GraphQL | DmAllSearchSlice / DmGroupSearchSlice / DmPeopleSearchSlice |
 | GET | `/2/dm_events/{event_id}` | GraphQL + DM | GetMessageEventsPageQuery / GetInitialXChatPageQuery |
-| GET | `/2/dm_conversations/{conversation_id}/dm_events` | GraphQL + DM | GetConversationPageQuery / GetMessageEventsPageQuery |
-| GET | `/2/dm_conversations/with/{participant_id}/dm_events` | GraphQL + DM | 1-on-1 DM events via GraphQL / REST fallback |
-| GET | `/2/dm_conversations/media/{dm_id}/{media_id}/{resource_id}` | DM Media | Proxy download gambar/video DM (`ton.x.com`) |
-| GET | `/2/chat/conversations` | GraphQL | XChat inbox conversations |
+| GET | `/2/dm_conversations/{conversation_id}/dm_events` | GraphQL + DM | GetConversationPageQuery / GetMessageEventsPageQuery; `?dm_pin=` dekripsi E2EE |
+| GET | `/2/dm_conversations/with/{participant_id}/dm_events` | GraphQL + DM | 1-on-1 DM events via GraphQL / REST fallback; `?dm_pin=` dekripsi E2EE |
+| GET | `/2/dm_conversations/media/{dm_id}/{media_id}/{resource_id}` | DM Media | Proxy media DM: `dm_id` angka = `ton.x.com`; `dm_id=xchat` = cache E2EE in-memory |
+| GET | `/2/chat/conversations` | GraphQL | XChat inbox conversations; `?dm_pin=` dekripsi preview E2EE |
 | GET | `/2/chat/conversations/{conversation_id}/messages` | GraphQL | XChat conversation messages (alias `/events`) |
 | GET | `/2/chat/requests` | GraphQL + DM | GetMessageRequestsPageQuery |
 | GET | `/2/chat/permissions` | GraphQL | DmAvPermissionsQuery |
@@ -255,6 +260,68 @@ curl -H "Authorization: Bearer $TOKEN" \
   -o dm_photo.jpg
 ```
 
+## XChat E2EE — ambil DM terenkripsi dengan PIN
+
+DM XChat (`x.com/i/chat`) terenkripsi end-to-end. Xapi mengeksekusi alur resmi
+X di headless Chromium (`PLAYWRIGHT_ENABLED=1` wajib): buka `/i/chat` → unlock
+PIN → dekripsi dilakukan JS resmi X → plaintext + gambar dibaca dari DOM.
+
+> **Keamanan PIN:** `?dm_pin=` di query string **bocor di access log uvicorn &
+> reverse proxy** (terbukti saat audit 2026-11-08). Untuk produksi selalu pakai
+> **header `X-DM-Pin: <pin>`** — didukung semua endpoint XChat. `?dm_pin=` hanya
+> untuk dev/testing. Server (`python3 main.py`) sudah menjalankan uvicorn
+> tanpa access log; bila menjalankan via CLI tambahkan `--no-access-log`.
+
+```bash
+# Inbox XChat (preview terdekripsi, unread, age) — header X-DM-Pin (produksi):
+curl -H "Authorization: Bearer $TOKEN" -H "X-DM-Pin: 1234" \
+  "http://127.0.0.1:8000/2/chat/conversations?max_results=20"
+
+# Isi percakapan terdekripsi (pesans, attachments, status links)
+curl -H "Authorization: Bearer $TOKEN" -H "X-DM-Pin: 1234" \
+  "http://127.0.0.1:8000/2/dm_conversations/1394249284736864258-1831953836929638400/dm_events"
+
+# Media DM biasa (proxy ton.x.com — full-res)
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://127.0.0.1:8000/2/dm_conversations/media/2061680909850677279/2061680891307622401/aporq_o1.jpg" \
+  -o dm_media.jpg
+
+# Media XChat E2EE (dari cache proses server — jalankan flow conversation
+# dengan dm_pin dulu; cache in-memory TTL 15 menit, gambar saja)
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://127.0.0.1:8000/2/dm_conversations/media/xchat/{media_id}/img_{media_id}.jpg" \
+  -o xchat_media.jpg
+```
+
+### Script standalone `fetch_dm_pin.py`
+
+Tanpa perlu server — login + inbox REST/GraphQL + alur browser E2EE +
+unduh media dalam satu proses (media langsung ke disk, tanpa cache endpoint):
+
+```bash
+# inbox E2EE terdekripsi
+PROXY_LIST="" python3 fetch_dm_pin.py --pin 1234 --max 20
+
+# scan media dari 19 percakapan pertama → simpan file ke ./media
+PROXY_LIST="" python3 fetch_dm_pin.py --pin 1234 --save-media ./media --scan-limit 19
+
+# 1 percakapan + simpan medianya
+PROXY_LIST="" python3 fetch_dm_pin.py --pin 1234 \
+  --conversation 1394249284736864258-1831953836929638400 --save-media ./media
+
+# tanpa pin — pakai unlock tersimpan di profil persist (kalau masih valid)
+PROXY_LIST="" python3 fetch_dm_pin.py --browser --save-media ./media
+```
+
+Catatan:
+- **Profil persist per akun** (`XCHAT_PROFILE_DIR`, default `.xchat_profiles/`,
+  di-gitignore): menyimpan cookie sesi + kunci E2EE → PIN tidak perlu diketik
+  ulang setiap run. Namun gate PIN **dikontrol server X dan bisa muncul
+  kembali sewaktu-waktu** — script menangani keduanya; siapkan `--pin`.
+- Profil terkunci jika dipakai **dua proses bersamaan** (server + script) —
+  jalankan salah satu dulu, atau set `XCHAT_PROFILE_DIR` berbeda.
+- Hanya **gambar** yang terekstrak dari XChat (video belum didukung).
+
 ### Write contoh
 
 ```bash
@@ -345,12 +412,15 @@ bash docs-ui/build.sh                 # esbuild → docs-ui/dist/bundle.js (~285
 | `CLIENT_POOL_MAX` | `50` | max pooled HTTP sessions |
 | `CLIENT_POOL_TTL` | `600` | seconds (10 min) |
 | `PLAYWRIGHT_MAX_CONCURRENT` | `4` | concurrent headless Chrome pages |
+| `XCHAT_PROFILE_DIR` | `.xchat_profiles` | induk direktori profil persist XChat (cookie sesi + kunci E2EE di disk — lindungi!) |
+| `XCHAT_PERSISTENT_MAX` | `3` | max profil/context persist aktif (LRU; evict aman — unlock state di disk) |
 | `WEB_CONCURRENCY` | `1` | uvicorn workers. **Cache per-worker**, recommended `1` |
 
 ## Performance
 
 - **Caches:** in-memory bounded LRU. SessionStore (5000 entries, 5 min TTL), ResponseCache (2000 entries, configurable TTL). Hit rate via `/admin/stats`.
 - **Playwright:** browser di pre-warm di startup (~2-3s saved on first request). Concurrency cap `PLAYWRIGHT_MAX_CONCURRENT` (default 4) — di luar limit, antri.
+- **XChat persistent profile:** satu browser process per akun (cap `XCHAT_PERSISTENT_MAX`, LRU idle di-evict). Evict/restart aman — unlock state di disk. Profil terkunci bila dua proses membuka akun yang sama bersamaan (WORKER=1).
 - **Static asset:** `bundle.js` dapat 1-year immutable cache; `index.html` no-cache; lainnya 1-hour public.
 - **Multi-worker:** caches tidak shared antar worker. Untuk scale-out, deploy multiple instances di belakang reverse proxy.
 

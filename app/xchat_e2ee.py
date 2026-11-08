@@ -21,7 +21,7 @@ import time
 from typing import Any, Optional
 
 import playwright_search
-from playwright_search import ContextPool, PlaywrightPool
+from playwright_search import XChatContextPool, PlaywrightPool
 
 log = logging.getLogger(__name__)
 
@@ -127,7 +127,7 @@ async def _ensure_pin_unlocked(page: Any, dm_pin: Optional[str]) -> bool:
                 }
                 return false;
             }""",
-            {"pinSel": PIN_INPUT_SELECTOR, "dmSel": DM_CONTAINER_SELECTOR},
+            arg={"pinSel": PIN_INPUT_SELECTOR, "dmSel": DM_CONTAINER_SELECTOR},
             timeout=12000,
         )
         state_val = await state.json_value()
@@ -135,7 +135,33 @@ async def _ensure_pin_unlocked(page: Any, dm_pin: Optional[str]) -> bool:
         state_val = "unknown"
 
     if state_val == "ready" and "/pin/" not in page.url:
-        return True
+        # XChat merender shell dm-container sementara sebelum redirect ke
+        # gate PIN — 'ready' prematur membuat pin tidak pernah diketik dan
+        # inbox kosong. Konfirmasi stabil: kalau dalam settle window gate
+        # PIN muncul (URL /pin/ atau 4 input), batal 'ready'.
+        try:
+            await asyncio.sleep(2.5)
+            pin_check = await page.evaluate(
+                """(pinSel) => {
+                    const host = document.querySelector('[data-testid="xchatEmbedRoute"]');
+                    const root = host?.shadowRoot || document;
+                    return {
+                        gate: window.location.href.includes('/pin/')
+                              || root.querySelectorAll(pinSel).length >= 4,
+                        links: root.querySelectorAll('a[href*="/i/chat/"]').length,
+                    };
+                }""",
+                PIN_INPUT_SELECTOR,
+            )
+            if pin_check.get("gate"):
+                log.info("XChat shell transient terdeteksi — lanjut unlock PIN")
+                state_val = "pin"
+            elif not pin_check.get("links"):
+                state_val = "pin"  # tidak ada isi → kemungkinan besar gate menyusul
+        except Exception:  # noqa: BLE001
+            pass
+        if state_val == "ready" and "/pin/" not in page.url:
+            return True
 
     # Check if PIN entry is needed
     needs_pin = "/pin/" in page.url or state_val == "pin"
@@ -166,7 +192,7 @@ async def _ensure_pin_unlocked(page: Any, dm_pin: Optional[str]) -> bool:
                 const root = host?.shadowRoot || document;
                 return root.querySelectorAll(pinSel).length >= 4;
             }""",
-            PIN_INPUT_SELECTOR,
+            arg=PIN_INPUT_SELECTOR,
             timeout=10000,
         )
     except Exception:
@@ -193,16 +219,18 @@ async def _ensure_pin_unlocked(page: Any, dm_pin: Optional[str]) -> bool:
     await asyncio.sleep(0.5)
     await page.keyboard.press("Enter")
 
-    # Wait for PIN page to clear and DM container to appear
+    # Wait for PIN page to clear and DM container to appear. XChat recovery
+    # unlock keeps the URL on /pin/recovery while the inbox renders — judge
+    # success by DM-container presence, not by the URL alone.
     try:
         await page.wait_for_function(
             """(dmSel) => {
-                if (window.location.href.includes('/pin/')) return false;
                 const host = document.querySelector('[data-testid="xchatEmbedRoute"]');
                 const root = host?.shadowRoot || document;
-                return Boolean(root.querySelector(dmSel) || document.querySelector(dmSel));
+                const dmReady = Boolean(root.querySelector(dmSel) || document.querySelector(dmSel));
+                return dmReady;
             }""",
-            DM_CONTAINER_SELECTOR,
+            arg=DM_CONTAINER_SELECTOR,
             timeout=20000,
         )
         await asyncio.sleep(1.5)
@@ -224,9 +252,11 @@ async def unlock_and_read_xchat_inbox(
     """
     playwright_search.PLAYWRIGHT_ENABLED = True
     async with PlaywrightPool.get().semaphore:
-        context = await ContextPool.get().acquire(auth_token)
-        page = await context.new_page()
+        context = None
+        page = None
         try:
+            context = await XChatContextPool.get().acquire(auth_token)
+            page = await context.new_page()
             await page.goto("https://x.com/i/chat", wait_until="domcontentloaded", timeout=30000)
             unlocked = await _ensure_pin_unlocked(page, dm_pin)
             if not unlocked:
@@ -243,6 +273,27 @@ async def unlock_and_read_xchat_inbox(
                     timeout=10000,
                 )
             except Exception:
+                await asyncio.sleep(2.0)
+
+            # Baris inbox ter-render bertahap: nama muncul dulu, teks pesan +
+            # aria-description menyusul async. Tanpa tunggu ini, batch scrape
+            # mengambil baris yang belum berisi pesan (preview = nama saja).
+            try:
+                await page.wait_for_function(
+                    """() => {
+                        const host = document.querySelector('[data-testid="xchatEmbedRoute"]');
+                        const root = host?.shadowRoot || document;
+                        const items = [...root.querySelectorAll('[data-testid^="dm-conversation-item-"]')];
+                        if (items.length === 0) return false;
+                        return items.every(it => {
+                            const aria = it.getAttribute('aria-description')
+                                || it.querySelector('[aria-description]')?.getAttribute('aria-description') || '';
+                            return aria.length > 0;
+                        });
+                    }""",
+                    timeout=8000,
+                )
+            except Exception:  # noqa: BLE001
                 await asyncio.sleep(2.0)
 
             collected: dict[str, dict[str, Any]] = {}
@@ -324,12 +375,34 @@ async def unlock_and_read_xchat_inbox(
                             }
                             const textEls = [...node.querySelectorAll('[dir="auto"]')].map(el => (el.textContent || '').trim()).filter(Boolean);
                             const msgCandidates = textEls.filter(t => !t.startsWith('@') && !/^(\\d+\\s*(?:s|m|h|d|w|y|detik|menit|jam|hari)|·)$/i.test(t));
-                            const previewText = msgCandidates.length > 0
-                                ? msgCandidates[msgCandidates.length - 1]
-                                : (node.textContent || '').trim();
                             const ariaDesc = node.getAttribute('aria-description')
                                 || node.querySelector('[aria-description]')?.getAttribute('aria-description')
                                 || '';
+                            // Preview bersih dari aria_desc: "nama, @handle, <pesan…>, <umur>, <status>".
+                            // Ambil slice asli setelah @handle sampai sebelum segmen umur/status
+                            // (koma & newline di dalam pesan tetap utuh).
+                            const cleanPreview = (aria) => {
+                                if (!aria || typeof aria !== 'string') return null;
+                                const parts = aria.split(',').map(s => s.trim()).filter(Boolean);
+                                if (parts.length < 3 || !parts[1].startsWith('@')) return null;
+                                const handleIdx = aria.indexOf(parts[1]);
+                                if (handleIdx < 0) return null;
+                                let msg = aria.slice(handleIdx + parts[1].length);
+                                msg = msg.replace(/^[\\s,]+/, '');
+                                const STATUS = '(?:Belum dibaca|Unread|Dibisukan|Muted)';
+                                const AGE = '\\\\d+\\\\s*(?:s|m|h|d|w|y|detik|menit|jam|hari|minggu|bulan|tahun|second|minute|hour|day|week|month|year)s?';
+                                for (let i = 0; i < 4; i++) {
+                                    const stripped = msg.replace(new RegExp('[\\\\s,]*' + STATUS + '[\\\\s,]*$', 'i'), '')
+                                                        .replace(new RegExp('[\\\\s,]*' + AGE + '[\\\\s,]*$', 'i'), '');
+                                    if (stripped === msg) break;
+                                    msg = stripped;
+                                }
+                                return msg.trim() || null;
+                            };
+                            const previewText = cleanPreview(ariaDesc)
+                                || (msgCandidates.length > 0
+                                    ? msgCandidates[msgCandidates.length - 1]
+                                    : (node.textContent || '').trim());
                             const ageMs = parseRelAge(ariaDesc);
                             const isUnread = /\\b(Belum dibaca|Unread)\\b/i.test(ariaDesc);
                             out.push({
@@ -375,10 +448,13 @@ async def unlock_and_read_xchat_inbox(
             log.warning("unlock_and_read_xchat_inbox error: %s", exc)
             return []
         finally:
-            try:
-                await page.close()
-            except Exception:
-                pass
+            if page is not None:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+            if context is not None:
+                await XChatContextPool.get().release(auth_token, context)
 
 
 async def unlock_and_read_xchat_conversation(
@@ -400,9 +476,11 @@ async def unlock_and_read_xchat_conversation(
 
     playwright_search.PLAYWRIGHT_ENABLED = True
     async with PlaywrightPool.get().semaphore:
-        context = await ContextPool.get().acquire(auth_token)
-        page = await context.new_page()
+        context = None
+        page = None
         try:
+            context = await XChatContextPool.get().acquire(auth_token)
+            page = await context.new_page()
             url = f"https://x.com/i/chat/{norm_conv_id}"
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
             unlocked = await _ensure_pin_unlocked(page, dm_pin)
@@ -590,10 +668,13 @@ async def unlock_and_read_xchat_conversation(
             log.warning("unlock_and_read_xchat_conversation(%s) failed: %s", norm_conv_id, exc)
             return []
         finally:
-            try:
-                await page.close()
-            except Exception:
-                pass
+            if page is not None:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+            if context is not None:
+                await XChatContextPool.get().release(auth_token, context)
 
 
 async def send_xchat_dm_via_browser(
@@ -609,9 +690,11 @@ async def send_xchat_dm_via_browser(
     norm_conv_id = conversation_id.replace(":", "-")
     playwright_search.PLAYWRIGHT_ENABLED = True
     async with PlaywrightPool.get().semaphore:
-        context = await ContextPool.get().acquire(auth_token)
-        page = await context.new_page()
+        context = None
+        page = None
         try:
+            context = await XChatContextPool.get().acquire(auth_token)
+            page = await context.new_page()
             url = f"https://x.com/i/chat/{norm_conv_id}"
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
             unlocked = await _ensure_pin_unlocked(page, dm_pin)
@@ -627,7 +710,7 @@ async def send_xchat_dm_via_browser(
                     const root = host?.shadowRoot || document;
                     return Boolean(root.querySelector(sel));
                 }""",
-                DM_COMPOSER_SELECTOR,
+                arg=DM_COMPOSER_SELECTOR,
                 timeout=15000,
             )
 
@@ -679,7 +762,7 @@ async def send_xchat_dm_via_browser(
                         const curCount = root.querySelectorAll('[data-testid^="message-text-"]').length;
                         return val.length === 0 || curCount > prevCount;
                     }""",
-                    {"sel": DM_COMPOSER_SELECTOR, "prevCount": prev_msg_count},
+                    arg={"sel": DM_COMPOSER_SELECTOR, "prevCount": prev_msg_count},
                     timeout=8000,
                 )
                 delivered = True
@@ -701,7 +784,10 @@ async def send_xchat_dm_via_browser(
             log.warning("send_xchat_dm_via_browser(%s) failed: %s", norm_conv_id, exc)
             return {"status": "error", "error": str(exc)}
         finally:
-            try:
-                await page.close()
-            except Exception:
-                pass
+            if page is not None:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+            if context is not None:
+                await XChatContextPool.get().release(auth_token, context)

@@ -141,6 +141,7 @@ async def admin_stats(
         "tid_provider": await TIDProvider.get().stats(),
         "client_pool": await ClientPool.get().stats(),
         "response_cache": await ResponseCache.get().stats(),
+        "xchat_context_pool": await __import__("playwright_search", fromlist=["XChatContextPool"]).XChatContextPool.get().stats(),
         "rate_limiter": rl_stats,
         "routes": {
             "v2_total": len(routes_summary["implemented"]) + len(routes_summary["stub_501"]),

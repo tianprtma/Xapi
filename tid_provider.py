@@ -158,22 +158,25 @@ class TIDProvider:
                 from playwright_search import ContextPool
 
                 ctx = await ContextPool.get().acquire(auth_token)
-                page = await ctx.new_page()
                 try:
-                    # Raw response body — bukan page.content(): X menghapus
-                    # SVG `loading-x-anim` (animation key frames) dari DOM
-                    # setelah app mount, jadi DOM-nya tidak bisa dipakai
-                    # untuk generate animation key.
-                    resp = await page.goto(
-                        "https://x.com/home",
-                        wait_until="domcontentloaded",
-                        timeout=30000,
-                    )
-                    if resp is None:
-                        return None
-                    return await resp.text()
+                    page = await ctx.new_page()
+                    try:
+                        # Raw response body — bukan page.content(): X menghapus
+                        # SVG `loading-x-anim` (animation key frames) dari DOM
+                        # setelah app mount, jadi DOM-nya tidak bisa dipakai
+                        # untuk generate animation key.
+                        resp = await page.goto(
+                            "https://x.com/home",
+                            wait_until="domcontentloaded",
+                            timeout=30000,
+                        )
+                        if resp is None:
+                            return None
+                        return await resp.text()
+                    finally:
+                        await page.close()
                 finally:
-                    await page.close()
+                    await ContextPool.get().release(auth_token, ctx)
             except Exception as e:  # noqa: BLE001
                 log.warning("TID home fetch via browser failed: %s", e)
                 return None

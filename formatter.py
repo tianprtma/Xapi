@@ -76,7 +76,7 @@ def _user_result_to_obj(user_result: dict[str, Any]) -> Optional[dict[str, Any]]
 def format_user(gql: dict[str, Any]) -> dict[str, Any]:
     """Format response UserByScreenName / UserByRestId."""
     user_result = (
-        (gql or {}).get("data", {}).get("user", {}).get("result", {})
+        ((((gql or {}).get("data") or {}).get("user")) or {}).get("result") or {}
     )
     obj = _user_result_to_obj(user_result)
     if not obj:
@@ -102,7 +102,7 @@ def _tweet_result_to_obj(tweet_result: dict[str, Any]) -> Optional[dict[str, Any
     text = (note or {}).get("text") or legacy.get("full_text") or legacy.get("text")
     core = tweet_result.get("core", {}) or {}
     author = (
-        core.get("user_results", {}).get("result", {}) if core else {}
+        ((core.get("user_results") or {}).get("result", {})) if core else {}
     )
 
     entities = legacy.get("entities", {}) or {}
@@ -256,15 +256,15 @@ def _dm_attachment_obj(m: dict[str, Any]) -> dict[str, Any]:
 
 def format_tweet(gql: dict[str, Any]) -> dict[str, Any]:
     """Format TweetResultByRestId / CreateTweet."""
-    data = (gql or {}).get("data", {})
+    data = (gql or {}).get("data") or {}
     # Try TweetResultByRestId path first
-    tw = data.get("tweetResult", {}).get("result", {})
+    tw = ((data.get("tweetResult") or {}).get("result")) or {}
     if not tw:
         # Try CreateTweet path (tweet_results.result format)
-        tw = data.get("create_tweet", {}).get("tweet_results", {}).get("result", {})
+        tw = (((data.get("create_tweet") or {}).get("tweet_results") or {}).get("result")) or {}
     if not tw:
         # Try CreateTweet path (tweet format — actual CreateTweet GQL response)
-        tw = data.get("create_tweet", {}).get("tweet", {})
+        tw = (data.get("create_tweet") or {}).get("tweet") or {}
     obj = _tweet_result_to_obj(tw)
     if not obj:
         return {"errors": [{"title": "Not Found", "detail": "Tweet not found", "type": "not_found"}]}
@@ -283,7 +283,7 @@ def _collect_includes_from_tweet(tweet_result: dict[str, Any]) -> dict[str, list
     includes: dict[str, list] = {"users": [], "media": [], "tweets": []}
     legacy = tweet_result.get("legacy", {}) or {}
     core = tweet_result.get("core", {}) or {}
-    author = core.get("user_results", {}).get("result", {}) if core else {}
+    author = ((core.get("user_results") or {}).get("result", {})) if core else {}
     a = _user_result_to_obj(author)
     if a:
         includes["users"].append(a)
@@ -291,14 +291,14 @@ def _collect_includes_from_tweet(tweet_result: dict[str, Any]) -> dict[str, list
     for m in (legacy.get("extended_entities", {}) or {}).get("media", []) or []:
         includes["media"].append(_media_obj(m))
 
-    quoted = tweet_result.get("quoted_status_result", {}).get("result")
+    quoted = (tweet_result.get("quoted_status_result") or {}).get("result")
     if quoted:
         q = _tweet_result_to_obj(quoted)
         if q:
             includes["tweets"].append(q)
         # also bring quoted author
         qcore = quoted.get("core", {}) or {}
-        qauthor = qcore.get("user_results", {}).get("result", {}) if qcore else {}
+        qauthor = ((qcore.get("user_results") or {}).get("result", {})) if qcore else {}
         qa = _user_result_to_obj(qauthor)
         if qa and qa.get("id") and qa["id"] not in {u["id"] for u in includes["users"] if u.get("id")}:
             includes["users"].append(qa)
@@ -389,7 +389,7 @@ def _entry_to_user(entry: dict[str, Any]) -> Optional[dict[str, Any]]:
     content = entry.get("content", {}) or {}
     item_content = content.get("itemContent") or {}
     if item_content.get("itemType") == "TimelineUser":
-        ur = item_content.get("user_results", {}).get("result", {})
+        ur = (item_content.get("user_results") or {}).get("result", {})
         return _user_result_to_obj(ur)
     return None
 
@@ -654,7 +654,7 @@ def _dm_event_to_obj(
     # Account Activity API (`message_create.message_data`), keep nested fallback.
     msg_data = ev.get("message_data") or msg.get("message_data") or {}
 
-    raw_conv_id = ev.get("conversation_id") or msg.get("target", {}).get("conversation_id")
+    raw_conv_id = ev.get("conversation_id") or (msg.get("target") or {}).get("conversation_id")
     base: dict[str, Any] = {
         "id": str(ev.get("id") or ev.get("event_id") or ""),
         "event_type": _DM_EVENT_TYPE_MAP.get(et, et),
@@ -795,7 +795,18 @@ def _dm_ts_to_iso(ts: Any) -> Optional[str]:
     if not ts:
         return None
     if isinstance(ts, str) and "T" in ts and ts.endswith("Z"):
-        return ts
+        # Normalisasi ISO → format milidetik seragam. Sort leksikografis di
+        # format_dm_events hanya benar kalau semua created_at satu format:
+        # "10:00:00Z" > "10:00:00.500Z" secara string (Z 0x5A > . 0x2E)
+        # padahal kronologisnya .000 < .500.
+        try:
+            from datetime import datetime
+
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            ms = int(dt.timestamp() * 1000)
+            return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{ms % 1000:03d}Z"
+        except ValueError:
+            return ts
     try:
         from datetime import datetime, timezone
 
@@ -1586,7 +1597,18 @@ def format_dm_events(
         if isinstance(sec.get("conversations"), dict):
             raw_convs.update(sec["conversations"])
         if not next_token:
-            next_token = sec.get("min_entry_id") or sec.get("cursor")
+            # min_entry_id = id ter-oldest di response ini; REST 1.1 max_id
+            # inklusif (id <= max_id) — turunkan 1 supaya event boundary tidak
+            # terduplikasi di halaman berikutnya (sama seperti sintesis token
+            # saat truncation di bawah).
+            raw_min = sec.get("min_entry_id")
+            if raw_min:
+                s_min = str(raw_min)
+                next_token = (
+                    str(int(s_min) - 1) if s_min.isdigit() and int(s_min) > 0 else s_min
+                )
+            else:
+                next_token = sec.get("cursor")
         if not prev_token:
             prev_token = sec.get("max_entry_id")
 
@@ -1689,8 +1711,18 @@ def format_dm_events(
 
     if max_results and max_results > 0 and len(events) > max_results:
         events = events[:max_results]
+        # Truncation memotong union multi-source (inbox + requests + REST).
+        # Cursor upstream ada DI ATAS event yang baru terpotong — memakainya
+        # berarti event terpotong tidak pernah disajikan halaman mana pun
+        # (data loss). Lanjutkan dari boundary halaman yang DISAJIKAN dengan
+        # token eksklusif (id - 1) supaya event boundary tidak terduplikasi
+        # di halaman berikutnya (REST 1.1 max_id inklusif: id <= max_id).
         if events and events[-1].get("id"):
-            next_token = str(events[-1]["id"])
+            last_id = str(events[-1]["id"])
+            if last_id.isdigit() and int(last_id) > 0:
+                next_token = str(int(last_id) - 1)
+            elif not next_token:
+                next_token = last_id
 
     out: dict[str, Any] = {
         "data": events,

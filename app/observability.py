@@ -57,6 +57,12 @@ def _setup_logging() -> None:
         root.removeHandler(h)
     root.addHandler(handler)
 
+    # uvicorn access log mencantumkan query string penuh → membocorkan
+    # `?dm_pin=` / `?auth_token=` ke journald/console (terbukti audit
+    # 2026-11-08). AccessLogMiddleware (path-only) sudah setara — matikan
+    # logger uvicorn.access untuk CLI maupun `python3 main.py`.
+    logging.getLogger("uvicorn.access").disabled = True
+
 
 # ──────────────────────────── Request ID middleware ────────────────────────────
 

@@ -24,10 +24,13 @@ headless Chrome calls when e.g. a worker fan-out hits the same endpoint.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import secrets
+from collections import OrderedDict
+from pathlib import Path
 from typing import Any, Callable, Coroutine, Literal, Optional
 
 from playwright.async_api import (
@@ -236,6 +239,15 @@ class PlaywrightPool:
                     )
                 raise
 
+    async def driver(self):
+        """Return the Playwright driver (starts shared driver + browser first).
+
+        Dipakai XChatContextPool untuk `launch_persistent_context` — API
+        persistent context hidup di BrowserType (driver), bukan di Browser.
+        """
+        await self.ensure()
+        return self._pw
+
     async def warmup(self) -> None:
         """Pre-launch browser di startup supaya request pertama tidak nunggu Chromium init.
 
@@ -347,6 +359,12 @@ class ContextPool:
 
     def __init__(self) -> None:
         self._ctxs: dict[str, tuple[BrowserContext, float]] = {}
+        # id(ctx) -> jumlah holder. Key id() aman: context yang dihitung selalu
+        # dirujuk _ctxs atau _dropped, jadi tidak ada aliasing id reuse.
+        self._ctx_use: dict[int, int] = {}
+        # Context dihapus dari pool saat masih dipakai (invalidate) — ditutup
+        # saat holder terakhir release().
+        self._dropped: set = set()
         self._lock = asyncio.Lock()
 
     @classmethod
@@ -365,28 +383,68 @@ class ContextPool:
                 try:
                     _ = ctx.pages
                     self._ctxs[auth_token] = (ctx, _t.time())
+                    self._ctx_use[id(ctx)] = self._ctx_use.get(id(ctx), 0) + 1
                     return ctx
                 except Exception:  # noqa: BLE001
                     self._ctxs.pop(auth_token, None)
+                    self._ctx_use.pop(id(ctx), None)
 
             browser = await PlaywrightPool.get().ensure()
             ctx = await _new_context(browser, auth_token)
 
             if len(self._ctxs) >= self.MAX:
-                oldest = min(self._ctxs.items(), key=lambda kv: kv[1][1])[0]
-                old_ctx, _ = self._ctxs.pop(oldest)
-                try:
-                    await old_ctx.close()
-                except Exception:  # noqa: BLE001
-                    pass
+                # Evict context idle terlama — skip yang sedang dipakai;
+                # pool boleh melebihi MAX sementara daripada menutup context
+                # yang sedang dipakai coroutine lain.
+                candidates = [
+                    (k, ts) for k, (c, ts) in self._ctxs.items()
+                    if self._ctx_use.get(id(c), 0) == 0
+                ]
+                if candidates:
+                    oldest = min(candidates, key=lambda kv: kv[1])[0]
+                    old_ctx, _ = self._ctxs.pop(oldest)
+                    self._ctx_use.pop(id(old_ctx), None)
+                    self._dropped.discard(old_ctx)
+                    try:
+                        await old_ctx.close()
+                    except Exception:  # noqa: BLE001
+                        pass
 
             self._ctxs[auth_token] = (ctx, _t.time())
+            self._ctx_use[id(ctx)] = self._ctx_use.get(id(ctx), 0) + 1
             return ctx
+
+    async def release(self, auth_token: str, ctx: BrowserContext) -> None:
+        """Decrement holder count untuk `ctx`; tutup context yang di-drop
+        dari pool saat masih dipakai (invalidate) ketika holder terakhir
+        selesai."""
+        async with self._lock:
+            count = self._ctx_use.get(id(ctx), 0)
+            if count > 1:
+                self._ctx_use[id(ctx)] = count - 1
+                return
+            self._ctx_use.pop(id(ctx), None)
+            dropped = ctx in self._dropped
+            if dropped:
+                self._dropped.discard(ctx)
+        if dropped:
+            try:
+                await ctx.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     async def invalidate(self, auth_token: str) -> None:
         async with self._lock:
             entry = self._ctxs.pop(auth_token, None)
+            if entry and self._ctx_use.get(id(entry[0]), 0) > 0:
+                # Context sedang dipakai — keluar dari pool (pemanggil baru
+                # dapat context baru), close ditunda sampai holder terakhir
+                # release(). Counter _ctx_use tidak di-reset agar drain
+                # alami saat holder melepas.
+                self._dropped.add(entry[0])
+                return
             if entry:
+                self._ctx_use.pop(id(entry[0]), None)
                 try:
                     await entry[0].close()
                 except Exception:  # noqa: BLE001
@@ -403,6 +461,245 @@ class ContextPool:
 
     def stats(self) -> dict[str, int]:
         return {"contexts": len(self._ctxs), "max": self.MAX}
+
+
+# ──────────────────────────── XChat persistent profile ────────────────────────────
+
+
+# Unlock E2EE XChat tersimpan di storage browser (localStorage/IndexedDB
+# origin x.com). Profil on-disk per akun → PIN cukup dimasukkan SEKALI,
+# run/proses berikutnya langsung ke inbox tanpa gate.
+XCHAT_PROFILE_DIR: str = os.environ.get(
+    "XCHAT_PROFILE_DIR", str(Path(__file__).resolve().parent / ".xchat_profiles")
+)
+XCHAT_PERSISTENT_MAX: int = int(os.environ.get("XCHAT_PERSISTENT_MAX", "3"))
+
+
+def _xchat_profile_dir(auth_token: str) -> Path:
+    """Subdir profil per akun — hash TANPA salt agar stabil antar restart
+    (token_key memakai salt per-proses yang berubah tiap restart)."""
+    import hashlib
+
+    digest = hashlib.sha256(f"xchat:{auth_token}".encode()).hexdigest()[:16]
+    return Path(XCHAT_PROFILE_DIR) / digest
+
+
+async def _apply_session_cookies(ctx: BrowserContext, auth_token: str, ct0: Optional[str] = None) -> None:
+    """Inject cookie sesi (auth_token + ct0) — overwrite aman jika sudah ada."""
+    from app.config import gen_ct0
+
+    _ct0 = ct0 or gen_ct0()
+    await ctx.add_cookies(
+        [
+            {
+                "name": "auth_token",
+                "value": auth_token,
+                "domain": ".x.com",
+                "path": "/",
+                "httpOnly": True,
+                "secure": True,
+                "sameSite": "None",
+            },
+            {
+                "name": "auth_token",
+                "value": auth_token,
+                "domain": ".twitter.com",
+                "path": "/",
+                "httpOnly": True,
+                "secure": True,
+                "sameSite": "None",
+            },
+            {
+                "name": "ct0",
+                "value": _ct0,
+                "domain": ".x.com",
+                "path": "/",
+                "httpOnly": False,
+                "secure": True,
+                "sameSite": "Lax",
+            },
+            {
+                "name": "ct0",
+                "value": _ct0,
+                "domain": ".twitter.com",
+                "path": "/",
+                "httpOnly": False,
+                "secure": True,
+                "sameSite": "None",
+            },
+        ]
+    )
+
+
+class XChatContextPool:
+    """Pool BrowserContext PERSISTENT (profil on-disk) khusus alur XChat E2EE.
+
+    - Satu profil disk per auth_token (hash stabil) → unlock PIN bertahan
+      antar run/proses; PIN hanya dimasukkan sekali per akun.
+    - `launch_persistent_context` memproses SATU browser process per context —
+      jumlah dibatasi XCHAT_PERSISTENT_MAX; LRU idle di-evict dengan in-use
+      tracking (materi sama dengan ContextPool). Evict aman: unlock state
+      ada di disk, re-launch tidak minta PIN ulang.
+    - CATATAN: profil menyimpan cookie sesi (auth_token) + kunci E2EE di
+      disk — lindungi direktorinya (default: <repo>/.xchat_profiles).
+    - Asumsi single-process (WORKER=1) — dua proses tidak boleh membuka
+      profil dir yang sama secara bersamaan.
+    """
+
+    _instance: Optional["XChatContextPool"] = None
+
+    def __init__(self) -> None:
+        self._ctxs: OrderedDict[str, BrowserContext] = OrderedDict()  # key = hash
+        self._ctx_use: dict[int, int] = {}   # id(ctx) -> jumlah holder
+        self._dropped: set = set()           # dihapus saat masih dipakai
+        self._lock = asyncio.Lock()
+
+    @classmethod
+    def get(cls) -> "XChatContextPool":
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    async def acquire(self, auth_token: str) -> BrowserContext:
+        from app.config import gen_ct0, profile_for_token
+
+        key = hashlib.sha256(f"xchat:{auth_token}".encode()).hexdigest()[:16]
+        # ct0 STABIL per profil — X mengikat sesi unlock E2EE ke identitas
+        # session (ct0); menggantinya tiap acquire memicu gate PIN ulang.
+        profile_dir = _xchat_profile_dir(auth_token)
+        ct0_file = profile_dir / "ct0.txt"
+        ct0 = None
+        if ct0_file.is_file():
+            ct0 = ct0_file.read_text().strip() or None
+        if not ct0:
+            ct0 = gen_ct0()
+            profile_dir.mkdir(parents=True, exist_ok=True)
+            ct0_file.write_text(ct0)
+
+        async with self._lock:
+            ctx = self._ctxs.get(key)
+            if ctx is not None:
+                # health check: context yang sudah mati melempar di .pages
+                try:
+                    _ = ctx.pages
+                    self._ctxs.move_to_end(key)
+                    self._ctx_use[id(ctx)] = self._ctx_use.get(id(ctx), 0) + 1
+                    await _apply_session_cookies(ctx, auth_token, ct0)
+                    return ctx
+                except Exception:  # noqa: BLE001
+                    self._ctxs.pop(key, None)
+                    self._ctx_use.pop(id(ctx), None)
+
+            prof = profile_for_token(auth_token)
+            is_win = "Windows" in prof["sec_ch_ua_platform"]
+            profile_dir.mkdir(parents=True, exist_ok=True)
+
+            driver = await PlaywrightPool.get().driver()
+            try:
+                ctx = await driver.chromium.launch_persistent_context(
+                    str(profile_dir),
+                    headless=True,
+                    user_agent=prof["user_agent"],
+                    viewport={"width": 1366, "height": 768} if is_win else {"width": 1440, "height": 900},
+                    locale="en-US",
+                    timezone_id="America/New_York",
+                    extra_http_headers={
+                        "sec-ch-ua": prof["sec_ch_ua"],
+                        "sec-ch-ua-mobile": "?0",
+                        "sec-ch-ua-platform": prof["sec_ch_ua_platform"],
+                    },
+                    args=[
+                        "--disable-blink-features=AutomationControlled",
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                    ],
+                )
+            except Exception as exc:  # noqa: BLE001
+                raise RuntimeError(
+                    f"XChat profile '{profile_dir.name}' gagal dibuka — "
+                    f"profil terkunci oleh proses lain (server & fetch_dm_pin.py "
+                    f"bareng?) atau Chromium gagal launch: {type(exc).__name__}: {exc}"
+                ) from exc
+            await ctx.add_init_script(
+                """
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                window.chrome = window.chrome || { runtime: {}, loadTimes: function() {}, csi: function() {}, app: {} };
+                """
+            )
+            await _apply_session_cookies(ctx, auth_token, ct0)
+
+            self._ctxs[key] = ctx
+            self._ctx_use[id(ctx)] = self._ctx_use.get(id(ctx), 0) + 1
+
+            # Evict LRU idle bila melebihi cap (persistent: aman, state di disk)
+            while len(self._ctxs) > XCHAT_PERSISTENT_MAX:
+                evict_key = next(
+                    (k for k, c in self._ctxs.items() if self._ctx_use.get(id(c), 0) == 0),
+                    None,
+                )
+                if evict_key is None:
+                    break  # semua in-use — biarkan melebihi cap sementara
+                old = self._ctxs.pop(evict_key)
+                self._ctx_use.pop(id(old), None)
+                self._dropped.discard(old)
+                try:
+                    await old.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+            return ctx
+
+    async def release(self, auth_token: str, ctx: BrowserContext) -> None:
+        async with self._lock:
+            count = self._ctx_use.get(id(ctx), 0)
+            if count > 1:
+                self._ctx_use[id(ctx)] = count - 1
+                return
+            self._ctx_use.pop(id(ctx), None)
+            dropped = ctx in self._dropped
+            if dropped:
+                self._dropped.discard(ctx)
+        if dropped:
+            try:
+                await ctx.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    async def invalidate(self, auth_token: str) -> None:
+        key = hashlib.sha256(f"xchat:{auth_token}".encode()).hexdigest()[:16]
+        async with self._lock:
+            ctx = self._ctxs.pop(key, None)
+            if ctx and self._ctx_use.get(id(ctx), 0) > 0:
+                self._dropped.add(ctx)
+                return
+            if ctx:
+                self._ctx_use.pop(id(ctx), None)
+        if ctx:
+            try:
+                await ctx.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    async def close_all(self) -> None:
+        async with self._lock:
+            ctxs = list(self._ctxs.values())
+            self._ctxs.clear()
+            self._ctx_use.clear()
+            dropped, self._dropped = list(self._dropped), set()
+        for ctx in ctxs + dropped:
+            try:
+                await ctx.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def stats(self) -> dict[str, int]:
+        return {
+            "contexts": len(self._ctxs),
+            "max": XCHAT_PERSISTENT_MAX,
+            "profile_dir": XCHAT_PROFILE_DIR,
+        }
 
 
 async def click_action_via_browser(
@@ -520,6 +817,7 @@ async def _click_action_via_browser_impl(
             await page.close()
         except Exception:  # noqa: BLE001
             pass
+        await ContextPool.get().release(auth_token, context)
         # context tetap di pool — jangan close
 
 
@@ -616,6 +914,7 @@ async def _action_via_browser_impl(
             await page.close()
         except Exception:  # noqa: BLE001
             pass
+        await ContextPool.get().release(auth_token, context)
         # context tetap di pool — jangan close
 
 
@@ -727,6 +1026,7 @@ async def _fetch_via_browser_impl(
             await page.close()
         except Exception:  # noqa: BLE001
             pass
+        await ContextPool.get().release(auth_token, context)
         # context tetap di pool — jangan close
 
 
@@ -835,4 +1135,5 @@ async def _search_via_browser_impl(
             await page.close()
         except Exception:  # noqa: BLE001
             pass
+        await ContextPool.get().release(auth_token, context)
         # context tetap di pool — jangan close

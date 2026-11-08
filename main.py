@@ -95,7 +95,20 @@ async def lifespan(_: FastAPI):
     # Graceful shutdown — ordered, isolated
     shutdown_log = logging.getLogger("xapi.shutdown")
 
-    # 1. Playwright browser (depends on nothing)
+    # 1. XChat persistent contexts DULUAN — mereka diluncurkan lewat driver
+    #    PlaywrightPool; kalau driver distop duluan, transportnya mati
+    #    (TargetClosedError) dan ctx.close() tak bisa flush storage unlock
+    #    E2EE ke disk (unlock bisa hilang tiap restart).
+    try:
+        from playwright_search import XChatContextPool
+        await asyncio.wait_for(XChatContextPool.get().close_all(), timeout=10.0)
+        shutdown_log.info("xchat persistent contexts closed")
+    except asyncio.TimeoutError:
+        shutdown_log.warning("xchat persistent contexts close timed out after 10s")
+    except Exception:
+        shutdown_log.exception("xchat persistent contexts close failed")
+
+    # 2. Playwright driver + shared browser (terakhir — semua context sudah tutup)
     try:
         await asyncio.wait_for(PlaywrightPool.get().close(), timeout=10.0)
         shutdown_log.info("playwright closed")
@@ -266,6 +279,10 @@ if __name__ == "__main__":
         port=8000,
         workers=workers,
         server_header=False,
+        # uvicorn access log mencantumkan query string penuh → membocorkan
+        # `?dm_pin=`/`?auth_token=` ke journald/console. Observability cukup
+        # dari AccessLogMiddleware (JSON, path-only, tanpa query string).
+        access_log=False,
     )
     server = uvicorn.Server(config=config)
     server.run()

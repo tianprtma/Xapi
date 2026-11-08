@@ -3,9 +3,10 @@ name: xapi
 description: >-
   Use the Xapi server (X/Twitter cookie API mirroring X API v2) to read and write X data with a
   browser `auth_token` cookie instead of OAuth2. Covers users, tweets, timelines, search, lists,
-  bookmarks, communities, Spaces, trends, DMs, media upload, and Birdwatch notes. Use when the
-  user asks to fetch, search, post, reply, quote, like, retweet, follow, bookmark, or DM on
-  X/Twitter, or mentions Xapi, `auth_token`, `/2/tweets`, or a self-hosted X API.
+  bookmarks, communities, Spaces, trends, DMs (including XChat E2EE-encrypted DMs via PIN), media
+  upload/download, and Birdwatch notes. Use when the user asks to fetch, search, post, reply,
+  quote, like, retweet, follow, bookmark, or DM on X/Twitter, or mentions Xapi, `auth_token`,
+  `dm_pin`, `/2/tweets`, `/2/dm_events`, or a self-hosted X API.
 ---
 
 # Xapi — X (Twitter) Cookie API
@@ -89,6 +90,40 @@ Media: `POST /2/media/upload?media_type=image/jpeg` with the raw file as the bod
 returned `data.media_id` in `media_ids` to `POST /2/tweets` (max 4). Video/GIF uses the same
 endpoint with chunked upload handled server-side.
 
+## XChat E2EE DMs (encrypted, `dm_pin`)
+
+Recent XChat DMs are end-to-end encrypted. Fetching plaintext requires the account's XChat PIN
+(4–8 digits) and `PLAYWRIGHT_ENABLED=1` on the server: Xapi opens `x.com/i/chat` in headless
+Chromium, unlocks with the PIN, and lets X's own JS decrypt. The browser profile persists per
+account (`.xchat_profiles/`) so the PIN is not re-typed every run — but X can re-serve the PIN
+gate at any time (server-controlled), so always pass `dm_pin` when the user provides one.
+
+**Never put the PIN in the query string in production** (`?dm_pin=` leaks in uvicorn/reverse-proxy
+access logs — proven in the 2026-11-08 audit). Use the `X-DM-Pin: <pin>` header instead — every
+XChat endpoint supports it.
+
+```bash
+# XChat inbox (decrypted previews, unread flags) — header X-DM-Pin (production-safe)
+curl -s -H "$H" -H "X-DM-Pin: 1234" "$B/2/chat/conversations?max_results=20"
+
+# Full decrypted conversation (conversation id = "<peer>-<me>")
+curl -s -H "$H" -H "X-DM-Pin: 1234" \
+  "$B/2/dm_conversations/1394249284736864258-1831953836929638400/dm_events"
+
+# DM media: plain DMs proxy ton.x.com (stateless, works anytime)
+curl -s -H "$H" "$B/2/dm_conversations/media/{dm_id}/{media_id}/{resource_id}" -o media.jpg
+# XChat E2EE media comes from the server's in-memory cache (TTL 15 min, images only) —
+# populated when the server itself runs the conversation flow above for that account.
+```
+
+E2EE events carry non-spec fields: `_xchat_decrypted`, `is_outgoing`, `_xapi_attachments`
+(with `proxy_path`, `media_id`, `mime`), `status_links`. Treat them as best-effort extras.
+
+**Standalone script** (no server needed): `python3 fetch_dm_pin.py --pin 1234 [--save-media ./media]
+[--conversation <id>] [--scan-limit N] [--browser]` — login + inbox REST/GraphQL + browser E2EE
++ media-to-disk in one process. Requires deps + Chromium (see `README.md`). Never print the PIN
+or the token in command output.
+
 ## Write safety
 
 - Writes are real and public. Confirm with the user before posting, deleting, following, blocking,
@@ -107,6 +142,8 @@ endpoint with chunked upload handled server-side.
 | `AUTH_TOKEN_EXPIRED` | Cookie expired — user must re-copy `auth_token` from x.com |
 | `UPSTREAM_AUTH_REJECTED` | X rejected the session; token may be revoked |
 | Slow response (2–6s) | Endpoint is CF-gated and uses Playwright; that is expected |
+| XChat DMs return empty previews / gate warnings | PIN gate re-appeared (server-controlled) — ask the user for `dm_pin`, or retry with the pin once provided |
+| `XChat profile '<hash>' gagal dibuka` | Persistent profile locked by another process (server + `fetch_dm_pin.py` together) — close one, or set a different `XCHAT_PROFILE_DIR` |
 | `STUB_NOT_IMPLEMENTED` / 501 | Feature needs OAuth2 or an undiscovered GraphQL op |
 | `RATE_LIMIT_EXCEEDED` | Wait for `retry_after`, then retry |
 

@@ -142,15 +142,23 @@ Common query params: `max_results` (1–100, default 20) and a cursor — usuall
 
 ## DMs and XChat
 
+XChat E2EE: recent encrypted DMs require `?dm_pin=<4-8 digit XChat PIN>` on the
+query (or `X-DM-Pin` header) AND `PLAYWRIGHT_ENABLED=1` — Xapi drives headless
+Chromium through x.com/i/chat (PIN unlock + decryption by X's own JS). A
+persistent browser profile per account (`.xchat_profiles/`) keeps the unlock
+across runs; X may still re-serve the PIN gate at any time, so pass `dm_pin`
+when available. Decrypted events carry best-effort extras: `_xchat_decrypted`,
+`is_outgoing`, `_xapi_attachments` (`proxy_path`, `media_id`, `mime`).
+
 | Method | Path | Notes |
 |---|---|---|
 | GET | `/2/dm_events` | List DM events via GraphQL (`GetInitialXChatPageQuery` / `GetInboxPageRequestQuery`) + REST fallback (`mode=auto\|graphql\|rest`, `include_requests=1`) |
 | GET | `/2/dm_events/search` | Search DM messages/groups/people via GraphQL (`DmAllSearchSlice` / `DmGroupSearchSlice` / `DmPeopleSearchSlice`) |
 | GET | `/2/dm_events/{event_id}` | Single DM event via GraphQL (`GetMessageEventsPageQuery` / `GetInitialXChatPageQuery`) + inbox fallback |
-| GET | `/2/dm_conversations/{conversation_id}/dm_events` | Conversation DM events via GraphQL (`GetConversationPageQuery` / `GetMessageEventsPageQuery`) + REST fallback |
-| GET | `/2/dm_conversations/with/{participant_id}/dm_events` | 1-on-1 DM events with participant via GraphQL + REST fallback |
-| GET | `/2/dm_conversations/media/{dm_id}/{media_id}/{resource_id}` | Proxy download binary media DM (`ton.x.com`) |
-| GET | `/2/chat/conversations` | XChat conversations list via GraphQL (`GetInitialXChatPageQuery` / `GetInboxPageRequestQuery`) |
+| GET | `/2/dm_conversations/{conversation_id}/dm_events` | Conversation DM events via GraphQL (`GetConversationPageQuery` / `GetMessageEventsPageQuery`) + REST fallback; `?dm_pin=` decrypts XChat E2EE |
+| GET | `/2/dm_conversations/with/{participant_id}/dm_events` | 1-on-1 DM events with participant via GraphQL + REST fallback (`?dm_pin=`) |
+| GET | `/2/dm_conversations/media/{dm_id}/{media_id}/{resource_id}` | Proxy download binary media. `dm_id` numeric → proxy `ton.x.com` (plain DM, stateless). `dm_id=xchat` → serves E2EE image from the server's in-memory cache (TTL 15 min, images only, populated by the conversation flow above) |
+| GET | `/2/chat/conversations` | XChat conversations list via GraphQL (`GetInitialXChatPageQuery` / `GetInboxPageRequestQuery`); `?dm_pin=` decrypts previews |
 | GET | `/2/chat/conversations/{conversation_id}/messages` | XChat conversation messages via GraphQL (`GetConversationPageQuery`, alias `/events`) |
 | GET | `/2/chat/requests` | XChat message requests via GraphQL (`GetMessageRequestsPageQuery`) |
 | GET | `/2/chat/permissions` | DM / AV permissions via GraphQL (`DmAvPermissionsQuery`) |

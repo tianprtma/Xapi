@@ -119,3 +119,9 @@ unfollow-script/audits/
 docs-ui/dist/_entry.jsx
 docs-ui/dist/*.jsx
 docs-ui/dist/*.bak
+.xchat_profiles/
+
+# Media DM privat (hasil fetch_dm_pin.py --save-media)
+media/
+# Snapshot env ber-kredensial dari dokumentasi harian
+doc_*.env

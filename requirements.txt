@@ -1,9 +1,15 @@
-# Versi teruji (deploy 192.168.10.14, Nov 2026)
-fastapi>=0.141
-uvicorn[standard]>=0.52
+# Versi teruji:
+#   - deploy 192.168.10.14 (Python 3.11), Nov 2026
+#   - macOS dev (Python 3.9), Nov 2026 — seluruh bug-fix suite & fetch_dm_pin.py
+#     dijalankan dengan kombinasi minimum di bawah ini.
+# CATATAN: pin lama (fastapi>=0.141, curl_cffi>=0.17, playwright>=1.64) TIDAK
+# ter-install di Python 3.9 (wheel-nya butuh py>=3.10) — gunakan minimum di
+# bawah; versi lebih baru tetap diterima di py>=3.10.
+fastapi>=0.128
+uvicorn[standard]>=0.30
 httpx>=0.28
-playwright>=1.64
-curl_cffi>=0.17
+playwright>=1.60
+curl_cffi>=0.13
 requests>=2.32
 beautifulsoup4>=4.15
 xclienttransaction @ git+https://github.com/iSarabjitDhiman/XClientTransaction.git

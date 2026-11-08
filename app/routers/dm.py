@@ -253,10 +253,19 @@ def _format_dm_events_smart(
         key=lambda x: (str(x.get("created_at") or ""), int(x["id"]) if str(x.get("id", "")).isdigit() else 0),
         reverse=True,
     )
+    existing_cursor = (formatted.get("meta") or {}).get("next_token")
     if max_results and max_results > 0 and len(events) > max_results:
         events = events[:max_results]
+        # Truncation memotong union multi-source — cursor upstream ada di
+        # atas event yang terpotong (data loss). Lanjutkan dari boundary
+        # halaman yang DISAJIKAN: token eksklusif (id - 1) supaya event
+        # boundary tidak terduplikasi (REST 1.1 max_id inklusif).
         if events and events[-1].get("id"):
-            formatted.setdefault("meta", {})["next_token"] = str(events[-1]["id"])
+            last_id = str(events[-1]["id"])
+            if last_id.isdigit() and int(last_id) > 0:
+                formatted.setdefault("meta", {})["next_token"] = str(int(last_id) - 1)
+            elif not existing_cursor:
+                formatted.setdefault("meta", {})["next_token"] = last_id
     formatted["data"] = events
     formatted.setdefault("meta", {})["result_count"] = len(events)
     return formatted
@@ -655,7 +664,10 @@ async def v2_dm_events(
                     tok,
                 )
 
-        if include_requests and _has_gql_dm_data(result):
+        if include_requests and _has_gql_dm_data(result) and not pagination_token:
+            # Requests hanya di halaman pertama: refetch di halaman 2+
+            # (tanpa cursor) membuat event requests page 1 muncul ulang
+            # di halaman berikutnya (duplikat antar halaman).
             req_res = await graphql_call(
                 "GetMessageRequestsPageQuery",
                 {"count": max_results},

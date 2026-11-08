@@ -62,6 +62,77 @@ export ALLOWED_ORIGINS="https://yourdomain.com"
 uvicorn main:app --host 0.0.0.0 --port 8000 --no-access-log
 ```
 
+## Deploy VPS — systemd (auto-run saat boot)
+
+File: [`deploy/xapi.service`](deploy/xapi.service) (unit systemd) +
+[`deploy/deploy.sh`](deploy/deploy.sh) (update script idempotent).
+Kedua file ini ada di repo — tinggal clone di VPS.
+
+### 1. Dependensi sistem & user service
+
+```bash
+ssh user@vps-anda
+sudo apt update && sudo apt install -y git python3-venv python3-pip curl
+sudo useradd -r -m -d /opt/xapi -s /usr/sbin/nologin xapi
+cd /opt/xapi
+```
+
+### 2. Clone + deploy otomatis (venv, deps, Chromium, .env)
+
+```bash
+sudo -u xapi git clone https://github.com/tianprtma/Xapi .
+# repo privat: git clone https://<TOKEN_GITHUB>@github.com/tianprtma/Xapi .
+sudo -u xapi bash deploy/deploy.sh
+sudo -u xapi nano .env   # ADMIN_TOKEN, ALLOW_QUERY_AUTH=0, ENABLE_RAW=0,
+                         # PLAYWRIGHT_ENABLED=1, PROXY_LIST= kosong/valid
+```
+
+### 3. Pasang unit & enable (auto-run saat boot + auto-restart saat crash)
+
+```bash
+sudo cp deploy/xapi.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now xapi
+```
+
+### 4. Verifikasi + unlock PIN pertama
+
+```bash
+systemctl status xapi --no-pager
+curl -s http://127.0.0.1:8000/health
+journalctl -u xapi -f                   # log JSON live
+
+# Unlock PIN pertama (profil persist tersimpan di /opt/xapi/.xchat_profiles/)
+curl -s -H "Authorization: Bearer $(grep -oP '(?<=^TEST_AUTH_TOKEN=).{40}' /opt/xapi/.env)"      -H "X-DM-Pin: 1234"      "http://127.0.0.1:8000/2/chat/conversations?max_results=5"
+```
+
+### 5. Bukti auto-run: reboot VPS
+
+```bash
+sudo reboot
+# SSH lagi setelah naik:
+systemctl status xapi --no-pager        # active (running) tanpa start manual = ✓
+curl -s http://127.0.0.1:8000/health
+```
+
+### 6. Update rutin
+
+```bash
+sudo -u xapi bash /opt/xapi/deploy/deploy.sh   # git pull + deps + Chromium
+sudo systemctl restart xapi
+```
+
+### Catatan VPS
+
+- Unit bind `127.0.0.1:8000` — akses via SSH tunnel (`ssh -L 8000:127.0.0.1:8000 …`)
+  atau nginx reverse proxy. `0.0.0.0` hanya jika wajib + firewall ketat.
+- `Restart=always` + `RestartSec=5`: proses crash auto-hidup dalam 5 detik.
+- `TimeoutStopSec=25`: budget shutdown agar flush storage unlock E2EE sempat jalan.
+- Profil persist **terkunci** bila dipakai dua proses bersamaan (server + `fetch_dm_pin.py`
+  di VPS yang sama) — jalankan salah satu, atau bedakan `XCHAT_PROFILE_DIR`.
+- Bila Chromium komplain library OS kurang: `sudo playwright install-deps chromium`
+  (atau `sudo .venv/bin/python -m playwright install-deps chromium`).
+
 ## Auth
 
 Semua endpoint butuh `auth_token` cookie. Token di-pass via:

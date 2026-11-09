@@ -31,7 +31,7 @@ sed \
     -e "s#^Environment=HOME=.*#Environment=HOME=$REPO_DIR#" \
     -e "s#^User=.*#User=$RUN_USER#" \
     -e "s#^Group=.*#Group=$RUN_GROUP#" \
-    -e "s#^# EnvironmentFile=-.*#EnvironmentFile=-$REPO_DIR/.env#" \
+    -e "s|^# EnvironmentFile=.*|EnvironmentFile=-$REPO_DIR/.env|" \
     -e "s#^ExecStart=.*#ExecStart=$REPO_DIR/.venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port $PORT --no-access-log#" \
     "$REPO_DIR/deploy/xapi.service" > "$TMP_UNIT"
 

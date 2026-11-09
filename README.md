@@ -146,6 +146,10 @@ sudo systemctl restart xapi
   di VPS yang sama) — jalankan salah satu, atau bedakan `XCHAT_PROFILE_DIR`.
 - Bila Chromium komplain library OS kurang: `sudo playwright install-deps chromium`
   (atau `sudo .venv/bin/python -m playwright install-deps chromium`).
+- `deploy.sh: line NN: .venv/bin/pip: No such file or directory` → paket
+  `python3.11-venv` belum terinstal: `sudo apt install -y python3.11-venv`
+  lalu ulangi `bash deploy/deploy.sh` (script kini menghapus venv parsial
+  otomatis dan memberi pesan ini, bukan crash).
 
 ## Auth
 

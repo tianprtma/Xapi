@@ -38,6 +38,22 @@ if [ -d .venv ] && [ -x .venv/bin/python ]; then
     fi
 fi
 [ -d .venv ] || "$PYTHON_BIN" -m venv .venv
+
+# File .venv bisa TERBENTUK TANPA pip bila paket python3.X-venv belum
+# terinstal (gejala: ".venv/bin/pip: No such file or directory"). Coba
+# ensurepip dulu; kalau tetap gagal, hapus venv parsial & beri instruksi.
+if [ ! -x .venv/bin/pip ]; then
+    echo "   pip belum ada di venv — mencoba ensurepip…"
+    .venv/bin/python -m ensurepip --upgrade >/dev/null 2>&1 || true
+fi
+if [ ! -x .venv/bin/pip ]; then
+    echo "ERROR: venv tidak memiliki pip — paket python3.$EXPECTED_MM-venv belum terinstal."
+    echo "  Perbaiki:"
+    echo "    sudo apt update && sudo apt install -y python3.${EXPECTED_MM}-venv"
+    echo "    (Ubuntu 24.04 / tanpa repo 3.11: lihat deadsnakes di README)"
+    rm -rf .venv   # buang venv parsial agar run berikutnya bersih
+    exit 1
+fi
 .venv/bin/pip install -q --upgrade pip
 .venv/bin/pip install -q -r requirements.txt
 

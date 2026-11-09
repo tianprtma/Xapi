@@ -89,10 +89,12 @@ sudo -u xapi nano .env   # ADMIN_TOKEN, ALLOW_QUERY_AUTH=0, ENABLE_RAW=0,
 
 ### 3. Pasang unit & enable (auto-run saat boot + auto-restart saat crash)
 
+Installer menyesuaikan path & user otomatis dari lokasi repo:
+
 ```bash
-sudo cp deploy/xapi.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now xapi
+sudo bash deploy/install-service.sh            # user = pemilik repo
+# deploy di /root (mode 700 → wajib service root)? paksa:
+# sudo bash deploy/install-service.sh root
 ```
 
 ### 4. Verifikasi + unlock PIN pertama
@@ -123,6 +125,13 @@ sudo systemctl restart xapi
 ```
 
 ### Catatan VPS
+
+- **Deploy di `/root`**: direktori `/root` ber-mode 700 sehingga service
+  non-root **tidak bisa membaca repo** — pakai `install-service.sh root`.
+  Berjalan sebagai root kurang aman (blast radius Chromium/Playwright lebih
+  besar); /opt + user khusus tetap lebih dianjurkan bila bisa.
+- Unit bersifat template — `install-service.sh` mengganti `WorkingDirectory`,
+  `HOME`, `User/Group`, `ExecStart` sesuai lokasi clone; jangan edit manual.
 
 - Unit bind `127.0.0.1:8000` — akses via SSH tunnel (`ssh -L 8000:127.0.0.1:8000 …`)
   atau nginx reverse proxy. `0.0.0.0` hanya jika wajib + firewall ketat.

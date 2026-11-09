@@ -10,6 +10,11 @@ cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"   # root repo
 echo "── git pull (ff-only)"
 git pull --ff-only origin main
 
+# HOME = repo: cache Chromium Playwright konsisten dengan Environment=HOME=
+# di unit systemd (tanpa ini, browser terinstal di /root/.cache tapi service
+# mencarinya di repo/.cache → "Executable doesn't exist").
+export HOME="$PWD"
+
 echo "── venv + dependencies"
 [ -d .venv ] || python3 -m venv .venv
 .venv/bin/pip install -q --upgrade pip

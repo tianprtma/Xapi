@@ -15,8 +15,29 @@ git pull --ff-only origin main
 # mencarinya di repo/.cache → "Executable doesn't exist").
 export HOME="$PWD"
 
-echo "── venv + dependencies"
-[ -d .venv ] || python3 -m venv .venv
+# ── Python 3.11 (wajib; override: PYTHON_BIN=python3.x bash deploy/deploy.sh)
+PYTHON_BIN="${PYTHON_BIN:-python3.11}"
+if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+    echo "ERROR: $PYTHON_BIN tidak ditemukan."
+    echo "  Ubuntu 22.04/24.04:"
+    echo "    sudo apt update && sudo apt install -y software-properties-common"
+    echo "    sudo add-apt-repository -y ppa:deadsnakes/ppa && sudo apt update"
+    echo "    sudo apt install -y python3.11 python3.11-venv"
+    echo "  Atau paksa versi lain: PYTHON_BIN=python3 bash deploy/deploy.sh"
+    exit 1
+fi
+EXPECTED_MM="$("$PYTHON_BIN" -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+echo "── venv + dependencies (python $EXPECTED_MM — $("$PYTHON_BIN" -V 2>&1))"
+
+# venv lama dengan versi berbeda → dibuat ulang (aman: hanya direktori venv)
+if [ -d .venv ] && [ -x .venv/bin/python ]; then
+    VENV_MM="$(.venv/bin/python -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo none)"
+    if [ "$VENV_MM" != "$EXPECTED_MM" ]; then
+        echo "   venv lama = Python $VENV_MM, target = $EXPECTED_MM → dibuat ulang"
+        rm -rf .venv
+    fi
+fi
+[ -d .venv ] || "$PYTHON_BIN" -m venv .venv
 .venv/bin/pip install -q --upgrade pip
 .venv/bin/pip install -q -r requirements.txt
 

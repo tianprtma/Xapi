@@ -13,8 +13,8 @@ Mirror endpoint X API v2 (`docs.x.com/x-api`) lewat cookie `auth_token`. Backend
 ## Setup
 
 ```bash
-# 1. virtualenv (Python 3.9+ — pin requirements sudah py3.9-compatible;
-#    di py>=3.10, versi lebih baru otomatis ter-install)
+# 1. virtualenv (Python 3.11 — deploy/deploy.sh memakai python3.11;
+#    minimal py3.9 didukung: PYTHON_BIN=python3 bash deploy/deploy.sh)
 uv venv --python 3.11
 source .venv/bin/activate
 
@@ -72,7 +72,12 @@ Kedua file ini ada di repo — tinggal clone di VPS.
 
 ```bash
 ssh user@vps-anda
-sudo apt update && sudo apt install -y git python3-venv python3-pip curl
+# python3.11 (deploy.sh memakai python3.11; override: PYTHON_BIN=python3)
+sudo apt update && sudo apt install -y git python3-venv python3-pip curl \
+    python3.11 python3.11-venv software-properties-common
+# bila python3.11 tidak ada di repo distro:
+#   sudo add-apt-repository -y ppa:deadsnakes/ppa && sudo apt update
+#   sudo apt install -y python3.11 python3.11-venv
 sudo useradd -r -m -d /opt/Xapi -s /usr/sbin/nologin xapi
 cd /opt/Xapi
 ```

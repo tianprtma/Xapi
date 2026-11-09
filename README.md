@@ -73,8 +73,8 @@ Kedua file ini ada di repo — tinggal clone di VPS.
 ```bash
 ssh user@vps-anda
 sudo apt update && sudo apt install -y git python3-venv python3-pip curl
-sudo useradd -r -m -d /opt/xapi -s /usr/sbin/nologin xapi
-cd /opt/xapi
+sudo useradd -r -m -d /opt/Xapi -s /usr/sbin/nologin xapi
+cd /opt/Xapi
 ```
 
 ### 2. Clone + deploy otomatis (venv, deps, Chromium, .env)
@@ -102,8 +102,8 @@ systemctl status xapi --no-pager
 curl -s http://127.0.0.1:8000/health
 journalctl -u xapi -f                   # log JSON live
 
-# Unlock PIN pertama (profil persist tersimpan di /opt/xapi/.xchat_profiles/)
-curl -s -H "Authorization: Bearer $(grep -oP '(?<=^TEST_AUTH_TOKEN=).{40}' /opt/xapi/.env)"      -H "X-DM-Pin: 1234"      "http://127.0.0.1:8000/2/chat/conversations?max_results=5"
+# Unlock PIN pertama (profil persist tersimpan di /opt/Xapi/.xchat_profiles/)
+curl -s -H "Authorization: Bearer $(grep -oP '(?<=^TEST_AUTH_TOKEN=).{40}' /opt/Xapi/.env)"      -H "X-DM-Pin: 1234"      "http://127.0.0.1:8000/2/chat/conversations?max_results=5"
 ```
 
 ### 5. Bukti auto-run: reboot VPS
@@ -118,7 +118,7 @@ curl -s http://127.0.0.1:8000/health
 ### 6. Update rutin
 
 ```bash
-sudo -u xapi bash /opt/xapi/deploy/deploy.sh   # git pull + deps + Chromium
+sudo -u xapi bash /opt/Xapi/deploy/deploy.sh   # git pull + deps + Chromium
 sudo systemctl restart xapi
 ```
 

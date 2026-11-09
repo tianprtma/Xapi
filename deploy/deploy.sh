@@ -37,6 +37,11 @@ if [ -d .venv ] && [ -x .venv/bin/python ]; then
         rm -rf .venv
     fi
 fi
+# .venv ada tapi TIDAK lengkap (tanpa bin/python) → bersihkan sebelum create
+if [ -d .venv ] && [ ! -x .venv/bin/python ]; then
+    echo "   .venv tidak lengkap (tanpa bin/python) → dibuat ulang"
+    rm -rf .venv
+fi
 [ -d .venv ] || "$PYTHON_BIN" -m venv .venv
 
 # File .venv bisa TERBENTUK TANPA pip bila paket python3.X-venv belum

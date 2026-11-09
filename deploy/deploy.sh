@@ -16,8 +16,16 @@ git pull --ff-only origin main
 export HOME="$PWD"
 
 # ── Python 3.11 (wajib; override: PYTHON_BIN=python3.x bash deploy/deploy.sh)
-PYTHON_BIN="${PYTHON_BIN:-python3.11}"
-if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+# PENTING: prefer /usr/bin/python3.11 (paket deadsnakes) — python3.11 di PATH
+# bisa saja build kustom tanpa modul ensurepip, yang membuat venv TANPA pip.
+if [ -z "${PYTHON_BIN:-}" ]; then
+    if [ -x /usr/bin/python3.11 ]; then
+        PYTHON_BIN=/usr/bin/python3.11
+    else
+        PYTHON_BIN=python3.11
+    fi
+fi
+if ! command -v "$PYTHON_BIN" >/dev/null 2>&1 && [ ! -x "$PYTHON_BIN" ]; then
     echo "ERROR: $PYTHON_BIN tidak ditemukan."
     echo "  Ubuntu 22.04/24.04:"
     echo "    sudo apt update && sudo apt install -y software-properties-common"
@@ -27,35 +35,46 @@ if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
     exit 1
 fi
 EXPECTED_MM="$("$PYTHON_BIN" -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
-echo "── venv + dependencies (python $EXPECTED_MM — $("$PYTHON_BIN" -V 2>&1))"
+echo "── venv + dependencies (python $EXPECTED_MM — $("$PYTHON_BIN" -V 2>&1); bin: $PYTHON_BIN)"
 
-# venv lama dengan versi berbeda → dibuat ulang (aman: hanya direktori venv)
-if [ -d .venv ] && [ -x .venv/bin/python ]; then
+# Modul ensurepip wajib ada agar pip masuk ke venv. Build kustom sering
+# tidak menyertakannya (gejala: venv terbuat tapi .venv/bin/pip tidak ada).
+if ! "$PYTHON_BIN" -c "import ensurepip" >/dev/null 2>&1; then
+    echo "   PERINGATAN: $PYTHON_BIN tidak punya modul ensurepip."
+    echo "   Coba /usr/bin/python3.11 (deadsnakes) atau install paket:"
+    echo "     sudo apt install -y python${EXPECTED_MM}-venv"
+fi
+
+# venv lama dengan versi berbeda / tanpa pip / tanpa bin/python → dibuat ulang
+if [ -d .venv ]; then
     VENV_MM="$(.venv/bin/python -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo none)"
     if [ "$VENV_MM" != "$EXPECTED_MM" ]; then
         echo "   venv lama = Python $VENV_MM, target = $EXPECTED_MM → dibuat ulang"
         rm -rf .venv
+    elif [ ! -x .venv/bin/python ]; then
+        echo "   .venv tidak lengkap (tanpa bin/python) → dibuat ulang"
+        rm -rf .venv
+    elif [ ! -x .venv/bin/pip ]; then
+        echo "   .venv ada tapi tanpa pip → dibuat ulang"
+        rm -rf .venv
     fi
-fi
-# .venv ada tapi TIDAK lengkap (tanpa bin/python) → bersihkan sebelum create
-if [ -d .venv ] && [ ! -x .venv/bin/python ]; then
-    echo "   .venv tidak lengkap (tanpa bin/python) → dibuat ulang"
-    rm -rf .venv
 fi
 [ -d .venv ] || "$PYTHON_BIN" -m venv .venv
 
-# File .venv bisa TERBENTUK TANPA pip bila paket python3.X-venv belum
-# terinstal (gejala: ".venv/bin/pip: No such file or directory"). Coba
-# ensurepip dulu; kalau tetap gagal, hapus venv parsial & beri instruksi.
+# Kalau masih tanpa pip: coba ensurepip di dalam venv, lalu diagnosa jelas.
 if [ ! -x .venv/bin/pip ]; then
     echo "   pip belum ada di venv — mencoba ensurepip…"
     .venv/bin/python -m ensurepip --upgrade >/dev/null 2>&1 || true
 fi
 if [ ! -x .venv/bin/pip ]; then
-    echo "ERROR: venv tidak memiliki pip — paket python3.$EXPECTED_MM-venv belum terinstal."
-    echo "  Perbaiki:"
-    echo "    sudo apt update && sudo apt install -y python3.${EXPECTED_MM}-venv"
-    echo "    (Ubuntu 24.04 / tanpa repo 3.11: lihat deadsnakes di README)"
+    echo "ERROR: venv tidak memiliki pip."
+    echo "  Diagnosa:"
+    echo "    command -v $PYTHON_BIN"
+    echo "    $PYTHON_BIN -c 'import ensurepip; print(\"ensurepip OK\")'"
+    echo "  Perbaiki (paket venv untuk Python $EXPECTED_MM):"
+    echo "    sudo apt update && sudo apt install -y python${EXPECTED_MM}-venv"
+    echo "  Lalu ulangi dengan interpreter apt:"
+    echo "    PYTHON_BIN=/usr/bin/python3.11 bash deploy/deploy.sh"
     rm -rf .venv   # buang venv parsial agar run berikutnya bersih
     exit 1
 fi

@@ -190,6 +190,23 @@ def _has_gql_dm_data(result: dict[str, Any]) -> bool:
     return True
 
 
+def _xchat_inbox_variables(pagination_token: str, max_results: int) -> dict[str, Any]:
+    """Variables `GetInboxPageRequestQuery` dari token halaman sebelumnya.
+
+    Token format: '<cursor_id>' atau '<cursor_id>|<graph_snapshot_id>'.
+    graph_snapshot_id wajib ikut — tanpa itu X mengabaikan kursor dan halaman
+    berikutnya mengulang halaman pertama (pagination tidak pernah maju)."""
+    cursor: dict[str, Any] = {"cursor_id": pagination_token}
+    if "|" in pagination_token:
+        cid, snap = pagination_token.split("|", 1)
+        cursor = {"cursor_id": int(cid) if cid.isdigit() else cid}
+        if snap:
+            cursor["graph_snapshot_id"] = snap
+    elif pagination_token.isdigit():
+        cursor = {"cursor_id": int(pagination_token)}
+    return {"continue_cursor": cursor, "count": max_results}
+
+
 def _format_dm_events_smart(
     payload: dict[str, Any],
     event_types: Optional[str] = None,
@@ -418,7 +435,7 @@ async def v2_chat_conversations(
         if pagination_token:
             result = await graphql_call(
                 "GetInboxPageRequestQuery",
-                {"continue_cursor": {"cursor_id": pagination_token}, "count": max_results},
+                _xchat_inbox_variables(pagination_token, max_results),
                 tok,
             )
         else:
@@ -437,7 +454,9 @@ async def v2_chat_conversations(
     if mode.lower() == "rest" or (mode.lower() == "auto"):
         params: dict[str, Any] = {}
         if pagination_token:
-            params["cursor"] = pagination_token
+            # Token XChat bisa 'cursor_id|graph_snapshot_id' — REST 1.1 hanya
+            # paham bagian cursor_id-nya.
+            params["cursor"] = pagination_token.split("|", 1)[0]
         rest_res = await dm_call("dm/user_updates.json", tok, params=params)
         if rest_res.get("status") == "ok":
             if _has_gql_dm_data(result) and isinstance(result.get("data"), dict) and isinstance(rest_res.get("data"), dict):
@@ -648,7 +667,7 @@ async def v2_dm_events(
         if pagination_token:
             result = await graphql_call(
                 "GetInboxPageRequestQuery",
-                {"continue_cursor": {"cursor_id": pagination_token}, "count": max_results},
+                _xchat_inbox_variables(pagination_token, max_results),
                 tok,
             )
         else:
@@ -684,7 +703,9 @@ async def v2_dm_events(
     if mode.lower() == "rest" or (mode.lower() == "auto"):
         params: dict[str, Any] = {}
         if pagination_token:
-            params["cursor"] = pagination_token
+            # Token XChat bisa 'cursor_id|graph_snapshot_id' — REST 1.1 hanya
+            # paham bagian cursor_id-nya.
+            params["cursor"] = pagination_token.split("|", 1)[0]
         rest_res = await dm_call("dm/user_updates.json", tok, params=params)
         if rest_res.get("status") == "ok" and include_requests:
             rest_data = dict(rest_res.get("data") or {})

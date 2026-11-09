@@ -1485,7 +1485,18 @@ def _extract_gql_dm_conversations_and_events(
         for cur_key in ("inboxCursor", "next_cursor", "cursor", "continue_cursor", "bottom_cursor"):
             c_val = container.get(cur_key)
             if isinstance(c_val, dict):
-                c_val = c_val.get("cursor_id") or c_val.get("value") or c_val.get("next_cursor")
+                c_id = c_val.get("cursor_id")
+                if c_id is None:
+                    c_id = c_val.get("value") or c_val.get("next_cursor")
+                if c_id is not None and not next_token:
+                    # Kursor XChat wajib dipasangkan graph_snapshot_id — tanpa itu
+                    # X mengabaikan kursor dan halaman berikutnya mengulang
+                    # halaman pertama (pagination inbox tidak pernah maju).
+                    snap = c_val.get("graph_snapshot_id")
+                    token = str(c_id)
+                    if snap:
+                        token = f"{token}|{snap}"
+                    next_token = token
             if isinstance(c_val, str) and c_val and not next_token:
                 next_token = c_val
 

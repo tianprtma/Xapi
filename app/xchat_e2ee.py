@@ -490,6 +490,20 @@ async def unlock_and_read_xchat_conversation(
             # If PIN redirect sent us to /i/chat main list, navigate to the specific conversation
             if norm_conv_id not in page.url:
                 await page.goto(url, wait_until="domcontentloaded", timeout=25000)
+            # Guard anti salah-percakapan: setelah redirect PIN, URL WAJIB menunjuk
+            # ke percakapan yang diminta. Kalau masih meleset (tab terbuka
+            # percakapan lain), jangan baca apa pun — mencegah pesan dari
+            # percakapan yang salah berpasangan ke placeholder inbox.
+            for _gu in range(2):
+                if norm_conv_id not in page.url:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=25000)
+                    await asyncio.sleep(1.0)
+            if norm_conv_id not in page.url:
+                log.warning(
+                    "unlock_and_read_xchat_conversation: URL tidak mengarah ke %s (actual: %s) — dibatalkan",
+                    norm_conv_id, page.url,
+                )
+                return []
 
             # Wait for message rows to render
             try:
@@ -716,6 +730,14 @@ async def send_xchat_dm_via_browser(
 
             if norm_conv_id not in page.url:
                 await page.goto(url, wait_until="domcontentloaded", timeout=25000)
+            # Guard anti salah-percakapan: jangan kirim kalau URL tidak menunjuk
+            # ke percakapan yang dituju (PIN redirect bisa mendarat di chat lain).
+            for _gu in range(2):
+                if norm_conv_id not in page.url:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=25000)
+                    await asyncio.sleep(1.0)
+            if norm_conv_id not in page.url:
+                return {"status": "error", "error": f"Browser tidak berada di percakapan {norm_conv_id}"}
 
             await page.wait_for_function(
                 """(sel) => {

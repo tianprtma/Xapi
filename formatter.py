@@ -1702,6 +1702,12 @@ def format_dm_events(
                 ev["participant_ids"] = convs_map[cid]["participant_ids"]
             elif "-" in cid and all(p.isdigit() for p in cid.split("-")):
                 ev["participant_ids"] = cid.split("-")
+        # Bendera kepercayaan percakapan — bot butuh ini untuk tahu DM mana yang
+        # masih di Message Requests (trusted=False) dan perlu di-approve.
+        if cid and "trusted" not in ev:
+            t = convs_map.get(cid, {}).get("trusted")
+            if t is not None:
+                ev["trusted"] = t
         for att in ev.get("_xapi_attachments") or []:
             if isinstance(att, dict) and att.get("media_id"):
                 m_v2 = _dm_media_v2_obj(att)

@@ -572,10 +572,11 @@ async def v2_chat_requests(
     result = await graphql_call("GetMessageRequestsPageQuery", variables, tok)
 
     # Also query REST 1.1 untrusted & untrusted_low_quality timelines so plaintext requests are included
-    params: dict[str, Any] = {"max_id": pagination_token} if pagination_token else {}
+    # max_id WAJIB hadir (nilai None diterima) — tanpa key ini X menolak 400.
+    params: dict[str, Any] = {"max_id": pagination_token}
     rest_res = await dm_call("dm/inbox_timeline/untrusted.json", tok, params=params)
     if rest_res.get("status") == "ok" and include_low_quality and not pagination_token:
-        lq_res = await dm_call("dm/inbox_timeline/untrusted_low_quality.json", tok)
+        lq_res = await dm_call("dm/inbox_timeline/untrusted_low_quality.json", tok, params={"max_id": None})
         if lq_res.get("status") == "ok":
             rest_data = dict(rest_res.get("data") or {})
             base_tl = dict(rest_data.get("inbox_timeline") or {})
@@ -718,7 +719,10 @@ async def v2_dm_events(
                 ("dm/inbox_timeline/untrusted.json", untrusted_tl.get("min_entry_id")),
                 ("dm/inbox_timeline/untrusted_low_quality.json", None),
             ]:
-                extra_params: dict[str, Any] = {"max_id": max_id} if max_id else {}
+                # max_id WAJIB ada di query — tanpa key ini REST X menolak 400
+                # "max_id missing from request" dan message request tak pernah
+                # ikut terformat (nilai None diterima X).
+                extra_params: dict[str, Any] = {"max_id": max_id}
                 extra = await dm_call(tl_path, tok, params=extra_params)
                 if extra.get("status") != "ok":
                     continue

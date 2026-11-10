@@ -527,6 +527,18 @@ async def unlock_and_read_xchat_conversation(
                 """async ({convId, myId, peerId}) => {
                     const host = document.querySelector('[data-testid="xchatEmbedRoute"]');
                     const root = host?.shadowRoot || document;
+                    // Virtualisasi XChat: baris lama (termasuk baris foto) hanya
+                    // dimaterialisasi setelah di-scroll. Scroll dulu ke bawah-atas
+                    // sebelum snapshot supaya lampiran pesan lama tidak hilang.
+                    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+                    const scroller = [...root.querySelectorAll('*')]
+                        .filter(el => el.scrollHeight > el.clientHeight + 300)
+                        .sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight))[0];
+                    if (scroller) {
+                        scroller.scrollTop = scroller.scrollHeight; await sleep(700);
+                        scroller.scrollTop = 0; await sleep(700);
+                        scroller.scrollTop = scroller.scrollHeight; await sleep(400);
+                    }
                     const rows = [...root.querySelectorAll('[data-dm-message-row]')];
                     const results = [];
 
@@ -568,9 +580,10 @@ async def unlock_and_read_xchat_conversation(
                         const hrefs = [...new Set([...row.querySelectorAll('a[href]')].map(a => a.href).filter(Boolean))];
                         const statusLinks = hrefs.filter(h => /\\/status\\/\\d+/.test(h));
 
-                        // Extract images from recent message rows (last 6 rows to cover split content + attachment rows and status rows)
+                        // Extract images from message rows (batas 4 per pesan; semua baris
+                        // yang termaterialisasi, bukan hanya 6 baris terakhir)
                         const imageDataUrls = [];
-                        if (idx >= rows.length - 6) {
+                        if (true) {
                             const imgs = [...row.querySelectorAll('img[src]')].filter(
                                 img => img.src.startsWith('blob:') || img.src.includes('ton.x.com') || img.src.includes('ton.twimg.com')
                             );

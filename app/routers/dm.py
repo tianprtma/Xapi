@@ -1164,14 +1164,25 @@ async def v2_dm_send(
     result = await dm_call("dm/new2.json", tok, method="POST", json_body=payload, with_dm_defaults=False)
     if raw:
         return wrap(result)
-    if result["status"] != "ok":
+    if result["status"] == "ok":
+        send_data = format_dm_send_result(result.get("data") or {})
+        if (send_data.get("data") or {}).get("dm_event_id"):
+            return JSONResponse(status_code=201, content=send_data)
+        # REST 200 TANPA event = X menelan kiriman (umum pada percakapan XChat
+        # E2EE): notifikasinya sukses tapi pesan tak pernah sampai. Fallback ke
+        # browser bila PIN tersedia.
         if pin:
             conv_id = dm_conv_id_for(me, participant_id)
             pw_res = await send_xchat_dm_via_browser(tok, pin, conv_id, body.text)
             if pw_res.get("status") == "ok":
                 return JSONResponse(status_code=201, content={"data": pw_res.get("data")})
         return write_finalize(result, raw=False)
-    return JSONResponse(status_code=201, content=format_dm_send_result(result.get("data") or {}))
+    if pin:
+        conv_id = dm_conv_id_for(me, participant_id)
+        pw_res = await send_xchat_dm_via_browser(tok, pin, conv_id, body.text)
+        if pw_res.get("status") == "ok":
+            return JSONResponse(status_code=201, content={"data": pw_res.get("data")})
+    return write_finalize(result, raw=False)
 
 
 @router.post("/2/dm_conversations/{conversation_id}/messages")
@@ -1212,13 +1223,21 @@ async def v2_dm_send_to_conv(
     result = await dm_call("dm/new2.json", tok, method="POST", json_body=payload, with_dm_defaults=False)
     if raw:
         return wrap(result)
-    if result["status"] != "ok":
+    if result["status"] == "ok":
+        send_data = format_dm_send_result(result.get("data") or {})
+        if (send_data.get("data") or {}).get("dm_event_id"):
+            return JSONResponse(status_code=201, content=send_data)
+        # REST 200 tanpa event = kiriman ditelan X (XChat E2EE) — coba browser.
         if pin:
             pw_res = await send_xchat_dm_via_browser(tok, pin, norm_conv_id, body.text)
             if pw_res.get("status") == "ok":
                 return JSONResponse(status_code=201, content={"data": pw_res.get("data")})
         return write_finalize(result, raw=False)
-    return JSONResponse(status_code=201, content=format_dm_send_result(result.get("data") or {}))
+    if pin:
+        pw_res = await send_xchat_dm_via_browser(tok, pin, norm_conv_id, body.text)
+        if pw_res.get("status") == "ok":
+            return JSONResponse(status_code=201, content={"data": pw_res.get("data")})
+    return write_finalize(result, raw=False)
 
 
 @router.delete("/2/dm_events/{event_id}")

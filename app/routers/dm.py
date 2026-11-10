@@ -7,6 +7,7 @@ in main.py via `app.include_router`.
 
 from __future__ import annotations
 
+import json
 import secrets
 from typing import Any, Optional
 
@@ -173,6 +174,31 @@ async def v2_chat_media_init() -> JSONResponse:
 @router.post("/2/chat/media/upload/{media_id}/append")
 async def v2_chat_media_append(media_id: str = PathParam(..., pattern=r"^\d+$")) -> JSONResponse:
     return stub_501(feature="chat_media_append", reason=OAUTH2_USER_CTX_REASON)
+
+
+def _xchat_requests_variables(pagination_token: Optional[str], max_results: int) -> dict[str, Any]:
+    """Variables `GetMessageRequestsPageQuery`.
+
+    Kursor halaman pertama wajib `{"descending": true}` (kursor XChat untuk
+    halaman request berbeda dari inbox utama: tidak memakai graph_snapshot_id).
+    Token lanjutan dari formatter = JSON `{"cursor_id": str, "descending": bool}`.
+    """
+    cursor: dict[str, Any] = {"descending": True}
+    if pagination_token:
+        tok = pagination_token.strip()
+        if tok.startswith("{"):
+            try:
+                parsed = json.loads(tok)
+                if isinstance(parsed, dict) and parsed.get("cursor_id") is not None:
+                    cursor = {
+                        "cursor_id": str(parsed["cursor_id"]),
+                        "descending": parsed.get("descending") is not False,
+                    }
+            except ValueError:
+                pass
+        else:
+            cursor = {"cursor_id": str(tok), "descending": True}
+    return {"cursor": cursor, "count": max_results}
 
 
 def _has_gql_dm_data(result: dict[str, Any]) -> bool:
@@ -565,11 +591,11 @@ async def v2_chat_requests(
     (& `dm/inbox_timeline/untrusted_low_quality.json`).
     """
     tok = extract_bearer(authorization, auth_token)
-    variables: dict[str, Any] = {"count": max_results}
-    if pagination_token:
-        variables["cursor"] = pagination_token
-
-    result = await graphql_call("GetMessageRequestsPageQuery", variables, tok)
+    result = await graphql_call(
+        "GetMessageRequestsPageQuery",
+        _xchat_requests_variables(pagination_token, max_results),
+        tok,
+    )
 
     # Also query REST 1.1 untrusted & untrusted_low_quality timelines so plaintext requests are included
     # max_id WAJIB hadir (nilai None diterima) — tanpa key ini X menolak 400.
@@ -690,7 +716,7 @@ async def v2_dm_events(
             # di halaman berikutnya (duplikat antar halaman).
             req_res = await graphql_call(
                 "GetMessageRequestsPageQuery",
-                {"count": max_results},
+                _xchat_requests_variables(None, max_results),
                 tok,
             )
             if _has_gql_dm_data(req_res):

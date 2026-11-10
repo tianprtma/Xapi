@@ -10,6 +10,7 @@ Spec: https://docs.x.com/x-api/introduction
 
 from __future__ import annotations
 
+import json
 from typing import Any, Optional
 
 
@@ -1445,7 +1446,14 @@ def _extract_gql_dm_conversations_and_events(
                     _collect_conv(c)
 
         # 3. Messages / events list / slice
-        for msg_key in ("messages", "message_events", "events", "entries", "items"):
+        for msg_key in (
+            "messages",
+            "message_events",
+            "events",
+            "entries",
+            "items",
+            "message_request_items",
+        ):
             msgs_node = container.get(msg_key)
             if isinstance(msgs_node, dict):
                 s_info = msgs_node.get("slice_info") or msgs_node.get("page_info") or {}
@@ -1466,6 +1474,24 @@ def _extract_gql_dm_conversations_and_events(
                     continue
                 if not isinstance(item, dict):
                     continue
+                # Item tipe XChatMessageRequestItem: percakapan message request
+                # berisi event ter-encode thrift (belum tentu menang status
+                # trusted=False di maps lain — tandai eksplisit).
+                if item.get("latest_message_events") is not None or item.get("encoded_message_create_event") is not None:
+                    rid = str(item.get("conversation_id") or "").replace(":", "-")
+                    if rid:
+                        _collect_conv({"conversation_id": rid, "trusted": False})
+                    for lm in item.get("latest_message_events") or []:
+                        if isinstance(lm, str):
+                            ev_obj = _decode_xchat_thrift_event(lm, default_conv_id=rid or default_cid)
+                            if ev_obj:
+                                events.append(ev_obj)
+                    single = item.get("encoded_message_create_event")
+                    if isinstance(single, str):
+                        ev_obj = _decode_xchat_thrift_event(single, default_conv_id=rid or default_cid)
+                        if ev_obj:
+                            events.append(ev_obj)
+                    continue
                 node = item.get("node") if "node" in item and isinstance(item["node"], dict) else item
                 # XChatGetInboxPageConversationData has `conversation_detail` + `latest_message_events`
                 if "conversation_detail" in node or node.get("__typename") == "XChatGetInboxPageConversationData":
@@ -1480,6 +1506,25 @@ def _extract_gql_dm_conversations_and_events(
                 ev_obj = _gql_dm_event_to_obj(node, default_conv_id=default_cid, users_by_id=users_by_id)
                 if ev_obj:
                     events.append(ev_obj)
+
+        # 4b. Kursor halaman message requests: XChatGetMessageRequestsPageContinueCursor
+        #     memakai {cursor_id: str, descending: bool} — TANPA graph_snapshot_id,
+        #     berbeda dari kursor inbox utama (lihat di bawah).
+        if container.get("__typename") == "XChatGetMessageRequestsPageResponse":
+            rc = container.get("cursor")
+            if (
+                isinstance(rc, dict)
+                and rc.get("__typename") == "XChatGetMessageRequestsPageContinueCursor"
+                and rc.get("cursor_id")
+            ):
+                next_token = json.dumps(
+                    {
+                        "cursor_id": str(rc["cursor_id"]),
+                        "descending": rc.get("descending") is not False,
+                    },
+                    separators=(",", ":"),
+                )
+            continue
 
         # 4. Cursors / pagination
         for cur_key in ("inboxCursor", "next_cursor", "cursor", "continue_cursor", "bottom_cursor"):

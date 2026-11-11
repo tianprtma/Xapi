@@ -297,7 +297,7 @@ async def unlock_and_read_xchat_inbox(
                 await asyncio.sleep(2.0)
 
             collected: dict[str, dict[str, Any]] = {}
-            max_scrolls = 4
+            max_scrolls = int(os.environ.get("XCHAT_INBOX_MAX_SCROLLS", "30"))
 
             for scroll_idx in range(max_scrolls):
                 batch = await page.evaluate(

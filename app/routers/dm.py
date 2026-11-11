@@ -497,10 +497,10 @@ async def v2_chat_conversations(
 
     formatted = _format_dm_conversations_smart(result.get("data") or {}, max_results=max_results)
     convs = formatted.get("data") or []
-    needs_e2ee = pin and (
-        not convs
-        or any(((c.get("last_message_event") or {}).get("_xchat_encrypted")) for c in convs if isinstance(c, dict))
-    )
+    # Sidebar XChat (browser, +PIN) adalah satu-satunya sumber yang memuat
+    # percakapan E2EE yang TIDAK pernah muncul di inbox GraphQL. Selama PIN
+    # diberikan, penelepon sudah menanggung biaya browser — selalu gabungkan.
+    needs_e2ee = bool(pin)
     if needs_e2ee and pin:
         me = await resolve_me_id(tok)
         inbox_items = await unlock_and_read_xchat_inbox(tok, pin, my_user_id=me, max_results=max_results)

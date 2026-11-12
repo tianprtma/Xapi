@@ -21,11 +21,15 @@ Xapi is a FastAPI server that mirrors the X API v2 using a logged-in browser coo
 
 ## Before calling the API
 
-1. Confirm the server is reachable: `curl -s "$XAPI_BASE_URL/info"`.
+1. Confirm the server is reachable AND subsystems ready:
+   `curl -s "$XAPI_BASE_URL/health"` — `{"healthy":true,...}` awaited; `playwright: connected`
+   is required for XChat E2EE and search fallbacks. (`/info` = metadata only.)
 2. Get the token from the user or env `XAPI_TOKEN` (40 lowercase hex chars, the `auth_token`
    cookie value from `x.com`). Never invent a token.
-3. If the server is not running and you have this repo, start it:
-   `uvicorn main:app --host 127.0.0.1 --port 8000` (see `README.md` for setup).
+3. If the server is not running and you have this repo, start it locally:
+   `uvicorn main:app --host 127.0.0.1 --port 8000 --no-access-log` (query strings carry
+   `dm_pin`/`auth_token`; `--no-access-log` keeps them out of logs). For a production
+   VPS, use the repo's deploy scripts — see "Server operations" below.
 
 ## Authentication
 
@@ -124,6 +128,19 @@ E2EE events carry non-spec fields: `_xchat_decrypted`, `is_outgoing`, `_xapi_att
 + media-to-disk in one process. Requires deps + Chromium (see `README.md`). Never print the PIN
 or the token in command output.
 
+## Server operations (deploy & diagnostics)
+
+- VPS deploy + systemd auto-start: `deploy/deploy.sh` (venv Python 3.11 + deps + Chromium) then
+  `sudo bash deploy/install-service.sh [root]` — see README "Deploy VPS" for the full runbook.
+  Unit binds 127.0.0.1:8000 with `Restart=always`; deployment profile example for bots:
+  `deploy/env.menfessllm.example`.
+- Server platform enforced: Python 3.11 (`PYTHON_BIN` override), single worker
+  (`WEB_CONCURRENCY=1`) — in-memory caches are per-worker.
+- Diagnostics: `GET /admin/stats` (header `X-Admin-Token`, hidden 404 without it) — session
+  cache, TID provider, client pool, response cache, rate limiter, xchat_context_pool, routes.
+- Never run `fetch_dm_pin.py` and the server for the same account at the same time: the
+  persistent XChat profile is single-process per account.
+
 ## Write safety
 
 - Writes are real and public. Confirm with the user before posting, deleting, following, blocking,
@@ -146,6 +163,9 @@ or the token in command output.
 | `XChat profile '<hash>' gagal dibuka` | Persistent profile locked by another process (server + `fetch_dm_pin.py` together) — close one, or set a different `XCHAT_PROFILE_DIR` |
 | `STUB_NOT_IMPLEMENTED` / 501 | Feature needs OAuth2 or an undiscovered GraphQL op |
 | `RATE_LIMIT_EXCEEDED` | Wait for `retry_after`, then retry |
+| `UPSTREAM_ERROR` / 502 | X upstream failing (rate limit/outage) — retry later, do not hammer |
+| `/health` shows `playwright: disconnected` | E2EE + browser fallbacks unavailable — set `PLAYWRIGHT_ENABLED=1` + `playwright install chromium`, restart service |
+| `/health` `healthy:false` on a VPS | Check `journalctl -u xapi` / run `deploy/deploy.sh` — service restart auto via systemd |
 
 For full endpoint tables and request bodies, read
 [references/endpoints.md](references/endpoints.md). For runnable snippets, read

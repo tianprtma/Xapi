@@ -11,162 +11,128 @@ description: >-
 
 # Xapi — X (Twitter) Cookie API
 
-Xapi is a FastAPI server that mirrors the X API v2 using a logged-in browser cookie
-(`auth_token`) instead of OAuth2. Responses follow the X API v2 shape.
+FastAPI mirror of X API v2 via cookie `auth_token`. Responses = official v2 shape.
+Default base: `http://127.0.0.1:8000` (override `XAPI_BASE_URL`).
 
-- Default base URL: `http://127.0.0.1:8000` (override with `XAPI_BASE_URL`)
-- Full route list (source of truth): `GET /openapi.json`, Swagger at `/docs`, docs UI at `/`
-- Detailed endpoint catalog: [references/endpoints.md](references/endpoints.md)
-- Copy-paste examples: [references/examples.md](references/examples.md)
-
-## Before calling the API
-
-1. Confirm the server is reachable AND subsystems ready:
-   `curl -s "$XAPI_BASE_URL/health"` — `{"healthy":true,...}` awaited; `playwright: connected`
-   is required for XChat E2EE and search fallbacks. (`/info` = metadata only.)
-2. Get the token from the user or env `XAPI_TOKEN` (40 lowercase hex chars, the `auth_token`
-   cookie value from `x.com`). Never invent a token.
-3. If the server is not running and you have this repo, start it locally:
-   `uvicorn main:app --host 127.0.0.1 --port 8000 --no-access-log` (query strings carry
-   `dm_pin`/`auth_token`; `--no-access-log` keeps them out of logs). For a production
-   VPS, use the repo's deploy scripts — see "Server operations" below.
-
-## Authentication
-
-Always send the token in a header:
+**Cara membaca:** seksi 🚀 dan 📋 cukup untuk 90% task. Detail panjang:
+[references/endpoints.md](references/endpoints.md) (katalog) ·
+[references/examples.md](references/examples.md) (snippet). Route hidup: `GET /openapi.json`.
 
 ```bash
-curl -s -H "Authorization: Bearer $XAPI_TOKEN" "$XAPI_BASE_URL/2/users/me"
+B="$XAPI_BASE_URL"; H="Authorization: Bearer $XAPI_TOKEN"   # token 40 hex dari user/env — jangan reka
+curl -s "$B/health"            # probe SEKALI di awal; sukses call pertama = tak perlu diulang
+curl -s -H "$H" "$B/2/users/me"
 ```
 
-- Never put the token in the URL (`?auth_token=`) unless the user explicitly asks; it leaks in
-  access logs and may be disabled server-side (`AUTH_QUERY_DISABLED`).
-- Never print, log, or commit the token. Redact it in command output you show the user.
-
-Validate a token and get the current profile with `GET /login` or `GET /2/users/me`.
-
-## Conventions
-
-- **IDs are numeric strings.** Resolve a handle to an ID first:
-  `GET /2/users/by/username/{username}` → `data.id`. Most write endpoints need the numeric ID.
-- **Pagination:** pass `max_results` (1–100, default 20) and `pagination_token` from the previous
-  response's `meta.next_token`.
-- **Raw payloads:** add `?raw=1` only when debugging a formatter issue; it may be disabled
-  (`INFRA_RAW_DISABLED`).
-- **Read responses:** `{ "data": ..., "includes": {...}, "meta": { "result_count", "next_token" } }`.
-- **Errors:** non-2xx returns `{ "errors": [ { "code", "title", "detail", "type", "status" } ] }`.
-  Branch on `errors[0].code`, not on prose.
-- **Own-resource endpoints** (bookmarks, blocking, muting, home timeline, liked tweets) only work
-  for the authenticated user's own ID.
-
-## Typical flows
+## 🚀 Golden flows (1 tujuan = 1 perintah)
 
 ```bash
-B="$XAPI_BASE_URL"; H="Authorization: Bearer $XAPI_TOKEN"
+# Profilku / cari id user
+curl -s -H "$H" "$B/2/users/me"                            # → data.id = "me"
+curl -s -H "$H" "$B/2/users/by/username/elonmusk"          # → data.id
 
-# Me / resolve handle
-curl -s -H "$H" "$B/2/users/me"
-curl -s -H "$H" "$B/2/users/by/username/elonmusk"
-
-# User tweets / search / detail
+# Tweet user / 1 tweet / +balasan
 curl -s -H "$H" "$B/2/users/44196397/tweets?max_results=20"
-curl -s -H "$H" "$B/2/tweets/search/recent?query=bitcoin&type=Latest"
+curl -s -H "$H" "$B/2/tweets/1234567890"
 curl -s -H "$H" "$B/2/tweets/1234567890/detail"
 
-# Post, reply, quote
-curl -s -X POST -H "$H" -H "Content-Type: application/json" \
-  -d '{"text":"hello from Xapi"}' "$B/2/tweets"
+# Keyword
+curl -s -H "$H" "$B/2/tweets/search/recent?query=bitcoin&type=Latest"   # Latest|Top|Media|People
+
+# DM: daftar percakapan / isi (tambah -H "X-DM-Pin: 1234" bila E2EE)
+curl -s -H "$H" "$B/2/chat/conversations?max_results=20"
+curl -s -H "$H" "$B/2/dm_conversations/111-222/dm_events"               # conv = "<peer>-<me>"
+
+# Tulis: post / balas / quote
+curl -s -X POST -H "$H" -H "Content-Type: application/json" -d '{"text":"hello"}' "$B/2/tweets"
 curl -s -X POST -H "$H" -H "Content-Type: application/json" \
   -d '{"text":"replying","reply_to":"1234567890"}' "$B/2/tweets"
+curl -s -X POST -H "$H" -H "Content-Type: application/json" \
+  -d '{"text":"komentar","quote_tweet_id":"1234567890"}' "$B/2/tweets"
 
-# Like / retweet / follow (user_id = your own ID from /2/users/me)
+# Tulis: like / follow / kirim DM
 curl -s -X POST -H "$H" -H "Content-Type: application/json" \
   -d '{"tweet_id":"1234567890"}' "$B/2/users/$ME/likes"
 curl -s -X POST -H "$H" -H "Content-Type: application/json" \
   -d '{"target_user_id":"44196397"}' "$B/2/users/$ME/following"
-
-# Send a DM
 curl -s -X POST -H "$H" -H "Content-Type: application/json" \
-  -d '{"text":"hi"}' "$B/2/dm_conversations/with/44196397/messages"
+  -d '{"text":"halo"}' "$B/2/dm_conversations/with/44196397/messages"
+
+# Media: upload dulu → media_id → media_ids di POST /2/tweets (max 4)
+MEDIA_ID=$(curl -s -X POST -H "$H" "$B/2/media/upload?media_type=image/jpeg" \
+  --data-binary @foto.jpg | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['media_id'])")
 ```
 
-Media: `POST /2/media/upload?media_type=image/jpeg` with the raw file as the body, then pass the
-returned `data.media_id` in `media_ids` to `POST /2/tweets` (max 4). Video/GIF uses the same
-endpoint with chunked upload handled server-side.
+## 📋 Decision table (permintaan → endpoint)
 
-## XChat E2EE DMs (encrypted, `dm_pin`)
+| Permintaan | Endpoint | Catatan |
+|---|---|---|
+| siapa @handle / cari id | `GET /2/users/by/username/{handle}` | `data.id` dipakai untuk tulis |
+| banyak handle sekaligus | `GET /2/users/by?usernames=a,b` | 1 call, max 100 |
+| profil by id | `GET /2/users/{id}` | fallback cache/PW bila GraphQL gagal |
+| tweet terbaru user | `GET /2/users/{id}/tweets` | `max_results` 1-100 |
+| cari kata/tweet | `GET /2/tweets/search/recent?query=` | `type=Latest\|Top\|Media\|People` |
+| 1 tweet / +balasan | `GET /2/tweets/{id}` / `/{id}/detail` | relasi di `referenced_tweets` |
+| daftar DM | `GET /2/chat/conversations` (XChat) / `GET /2/dm_events` (v2) | E2EE: header `X-DM-Pin` |
+| isi 1 percakapan | `GET /2/dm_conversations/{conv}/dm_events` | `?dm_pin=`/header bila E2EE |
+| kirim DM | `POST /2/dm_conversations/with/{user_id}/messages` | body `{text}`; versi by-conv ada |
+| post/balas/quote | `POST /2/tweets` | `text` + `reply_to`/`quote_tweet_id`/`media_ids` |
+| like/unlike | `POST`·`DELETE /2/users/{me}/likes/{tweet_id}` | user_id = "me" |
+| follow/unfollow | `POST/DELETE /2/users/{me}/following/{target}` | body `{target_user_id}` |
+| upload media | `POST /2/media/upload?media_type=…` | body = bytes mentah |
+| trending | `GET /2/trends/by/woeid/1` | 1=worldwide |
+| lain (list/bookmark/note) | [endpoints.md](references/endpoints.md) | 501 = sengaja stub |
 
-Recent XChat DMs are end-to-end encrypted. Fetching plaintext requires the account's XChat PIN
-(4–8 digits) and `PLAYWRIGHT_ENABLED=1` on the server: Xapi opens `x.com/i/chat` in headless
-Chromium, unlocks with the PIN, and lets X's own JS decrypt. The browser profile persists per
-account (`.xchat_profiles/`) so the PIN is not re-typed every run — but X can re-serve the PIN
-gate at any time (server-controlled), so always pass `dm_pin` when the user provides one.
+## ⚡ Speed cheat-sheet
 
-**Never put the PIN in the query string in production** (`?dm_pin=` leaks in uvicorn/reverse-proxy
-access logs — proven in the 2026-11-08 audit). Use the `X-DM-Pin: <pin>` header instead — every
-XChat endpoint supports it.
+- **1 probe per sesi**: `/health` di awal; call API pertama sukses → lanjut tanpa cek ulang.
+- **Cache "me"**: `data.id` dari `/2/users/me` dipakai berulang — jangan login/resolve tiap task.
+- **Resolve handle 1×**: id-sama disimpan; multi-id via `/2/users/by?usernames=`.
+- **PIN hanya untuk DM E2EE**: jangan tanya `dm_pin` untuk tweet/lookup/follow. Tanya hanya saat
+  respons DM kosong/gate, atau memang diminta.
+- **Ekspektasi latensi** (sampaikan ke user): curl <1s · Playwright fallback 3-6s ·
+  E2EE unlock 10-20s pertama. Lambat ≠ error.
+- **Tulis = konfirmasi dulu, jangan retry agresif** (limit X: 344/226).
+- **`?raw=1`** hanya debug; produksi bisa mati (`INFRA_RAW_DISABLED`).
 
-```bash
-# XChat inbox (decrypted previews, unread flags) — header X-DM-Pin (production-safe)
-curl -s -H "$H" -H "X-DM-Pin: 1234" "$B/2/chat/conversations?max_results=20"
+## 🔑 Auth & respons
 
-# Full decrypted conversation (conversation id = "<peer>-<me>")
-curl -s -H "$H" -H "X-DM-Pin: 1234" \
-  "$B/2/dm_conversations/1394249284736864258-1831953836929638400/dm_events"
+- Token via header; jangan `?auth_token=` (log leak).
+- `{data}` / `{data, includes, meta:{result_count,next_token}}`; error branch di `errors[0].code`.
+- `pagination_token` = `meta.next_token`. ID = string angka.
 
-# DM media: plain DMs proxy ton.x.com (stateless, works anytime)
-curl -s -H "$H" "$B/2/dm_conversations/media/{dm_id}/{media_id}/{resource_id}" -o media.jpg
-# XChat E2EE media comes from the server's in-memory cache (TTL 15 min, images only) —
-# populated when the server itself runs the conversation flow above for that account.
-```
+## 🛑 Error fast-fail
 
-E2EE events carry non-spec fields: `_xchat_decrypted`, `is_outgoing`, `_xapi_attachments`
-(with `proxy_path`, `media_id`, `mime`), `status_links`. Treat them as best-effort extras.
-
-**Standalone script** (no server needed): `python3 fetch_dm_pin.py --pin 1234 [--save-media ./media]
-[--conversation <id>] [--scan-limit N] [--browser]` — login + inbox REST/GraphQL + browser E2EE
-+ media-to-disk in one process. Requires deps + Chromium (see `README.md`). Never print the PIN
-or the token in command output.
-
-## Server operations (deploy & diagnostics)
-
-- VPS deploy + systemd auto-start: `deploy/deploy.sh` (venv Python 3.11 + deps + Chromium) then
-  `sudo bash deploy/install-service.sh [root]` — see README "Deploy VPS" for the full runbook.
-  Unit binds 127.0.0.1:8000 with `Restart=always`; deployment profile example for bots:
-  `deploy/env.menfessllm.example`.
-- Server platform enforced: Python 3.11 (`PYTHON_BIN` override), single worker
-  (`WEB_CONCURRENCY=1`) — in-memory caches are per-worker.
-- Diagnostics: `GET /admin/stats` (header `X-Admin-Token`, hidden 404 without it) — session
-  cache, TID provider, client pool, response cache, rate limiter, xchat_context_pool, routes.
-- Never run `fetch_dm_pin.py` and the server for the same account at the same time: the
-  persistent XChat profile is single-process per account.
-
-## Write safety
-
-- Writes are real and public. Confirm with the user before posting, deleting, following, blocking,
-  muting, or sending DMs unless they already gave an explicit instruction.
-- X rate limits apply: code `344` = daily tweet limit, `226` = auth/automation rejection, `429` =
-  back off. Do not retry writes aggressively.
-- Some endpoints are intentional `501` stubs (XChat, Spaces buyers/creator lookups, public keys,
-  community search). Check [references/endpoints.md](references/endpoints.md) before promising them.
-
-## Troubleshooting
-
-| Symptom | Meaning / action |
+| Error code | Action |
 |---|---|
-| `AUTH_TOKEN_MISSING` | Add `Authorization: Bearer <token>` header |
-| `AUTH_TOKEN_INVALID_FORMAT` | Token must be 40 lowercase hex chars |
-| `AUTH_TOKEN_EXPIRED` | Cookie expired — user must re-copy `auth_token` from x.com |
-| `UPSTREAM_AUTH_REJECTED` | X rejected the session; token may be revoked |
-| Slow response (2–6s) | Endpoint is CF-gated and uses Playwright; that is expected |
-| XChat DMs return empty previews / gate warnings | PIN gate re-appeared (server-controlled) — ask the user for `dm_pin`, or retry with the pin once provided |
-| `XChat profile '<hash>' gagal dibuka` | Persistent profile locked by another process (server + `fetch_dm_pin.py` together) — close one, or set a different `XCHAT_PROFILE_DIR` |
-| `STUB_NOT_IMPLEMENTED` / 501 | Feature needs OAuth2 or an undiscovered GraphQL op |
-| `RATE_LIMIT_EXCEEDED` | Wait for `retry_after`, then retry |
-| `UPSTREAM_ERROR` / 502 | X upstream failing (rate limit/outage) — retry later, do not hammer |
-| `/health` shows `playwright: disconnected` | E2EE + browser fallbacks unavailable — set `PLAYWRIGHT_ENABLED=1` + `playwright install chromium`, restart service |
-| `/health` `healthy:false` on a VPS | Check `journalctl -u xapi` / run `deploy/deploy.sh` — service restart auto via systemd |
+| `AUTH_TOKEN_MISSING` / `AUTH_TOKEN_INVALID_FORMAT` | Berhenti — minta token 40-hex benar |
+| `AUTH_TOKEN_EXPIRED` / `UPSTREAM_AUTH_REJECTED` | Token mati — user ambil ulang dari x.com |
+| `RATE_LIMIT_EXCEEDED` | Tunggu `retry_after`; jangan paralel/hammer |
+| `UPSTREAM_ERROR` (502) | Upstream bermasalah — retry 1×, lalu lapor |
+| `STUB_NOT_IMPLEMENTED` (501) | Fitur tak tersedia — sampaikan, jangan janji |
+| `not_found` (404) | Periksa id/username/respons sebelumnya |
+| Gate PIN / DM E2EE kosong | Minta `dm_pin` user (4-8 digit) |
 
-For full endpoint tables and request bodies, read
-[references/endpoints.md](references/endpoints.md). For runnable snippets, read
-[references/examples.md](references/examples.md).
+## 🔐 XChat E2EE (hanya bila DM terenkripsi)
+
+- Dekripsi via Chromium server — `/health` harus `playwright: connected`
+  (`PLAYWRIGHT_ENABLED=1` + Chromium terinstal).
+- Produksi: PIN di **header** `X-DM-Pin: <pin>` — `?dm_pin=` bocor di log.
+- Profil persist per akun (`.xchat_profiles/`) → unlock tak diulang; X tetap bisa re-gate.
+- Extra fields: `_xchat_decrypted`, `is_outgoing`, `_xapi_attachments` (`proxy_path`), `status_links`.
+  Media E2EE dari cache server (TTL 15m, gambar saja); DM biasa proxy `ton.x.com`.
+- Tanpa server: `python3 fetch_dm_pin.py --pin 1234 [--save-media dir] [--conversation id]
+  [--scan-limit N] [--browser]`.
+
+## 🖥️ Server operations (ringkas — detail: README "Deploy VPS")
+
+- Deploy/update VPS: `deploy/deploy.sh` (venv py3.11 + deps + Chromium) lalu
+  `sudo bash deploy/install-service.sh [root]`; systemd auto-start.
+- Diagnostik: `GET /admin/stats` (header `X-Admin-Token`; 404 bila tak diset).
+- Satu akun = satu proses untuk profil XChat — jangan server + `fetch_dm_pin.py` barengan.
+
+## ✍️ Write safety
+
+Writes are real & public. Confirm before posting/deleting/following/blocking/DM kecuali
+sudah diperintah eksplisit. Sebagian endpoint 501 (OAuth2-only) — cek
+[endpoints.md](references/endpoints.md) sebelum menjanjikannya.

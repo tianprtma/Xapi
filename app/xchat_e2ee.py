@@ -562,9 +562,22 @@ async def unlock_and_read_xchat_conversation(
                         .filter(el => el.scrollHeight > el.clientHeight + 300)
                         .sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight))[0];
                     if (scroller) {
-                        scroller.scrollTop = scroller.scrollHeight; await sleep(700);
-                        scroller.scrollTop = 0; await sleep(700);
+                        scroller.scrollTop = scroller.scrollHeight; await sleep(600);
+                        let last = 0;
+                        // Materialisasi penuh: baris virtual hanya muncul saat
+                        // viewport menyentuh bagian tsb — jangkar di BAWAH lalu
+                        // naik bertahap ke ATAS sambil menunggu render, sampai
+                        // jumlah baris stabil. Tanpa ini, pesan ke-10+ hilang
+                        // dari snapshot dan tak pernah diproses bot.
+                        for (let i = 0; i < 14; i++) {
+                            scroller.scrollTop = Math.max(0, scroller.scrollHeight - (i + 1) * (scroller.clientHeight * 1.2));
+                            await sleep(320);
+                            const n = root.querySelectorAll('[data-dm-message-row]').length;
+                            if (n === last && n > 0 && i > 3) break;
+                            last = n;
+                        }
                         scroller.scrollTop = scroller.scrollHeight; await sleep(400);
+                        scroller.scrollTop = 0; await sleep(400);
                     }
                     const rows = [...root.querySelectorAll('[data-dm-message-row]')];
                     const results = [];

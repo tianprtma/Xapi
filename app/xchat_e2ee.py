@@ -426,17 +426,30 @@ async def unlock_and_read_xchat_inbox(
                 if len(collected) >= max_results:
                     break
 
-                # Scroll down
+                # Scroll down — scroller element bisa berubah antar versi X; pakai
+                # pencarian kandidat (bukan satu testid) agar daftar percakapan
+                # termaterialisasi penuh (kalau selector meleset, sidebar hanya
+                # memberi ~19 baris dan percakapan 'gelap' tak pernah terlihat).
                 scrolled = await page.evaluate(
                     """() => {
                         const host = document.querySelector('[data-testid="xchatEmbedRoute"]');
                         const root = host?.shadowRoot || document;
-                        const scroller = root.querySelector('[data-testid="dm-conversation-scroller"]');
-                        if (!scroller) return false;
-                        const prev = scroller.scrollTop;
-                        const max = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
-                        scroller.scrollTop = Math.min(max, prev + Math.max(400, scroller.clientHeight * 0.8));
-                        return scroller.scrollTop > prev;
+                        const candidates = [
+                            root.querySelector('[data-testid="dm-conversation-scroller"]'),
+                            root.querySelector('[data-testid="DM_ScrollerContainer"]'),
+                            ...root.querySelectorAll('[data-testid^="conversation" i]'),
+                            ...root.querySelectorAll('*'),
+                        ].filter(el => el && el.scrollHeight > el.clientHeight + 300);
+                        candidates.sort((a, b) =>
+                            (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight));
+                        const scrollerSet = new Set(candidates.slice(0, 6));
+                        for (const scroller of candidates.slice(0, 6)) {
+                            const prev = scroller.scrollTop;
+                            const max = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+                            scroller.scrollTop = Math.min(max, prev + Math.max(400, scroller.clientHeight * 0.8));
+                            if (scroller.scrollTop > prev) return true;
+                        }
+                        return false;
                     }"""
                 )
                 if not scrolled:

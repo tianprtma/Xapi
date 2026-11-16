@@ -383,9 +383,17 @@ async def _enrich_conv_events_with_e2ee(
     if not pin:
         return formatted
     events = formatted.get("data") or []
-    # Only invoke Playwright E2EE decryption if there are no events or the LATEST event (events[0]) is encrypted
-    latest_is_encrypted = bool(events and isinstance(events[0], dict) and events[0].get("_xchat_encrypted"))
-    if events and not latest_is_encrypted:
+    # Invoke Playwright E2EE decryption when any page event is still encrypted.
+    # A newer plaintext/outgoing event must not hide an older media-bearing DM.
+    has_encrypted_event = any(
+        isinstance(ev, dict)
+        and (
+            ev.get("_xchat_encrypted")
+            or (ev.get("text") or "").strip() == "[XChat E2EE Encrypted Message]"
+        )
+        for ev in events
+    )
+    if events and not has_encrypted_event:
         return formatted
 
     me = await resolve_me_id(tok)
@@ -409,7 +417,10 @@ async def _enrich_conv_events_with_e2ee(
         for ev in events:
             is_msg = ev.get("event_type") in (None, "MessageCreate")
             if is_msg:
-                if ev.get("_xchat_encrypted") and msg_idx < len(decrypted_events):
+                if (
+                    ev.get("_xchat_encrypted")
+                    or (ev.get("text") or "").strip() == "[XChat E2EE Encrypted Message]"
+                ) and msg_idx < len(decrypted_events):
                     d_ev = decrypted_events[msg_idx]
                     merged = {**ev, **d_ev, "id": ev.get("id") or d_ev.get("id")}
                     if str(ev.get("sender_id") or "").isdigit():

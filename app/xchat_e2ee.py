@@ -470,6 +470,59 @@ async def unlock_and_read_xchat_inbox(
                 await XChatContextPool.get().release(auth_token, context)
 
 
+def project_xchat_message_rows(
+    rows_data: list[dict[str, Any]], conversation_id: str, max_results: int = 50,
+) -> list[dict[str, Any]]:
+    """Project browser rows into events, retaining unresolved-media state."""
+    events: list[dict[str, Any]] = []
+    for idx, row in enumerate(rows_data):
+        ev_id = str(row.get("row_key") or f"{int(time.time() * 1000)}_{idx}")
+        event: dict[str, Any] = {
+            "id": ev_id,
+            "event_type": "MessageCreate",
+            "dm_conversation_id": conversation_id,
+            "sender_id": row.get("sender_id"),
+            "text": row.get("text"),
+            "created_at": row.get("created_at"),
+            "is_outgoing": bool(row.get("is_outgoing")),
+            "_xchat_decrypted": True,
+        }
+        hrefs = row.get("hrefs") or []
+        status_links = row.get("status_links") or []
+        if hrefs:
+            event["entities"] = {
+                "urls": [{"url": u, "expanded_url": u, "display_url": u} for u in hrefs]
+            }
+        if status_links:
+            event["status_links"] = status_links
+
+        attachments = []
+        for img_idx, data_url in enumerate(row.get("image_data_urls") or []):
+            cached = cache_e2ee_media(
+                data_url, key_hint=f"{conversation_id}_{ev_id}_{img_idx}"
+            )
+            if cached:
+                attachments.append(cached)
+        if attachments:
+            event["_xapi_attachments"] = attachments
+            event["attachments"] = {
+                "media_keys": [f"3_{att['media_id']}" for att in attachments]
+            }
+            event["_xchat_media_state"] = "ready"
+        elif row.get("media_pending"):
+            event["_xchat_media_pending"] = True
+            event["_xchat_media_state"] = "pending"
+        elif row.get("media_state") == "none":
+            event["_xchat_media_state"] = "none"
+        else:
+            event["_xchat_media_pending"] = True
+            event["_xchat_media_state"] = "pending"
+        events.append({key: value for key, value in event.items() if value is not None})
+
+    events.reverse()
+    return events[:max_results]
+
+
 async def unlock_and_read_xchat_conversation(
     auth_token: str,
     dm_pin: Optional[str],
@@ -583,18 +636,22 @@ async def unlock_and_read_xchat_conversation(
                     const results = [];
 
                     const blobToDataUrl = async (src) => {
-                        try {
-                            const r = await fetch(src);
-                            const blob = await r.blob();
-                            return await new Promise((resolve) => {
-                                const reader = new FileReader();
-                                reader.onloadend = () => resolve(reader.result);
-                                reader.onerror = () => resolve(null);
-                                reader.readAsDataURL(blob);
-                            });
-                        } catch {
-                            return null;
+                        for (let attempt = 0; attempt < 3; attempt++) {
+                            try {
+                                const r = await fetch(src);
+                                if (!r.ok) throw new Error(`media fetch ${r.status}`);
+                                const blob = await r.blob();
+                                const dataUrl = await new Promise((resolve) => {
+                                    const reader = new FileReader();
+                                    reader.onloadend = () => resolve(reader.result);
+                                    reader.onerror = () => resolve(null);
+                                    reader.readAsDataURL(blob);
+                                });
+                                if (dataUrl) return dataUrl;
+                            } catch { /* retry transient blob/materialization failures */ }
+                            if (attempt < 2) await sleep(300 * (attempt + 1));
                         }
+                        return null;
                     };
 
                     for (let idx = 0; idx < rows.length; idx++) {
@@ -620,22 +677,28 @@ async def unlock_and_read_xchat_conversation(
                         const hrefs = [...new Set([...row.querySelectorAll('a[href]')].map(a => a.href).filter(Boolean))];
                         const statusLinks = hrefs.filter(h => /\\/status\\/\\d+/.test(h));
 
-                        // Extract images from message rows (batas 4 per pesan; semua baris
-                        // yang termaterialisasi, bukan hanya 6 baris terakhir)
+                        // Attachment focus can appear before its image/blob URL.
+                        // Wait briefly per row; never silently downgrade a known
+                        // attachment to a text-only event.
+                        const relevantImg = (img) => img.src.startsWith('blob:') ||
+                            img.src.includes('ton.x.com') || img.src.includes('ton.twimg.com');
+                        let imgs = [...row.querySelectorAll('img[src]')].filter(relevantImg);
+                        for (let wait = 0; hasAttachmentFocus && imgs.length === 0 && wait < 5; wait++) {
+                            await sleep(300);
+                            imgs = [...row.querySelectorAll('img[src]')].filter(relevantImg);
+                        }
                         const imageDataUrls = [];
-                        if (true) {
-                            const imgs = [...row.querySelectorAll('img[src]')].filter(
-                                img => img.src.startsWith('blob:') || img.src.includes('ton.x.com') || img.src.includes('ton.twimg.com')
-                            );
-                            for (const img of imgs.slice(0, 4)) {
-                                const dataUrl = await blobToDataUrl(img.src);
-                                if (dataUrl) imageDataUrls.push(dataUrl);
-                            }
+                        for (const img of imgs.slice(0, 4)) {
+                            const dataUrl = await blobToDataUrl(img.src);
+                            if (dataUrl) imageDataUrls.push(dataUrl);
                         }
 
-                        // Skip completely empty divider/date rows
-                        const hasAnyImg = row.querySelectorAll('img[src]').length > 0;
-                        if (!text && imageDataUrls.length === 0 && statusLinks.length === 0 && !hasAnyImg) {
+                        // Skip completely empty divider/date rows, except a row
+                        // explicitly exposing X's attachment focus target.
+                        const hasAnyImg = imgs.length > 0;
+                        const mediaPending = (hasAttachmentFocus || hasAnyImg) && imageDataUrls.length === 0;
+                        if (!text && imageDataUrls.length === 0 && statusLinks.length === 0
+                            && !hasAnyImg && !hasAttachmentFocus) {
                             continue;
                         }
 
@@ -648,6 +711,9 @@ async def unlock_and_read_xchat_conversation(
                             hrefs,
                             status_links: statusLinks,
                             image_data_urls: imageDataUrls,
+                            media_pending: mediaPending,
+                            media_state: imageDataUrls.length > 0 ? 'ready' :
+                                (mediaPending ? 'pending' : (hasContentFocus && text ? 'none' : 'unknown')),
                             _has_attachment_only: hasAttachmentFocus && !hasContentFocus && !text,
                             _has_content_only: hasContentFocus && !hasAttachmentFocus && imageDataUrls.length === 0,
                         };
@@ -667,6 +733,7 @@ async def unlock_and_read_xchat_conversation(
                             prev.hrefs = [...new Set([...prev.hrefs, ...curItem.hrefs])];
                             prev.status_links = [...new Set([...prev.status_links, ...curItem.status_links])];
                             prev.image_data_urls = [...prev.image_data_urls, ...curItem.image_data_urls].slice(0, 4);
+                            prev.media_pending = prev.media_pending || curItem.media_pending;
                             prev._has_attachment_only = false;
                             prev._has_content_only = false;
                             continue;
@@ -679,44 +746,9 @@ async def unlock_and_read_xchat_conversation(
                 {"convId": norm_conv_id, "myId": my_user_id, "peerId": peer_id},
             )
 
-            events: list[dict[str, Any]] = []
-            for idx, r in enumerate(rows_data or []):
-                ev_id = str(r.get("row_key") or f"{ int(time.time() * 1000) }_{idx}")
-                ev_obj: dict[str, Any] = {
-                    "id": ev_id,
-                    "event_type": "MessageCreate",
-                    "dm_conversation_id": norm_conv_id,
-                    "sender_id": r.get("sender_id"),
-                    "text": r.get("text"),
-                    "created_at": r.get("created_at"),
-                    "is_outgoing": bool(r.get("is_outgoing")),
-                    "_xchat_decrypted": True,
-                }
-                hrefs = r.get("hrefs") or []
-                status_links = r.get("status_links") or []
-                if hrefs:
-                    ev_obj["entities"] = {
-                        "urls": [{"url": u, "expanded_url": u, "display_url": u} for u in hrefs]
-                    }
-                if status_links:
-                    ev_obj["status_links"] = status_links
-
-                img_data_urls = r.get("image_data_urls") or []
-                if img_data_urls:
-                    atts = []
-                    for i_idx, d_url in enumerate(img_data_urls):
-                        cached = cache_e2ee_media(d_url, key_hint=f"{norm_conv_id}_{ev_id}_{i_idx}")
-                        if cached:
-                            atts.append(cached)
-                    if atts:
-                        ev_obj["_xapi_attachments"] = atts
-                        ev_obj["attachments"] = {"media_keys": [f"3_{a['media_id']}" for a in atts]}
-
-                events.append({k: v for k, v in ev_obj.items() if v is not None})
-
-            # Return newest-first to match X API v2 dm_events ordering
-            events.reverse()
-            return events[:max_results]
+            return project_xchat_message_rows(
+                rows_data or [], norm_conv_id, max_results=max_results
+            )
         except Exception as exc:
             log.warning("unlock_and_read_xchat_conversation(%s) failed: %s", norm_conv_id, exc)
             return []

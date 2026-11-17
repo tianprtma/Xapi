@@ -380,20 +380,34 @@ async def _enrich_conv_events_with_e2ee(
     max_results: int = 50,
 ) -> dict[str, Any]:
     """If `pin` is available and the latest conversation event is encrypted (or events are empty), unlock via XChat E2EE resolver."""
-    if not pin:
-        return formatted
     events = formatted.get("data") or []
+    if not pin:
+        for ev in events:
+            if (
+                isinstance(ev, dict)
+                and ev.get("event_type") in (None, "MessageCreate")
+                and str(ev.get("id") or "")
+                and not str(ev.get("id") or "").isdigit()
+            ):
+                ev["_xchat_media_pending"] = True
+                ev["_xchat_media_state"] = "pending"
+        return formatted
     # Invoke Playwright E2EE decryption when any page event is still encrypted.
     # A newer plaintext/outgoing event must not hide an older media-bearing DM.
-    has_encrypted_event = any(
+    has_xchat_candidate = any(
         isinstance(ev, dict)
         and (
             ev.get("_xchat_encrypted")
             or (ev.get("text") or "").strip() == "[XChat E2EE Encrypted Message]"
+            or (
+                ev.get("event_type") in (None, "MessageCreate")
+                and str(ev.get("id") or "")
+                and not str(ev.get("id") or "").isdigit()
+            )
         )
         for ev in events
     )
-    if events and not has_encrypted_event:
+    if events and not has_xchat_candidate:
         return formatted
 
     me = await resolve_me_id(tok)
@@ -405,41 +419,92 @@ async def _enrich_conv_events_with_e2ee(
         max_results=max_results,
     )
     if not decrypted_events:
+        for ev in events:
+            if (
+                isinstance(ev, dict)
+                and ev.get("event_type") in (None, "MessageCreate")
+                and str(ev.get("id") or "")
+                and not str(ev.get("id") or "").isdigit()
+            ):
+                ev["_xchat_media_pending"] = True
+                ev["_xchat_media_state"] = "pending"
         return formatted
 
     # If we had no events at all, use decrypted DOM rows directly; otherwise merge aligned MessageCreate events
     if not events:
         new_events = decrypted_events[:max_results]
     else:
-        # Both `events` and `decrypted_events` are ordered newest-first; align MessageCreate events by message index
+        # Match exact event IDs first, including plaintext UUID rows with media
+        # pending. Positional fallback is reserved for encrypted placeholders;
+        # otherwise a split/outgoing DOM row can shift media onto the wrong DM.
         new_events = []
+        dec_by_id = {str(d.get("id")): d for d in decrypted_events if d.get("id")}
+        consumed_dec_ids: set[str] = set()
         msg_idx = 0
         for ev in events:
             is_msg = ev.get("event_type") in (None, "MessageCreate")
-            if is_msg:
-                if (
-                    ev.get("_xchat_encrypted")
-                    or (ev.get("text") or "").strip() == "[XChat E2EE Encrypted Message]"
-                ) and msg_idx < len(decrypted_events):
-                    d_ev = decrypted_events[msg_idx]
-                    merged = {**ev, **d_ev, "id": ev.get("id") or d_ev.get("id")}
-                    if str(ev.get("sender_id") or "").isdigit():
-                        merged["sender_id"] = ev["sender_id"]
-                        if me:
-                            merged["is_outgoing"] = str(ev["sender_id"]) == str(me)
-                    if ev.get("created_at"):
-                        merged["created_at"] = ev["created_at"]
-                    merged.pop("_xchat_encrypted", None)
-                    merged.pop("encrypted_text", None)
-                    new_events.append(merged)
-                else:
-                    new_events.append(ev)
-                msg_idx += 1
-            else:
+            if not is_msg:
                 new_events.append(ev)
-        # If GraphQL only returned the latest 1 message in conversation_timeline while DOM has older messages, append them
-        if msg_idx < len(decrypted_events) and len(new_events) < max_results:
-            new_events.extend(decrypted_events[msg_idx : msg_idx + (max_results - len(new_events))])
+                continue
+            eid = str(ev.get("id") or "")
+            is_encrypted = bool(
+                ev.get("_xchat_encrypted")
+                or (ev.get("text") or "").strip() == "[XChat E2EE Encrypted Message]"
+            )
+            d_ev = dec_by_id.get(eid) if eid else None
+            if d_ev is None and eid and not eid.isdigit() and not is_encrypted:
+                candidates = [
+                    d for d in decrypted_events
+                    if str(d.get("id") or "") not in consumed_dec_ids
+                    and not d.get("is_outgoing")
+                    and str(d.get("sender_id") or "") == str(ev.get("sender_id") or "")
+                    and (d.get("text") or "").strip() == (ev.get("text") or "").strip()
+                ]
+                if len(candidates) == 1:
+                    d_ev = candidates[0]
+            if d_ev is None and is_encrypted and msg_idx < len(decrypted_events):
+                d_ev = decrypted_events[msg_idx]
+            msg_idx += 1
+            is_uuid_candidate = bool(eid and not eid.isdigit())
+            if d_ev is None:
+                kept = dict(ev)
+                if is_uuid_candidate:
+                    kept["_xchat_media_pending"] = True
+                    kept["_xchat_media_state"] = "pending"
+                new_events.append(kept)
+                continue
+            merged = {**ev, **d_ev, "id": ev.get("id") or d_ev.get("id")}
+            if str(ev.get("sender_id") or "").isdigit():
+                merged["sender_id"] = ev["sender_id"]
+                if me:
+                    merged["is_outgoing"] = str(ev["sender_id"]) == str(me)
+            if ev.get("created_at"):
+                merged["created_at"] = ev["created_at"]
+            if ev.get("_xapi_attachments") and not merged.get("_xapi_attachments"):
+                merged["_xapi_attachments"] = ev["_xapi_attachments"]
+            media_pending = bool(
+                ev.get("_xchat_media_pending") or d_ev.get("_xchat_media_pending")
+            )
+            media_state = d_ev.get("_xchat_media_state")
+            if merged.get("_xapi_attachments"):
+                merged.pop("_xchat_media_pending", None)
+                merged["_xchat_media_state"] = "ready"
+            elif media_pending or (is_uuid_candidate and media_state != "none"):
+                merged["_xchat_media_pending"] = True
+                merged["_xchat_media_state"] = "pending"
+            else:
+                merged.pop("_xchat_media_pending", None)
+                if media_state == "none":
+                    merged["_xchat_media_state"] = "none"
+            merged.pop("_xchat_encrypted", None)
+            merged.pop("encrypted_text", None)
+            new_events.append(merged)
+            consumed_dec_ids.add(str(d_ev.get("id") or ""))
+        # Append only decrypted DOM rows not already represented by an exact
+        # GraphQL event. These may be older virtualized messages absent in page.
+        extras = [d for d in decrypted_events if str(d.get("id") or "") not in consumed_dec_ids]
+        if extras and len(new_events) < max_results:
+            new_events.extend(extras[: max_results - len(new_events)])
 
     formatted["data"] = new_events[:max_results]
     formatted["meta"] = {

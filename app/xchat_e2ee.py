@@ -60,8 +60,17 @@ def resolve_dm_pin(query_pin: Optional[str] = None, header_pin: Optional[str] = 
     return None
 
 
-def cache_e2ee_media(data_url: str, key_hint: str = "") -> Optional[dict[str, str]]:
-    """Store a base64 data URL from browser blob extraction into _E2EE_MEDIA_CACHE."""
+def cache_e2ee_media(
+    data_url: str,
+    key_hint: str = "",
+    *,
+    kind: str = "photo",
+    duration_ms: Optional[int] = None,
+    width: Optional[int] = None,
+    height: Optional[int] = None,
+    thumbnail_data_url: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    """Store browser-extracted E2EE media and return a safe proxy descriptor."""
     if not data_url or not data_url.startswith("data:"):
         return None
     try:
@@ -70,9 +79,11 @@ def cache_e2ee_media(data_url: str, key_hint: str = "") -> Optional[dict[str, st
         raw_bytes = base64.b64decode(b64_data)
     except Exception:
         return None
+    if not raw_bytes:
+        return None
 
+    kind = "video" if kind in ("video", "animated_gif") else "photo"
     now = time.time()
-    # Evict expired entries
     expired = [k for k, (_, _, ts) in _E2EE_MEDIA_CACHE.items() if now - ts > _E2EE_MEDIA_TTL]
     for k in expired:
         _E2EE_MEDIA_CACHE.pop(k, None)
@@ -80,20 +91,42 @@ def cache_e2ee_media(data_url: str, key_hint: str = "") -> Optional[dict[str, st
         oldest_key = min(_E2EE_MEDIA_CACHE.items(), key=lambda kv: kv[1][2])[0]
         _E2EE_MEDIA_CACHE.pop(oldest_key, None)
 
-    media_id = hashlib.sha256((key_hint or secrets.token_hex(8)).encode("utf-8") + raw_bytes[:256]).hexdigest()[:20]
-    ext = (
-        "jpg" if ("jpeg" in mime or "jpg" in mime)
-        else ("webp" if "webp" in mime else ("gif" if "gif" in mime else "png"))
-    )
-    resource_id = f"img_{media_id}.{ext}"
+    media_id = hashlib.sha256(
+        (key_hint or secrets.token_hex(8)).encode("utf-8") + raw_bytes[:256]
+    ).hexdigest()[:20]
+    if kind == "video":
+        if mime not in ("video/mp4", "video/quicktime"):
+            return None
+        ext = "mp4" if mime == "video/mp4" else "mov"
+        resource_prefix = "vid"
+    else:
+        ext = (
+            "jpg" if ("jpeg" in mime or "jpg" in mime)
+            else ("webp" if "webp" in mime else ("gif" if "gif" in mime else "png"))
+        )
+        resource_prefix = "img"
+    resource_id = f"{resource_prefix}_{media_id}.{ext}"
     _E2EE_MEDIA_CACHE[media_id] = (raw_bytes, mime, now)
-
-    return {
+    result: dict[str, Any] = {
         "media_id": media_id,
-        "kind": "photo",
+        "kind": kind,
+        "mime": mime,
         "url": f"https://ton.x.com/1.1/ton/data/dm/xchat/{media_id}/{resource_id}",
         "proxy_path": f"/2/dm_conversations/media/xchat/{media_id}/{resource_id}",
+        "duration_ms": duration_ms,
+        "width": width,
+        "height": height,
+        "byte_size": len(raw_bytes),
     }
+    if thumbnail_data_url and kind == "video":
+        thumb = cache_e2ee_media(
+            thumbnail_data_url,
+            key_hint=f"{key_hint}:thumbnail",
+            kind="photo",
+        )
+        if thumb:
+            result["thumbnail_proxy_path"] = thumb["proxy_path"]
+    return {k: v for k, v in result.items() if v is not None}
 
 
 def get_cached_e2ee_media(media_id: str) -> Optional[tuple[bytes, str]]:
@@ -503,10 +536,27 @@ def project_xchat_message_rows(
             )
             if cached:
                 attachments.append(cached)
+        for video_idx, data_url in enumerate(row.get("video_data_urls") or []):
+            cached = cache_e2ee_media(
+                data_url,
+                key_hint=f"{conversation_id}_{ev_id}_video_{video_idx}",
+                kind="video",
+                duration_ms=row.get("video_duration_ms"),
+                width=row.get("video_width"),
+                height=row.get("video_height"),
+                thumbnail_data_url=(row.get("video_thumbnail_data_urls") or [None])[video_idx]
+                if video_idx < len(row.get("video_thumbnail_data_urls") or []) else None,
+            )
+            if cached:
+                attachments.append(cached)
         if attachments:
             event["_xapi_attachments"] = attachments
             event["attachments"] = {
-                "media_keys": [f"3_{att['media_id']}" for att in attachments]
+                # Official X media-key prefixes: 3_ = photo, 7_ = video/GIF.
+                "media_keys": [
+                    f"{'7' if att.get('kind') == 'video' else '3'}_{att['media_id']}"
+                    for att in attachments
+                ]
             }
             event["_xchat_media_state"] = "ready"
         elif row.get("media_pending"):
@@ -680,9 +730,37 @@ async def unlock_and_read_xchat_conversation(
                         // Attachment focus can appear before its image/blob URL.
                         // Wait briefly per row; never silently downgrade a known
                         // attachment to a text-only event.
+                        const videoEls = [...row.querySelectorAll('video')];
+                        const mediaSrc = (src) => src && (
+                            src.startsWith('blob:') || src.startsWith('data:') ||
+                            src.includes('ton.x.com') || src.includes('ton.twimg.com') ||
+                            src.includes('video.twimg.com')
+                        );
+                        let videoSources = [];
+                        let videoPosterSources = [];
+                        // XChat may attach the <video> node before metadata/source is
+                        // ready. Poll briefly so a transient empty src/duration does
+                        // not become a permanent text-only decision.
+                        for (let wait = 0; videoEls.length > 0 && wait < 5; wait++) {
+                            videoSources = [...new Set(videoEls.flatMap(v => [
+                                v.currentSrc, v.src,
+                                ...[...v.querySelectorAll('source')].map(s => s.src),
+                            ].filter(mediaSrc)))];
+                            videoPosterSources = [...new Set(videoEls.map(v =>
+                                v.poster || v.getAttribute('data-poster') || v.getAttribute('poster')
+                            ).filter(mediaSrc))];
+                            const ready = videoEls.some(v =>
+                                Number.isFinite(v.duration) && v.duration > 0 && videoSources.length > 0
+                            );
+                            if (ready) break;
+                            await sleep(300);
+                        }
+                        const posterSet = new Set(videoPosterSources);
                         const relevantImg = (img) => img.src.startsWith('blob:') ||
                             img.src.includes('ton.x.com') || img.src.includes('ton.twimg.com');
-                        let imgs = [...row.querySelectorAll('img[src]')].filter(relevantImg);
+                        let imgs = [...row.querySelectorAll('img[src]')].filter(
+                            img => relevantImg(img) && !posterSet.has(img.src)
+                        );
                         for (let wait = 0; hasAttachmentFocus && imgs.length === 0 && wait < 5; wait++) {
                             await sleep(300);
                             imgs = [...row.querySelectorAll('img[src]')].filter(relevantImg);
@@ -692,13 +770,39 @@ async def unlock_and_read_xchat_conversation(
                             const dataUrl = await blobToDataUrl(img.src);
                             if (dataUrl) imageDataUrls.push(dataUrl);
                         }
+                        const videoDataUrls = [];
+                        const videoThumbnailDataUrls = [];
+                        let videoDurationMs = null;
+                        let videoWidth = null;
+                        let videoHeight = null;
+                        let videoPending = false;
+                        for (const video of videoEls.slice(0, 1)) {
+                            const duration = Number.isFinite(video.duration) && video.duration > 0
+                                ? video.duration : null;
+                            videoDurationMs = duration != null ? Math.round(duration * 1000) : null;
+                            videoWidth = video.videoWidth || null;
+                            videoHeight = video.videoHeight || null;
+                            if (videoSources.length === 0 || videoDurationMs == null) videoPending = true;
+                        }
+                        for (const src of videoSources.slice(0, 1)) {
+                            const dataUrl = await blobToDataUrl(src);
+                            if (dataUrl) videoDataUrls.push(dataUrl);
+                            else videoPending = true;
+                        }
+                        for (const src of videoPosterSources.slice(0, 1)) {
+                            const dataUrl = await blobToDataUrl(src);
+                            if (dataUrl) videoThumbnailDataUrls.push(dataUrl);
+                        }
 
                         // Skip completely empty divider/date rows, except a row
                         // explicitly exposing X's attachment focus target.
                         const hasAnyImg = imgs.length > 0;
                         const mediaPending = (hasAttachmentFocus || hasAnyImg) && imageDataUrls.length === 0;
+                        const mediaReady = videoDataUrls.length > 0 || imageDataUrls.length > 0;
+                        const mediaState = videoDataUrls.length > 0 ? 'ready' :
+                            (videoPending || mediaPending ? 'pending' : (hasContentFocus && text ? 'none' : 'unknown'));
                         if (!text && imageDataUrls.length === 0 && statusLinks.length === 0
-                            && !hasAnyImg && !hasAttachmentFocus) {
+                            && !hasAnyImg && !hasAttachmentFocus && videoEls.length === 0) {
                             continue;
                         }
 
@@ -711,9 +815,14 @@ async def unlock_and_read_xchat_conversation(
                             hrefs,
                             status_links: statusLinks,
                             image_data_urls: imageDataUrls,
-                            media_pending: mediaPending,
-                            media_state: imageDataUrls.length > 0 ? 'ready' :
-                                (mediaPending ? 'pending' : (hasContentFocus && text ? 'none' : 'unknown')),
+                            video_data_urls: videoDataUrls,
+                            video_duration_ms: videoDurationMs,
+                            video_width: videoWidth,
+                            video_height: videoHeight,
+                            video_thumbnail_data_urls: videoThumbnailDataUrls,
+                            video_pending: videoPending,
+                            media_pending: mediaPending || videoPending,
+                            media_state: mediaState,
                             _has_attachment_only: hasAttachmentFocus && !hasContentFocus && !text,
                             _has_content_only: hasContentFocus && !hasAttachmentFocus && imageDataUrls.length === 0,
                         };
@@ -733,6 +842,12 @@ async def unlock_and_read_xchat_conversation(
                             prev.hrefs = [...new Set([...prev.hrefs, ...curItem.hrefs])];
                             prev.status_links = [...new Set([...prev.status_links, ...curItem.status_links])];
                             prev.image_data_urls = [...prev.image_data_urls, ...curItem.image_data_urls].slice(0, 4);
+                            prev.video_data_urls = [...(prev.video_data_urls || []), ...(curItem.video_data_urls || [])].slice(0, 1);
+                            prev.video_duration_ms = prev.video_duration_ms || curItem.video_duration_ms;
+                            prev.video_width = prev.video_width || curItem.video_width;
+                            prev.video_height = prev.video_height || curItem.video_height;
+                            prev.video_thumbnail_data_urls = [...(prev.video_thumbnail_data_urls || []), ...(curItem.video_thumbnail_data_urls || [])].slice(0, 1);
+                            prev.video_pending = prev.video_pending || curItem.video_pending;
                             prev.media_pending = prev.media_pending || curItem.media_pending;
                             prev._has_attachment_only = false;
                             prev._has_content_only = false;

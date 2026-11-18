@@ -489,7 +489,11 @@ async def _enrich_conv_events_with_e2ee(
             if merged.get("_xapi_attachments"):
                 merged.pop("_xchat_media_pending", None)
                 merged["_xchat_media_state"] = "ready"
-            elif media_pending or (is_uuid_candidate and media_state != "none"):
+            elif media_state == "ready" and d_ev.get("_xapi_attachments"):
+                merged["_xapi_attachments"] = d_ev["_xapi_attachments"]
+                merged.pop("_xchat_media_pending", None)
+                merged["_xchat_media_state"] = "ready"
+            elif media_pending or (is_uuid_candidate and media_state not in ("none", "ready")):
                 merged["_xchat_media_pending"] = True
                 merged["_xchat_media_state"] = "pending"
             else:

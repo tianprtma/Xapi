@@ -47,6 +47,19 @@ def test_xchat_row_projection_emits_cached_media():
     _E2EE_MEDIA_CACHE.clear()
 
 
+def test_xchat_photo_data_is_ready_even_without_focus_marker():
+    _E2EE_MEDIA_CACHE.clear()
+    events = project_xchat_message_rows([{
+        "row_key": "photo-no-focus", "sender_id": "777", "text": "wots foto",
+        "image_data_urls": ["data:image/jpeg;base64,/9j/2Q=="],
+        "media_pending": False, "media_state": "ready",
+    }], "999-777")
+    assert events[0]["_xchat_media_state"] == "ready"
+    assert not events[0].get("_xchat_media_pending")
+    assert events[0]["_xapi_attachments"]
+    _E2EE_MEDIA_CACHE.clear()
+
+
 @pytest.mark.asyncio
 async def test_plain_uuid_event_without_dom_result_stays_pending():
     formatted = {"data": [{"id": "uuid-plain", "event_type": "MessageCreate",

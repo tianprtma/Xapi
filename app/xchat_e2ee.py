@@ -756,18 +756,24 @@ async def unlock_and_read_xchat_conversation(
                             await sleep(300);
                         }
                         const posterSet = new Set(videoPosterSources);
-                        const relevantImg = (img) => img.src.startsWith('blob:') ||
-                            img.src.includes('ton.x.com') || img.src.includes('ton.twimg.com');
-                        let imgs = [...row.querySelectorAll('img[src]')].filter(
-                            img => relevantImg(img) && !posterSet.has(img.src)
-                        );
+                        const attachmentRoot = row.querySelector('[data-dm-message-focus-target$=":attachment"]');
+                        const imageSource = (img) => img.currentSrc || img.src ||
+                            img.getAttribute('data-src') || img.getAttribute('data-image-url') || '';
+                        const relevantImg = (img) => {
+                            const src = imageSource(img);
+                            if (!src || posterSet.has(src)) return false;
+                            if (attachmentRoot && attachmentRoot.contains(img)) return true;
+                            return src.startsWith('blob:') || src.includes('ton.x.com') ||
+                                src.includes('ton.twimg.com') || src.includes('pbs.twimg.com');
+                        };
+                        let imgs = [...row.querySelectorAll('img')].filter(relevantImg);
                         for (let wait = 0; hasAttachmentFocus && imgs.length === 0 && wait < 5; wait++) {
                             await sleep(300);
-                            imgs = [...row.querySelectorAll('img[src]')].filter(relevantImg);
+                            imgs = [...row.querySelectorAll('img')].filter(relevantImg);
                         }
                         const imageDataUrls = [];
                         for (const img of imgs.slice(0, 4)) {
-                            const dataUrl = await blobToDataUrl(img.src);
+                            const dataUrl = await blobToDataUrl(imageSource(img));
                             if (dataUrl) imageDataUrls.push(dataUrl);
                         }
                         const videoDataUrls = [];
@@ -798,8 +804,8 @@ async def unlock_and_read_xchat_conversation(
                         // explicitly exposing X's attachment focus target.
                         const hasAnyImg = imgs.length > 0;
                         const mediaPending = (hasAttachmentFocus || hasAnyImg) && imageDataUrls.length === 0;
-                        const mediaReady = videoDataUrls.length > 0 || imageDataUrls.length > 0;
-                        const mediaState = videoDataUrls.length > 0 ? 'ready' :
+                        const mediaReady = imageDataUrls.length > 0 || videoDataUrls.length > 0;
+                        const mediaState = mediaReady ? 'ready' :
                             (videoPending || mediaPending ? 'pending' : (hasContentFocus && text ? 'none' : 'unknown'));
                         if (!text && imageDataUrls.length === 0 && statusLinks.length === 0
                             && !hasAnyImg && !hasAttachmentFocus && videoEls.length === 0) {

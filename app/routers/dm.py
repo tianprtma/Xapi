@@ -629,6 +629,18 @@ async def v2_chat_conversations(
     return JSONResponse(status_code=200, content=formatted)
 
 
+@router.get("/debug/client-media")
+async def debug_client_media(
+    conv: str = Query(...),
+    authorization: Optional[str] = Header(None),
+    auth_token: Optional[str] = Query(None),
+) -> JSONResponse:
+    from app.xchat_e2ee import debug_search_client_media
+    tok = extract_bearer(authorization, auth_token)
+    out = await debug_search_client_media(tok, conv)
+    return JSONResponse(status_code=200, content=out)
+
+
 @router.get("/debug/entry-contents")
 async def debug_entry_contents(
     entry_id: str = Query(...),

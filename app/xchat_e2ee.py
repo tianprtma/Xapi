@@ -409,7 +409,7 @@ async def unlock_and_read_xchat_inbox(
             # di headless XChat baru — wait 10-12s sia-sia per sweep).
             if my_user_id:
                 try:
-                    db_bytes = await extract_xchat_opfs_db(page, str(my_user_id))
+                    db_bytes = await extract_xchat_opfs_db(page, str(my_user_id), context=context)
                     if db_bytes and db_bytes[:15] == b"SQLite format 3":
                         import sqlite3 as _sqlite3
                         import tempfile as _tempfile
@@ -688,7 +688,9 @@ async def unlock_and_read_xchat_inbox(
         finally:
             if page is not None:
                 try:
-                    await page.close()
+                    cached_opfs = getattr(context, "_xchat_opfs_page", None) if context else None
+                    if page is not cached_opfs:
+                        await page.close()
                 except Exception:
                     pass
             if context is not None:
@@ -727,12 +729,37 @@ _OPFS_DB_JS = """async (fileName) => {
 }"""
 
 
-async def extract_xchat_opfs_db(page: Any, viewer_id: str) -> Optional[bytes]:
+async def extract_xchat_opfs_db(
+    page: Any, viewer_id: str, *, context: Any = None
+) -> Optional[bytes]:
     """Baca file SQLite OPFS `backups/chat_<viewer_id>.db` dari halaman X.
+    R87.2: navigator.storage.getDirectory hanya ter-expose di PAGE PERTAMA
+    yang membuka origin di persistent context — page baru yang dibuka belakangan
+    kadang tidak punya API itu (probe 3x: run-1 sukses, run-2/3 undefined).
+    Bila berhasil, page disimpan sebagai `_xchat_opfs_page` pada konteks dan
+    dipakai ulang untuk pemanggilan berikutnya.
     Kembalikan bytes db, atau None bila file tidak ada."""
-    b64 = await page.evaluate(_OPFS_DB_JS, f"chat_{viewer_id}.db")
+    target = page
+    if context is not None:
+        cached = getattr(context, "_xchat_opfs_page", None)
+        if cached is not None:
+            try:
+                _ = cached.url  # page masih hidup?
+                target = cached
+            except Exception:
+                target = page
+    b64 = await target.evaluate(_OPFS_DB_JS, f"chat_{viewer_id}.db")
+    if not b64 and target is not page:
+        # Page cache mungkin basi — coba page baru sekali lagi.
+        b64 = await page.evaluate(_OPFS_DB_JS, f"chat_{viewer_id}.db")
+        target = page
     if not b64:
         return None
+    if context is not None and getattr(context, "_xchat_opfs_page", None) is None:
+        try:
+            context._xchat_opfs_page = target
+        except Exception:
+            pass
     try:
         import base64 as _b64
         return _b64.b64decode(b64)
@@ -1010,7 +1037,7 @@ async def unlock_and_read_xchat_conversation(
             # (di headless, XChat baru TIDAK merender baris — hang 60-90s).
             if my_user_id:
                 try:
-                    db_bytes = await extract_xchat_opfs_db(page, str(my_user_id))
+                    db_bytes = await extract_xchat_opfs_db(page, str(my_user_id), context=context)
                     if db_bytes and db_bytes[:15] == b"SQLite format 3":
                         import sqlite3 as _sqlite3
                         import tempfile as _tempfile
@@ -1357,7 +1384,9 @@ async def unlock_and_read_xchat_conversation(
         finally:
             if page is not None:
                 try:
-                    await page.close()
+                    cached_opfs = getattr(context, "_xchat_opfs_page", None) if context else None
+                    if page is not cached_opfs:
+                        await page.close()
                 except Exception:
                     pass
             if context is not None:
@@ -1529,7 +1558,9 @@ async def send_xchat_dm_via_browser(
         finally:
             if page is not None:
                 try:
-                    await page.close()
+                    cached_opfs = getattr(context, "_xchat_opfs_page", None) if context else None
+                    if page is not cached_opfs:
+                        await page.close()
                 except Exception:
                     pass
             if context is not None:

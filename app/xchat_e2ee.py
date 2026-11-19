@@ -819,40 +819,6 @@ async def extract_xchat_opfs_db(
         return None
 
 
-async def debug_opfs_attachments(auth_token: str, my_user_id: str, conv_colon: str) -> dict[str, Any]:
-    """DIAGNOSTIK SEMENTARA R90: dump dm_local_attachment utk satu conv."""
-    import sqlite3
-    import tempfile
-    playwright_search.PLAYWRIGHT_ENABLED = True
-    async with PlaywrightPool.get().semaphore:
-        context = await XChatContextPool.get().acquire(auth_token)
-        page = await context.new_page()
-        try:
-            await page.goto("https://x.com/i/chat", wait_until="domcontentloaded", timeout=30000)
-            db_bytes = await extract_xchat_opfs_db(page, str(my_user_id), context=context)
-            if not db_bytes or db_bytes[:15] != b"SQLite format 3":
-                return {"error": "no db"}
-            with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
-                tf.write(db_bytes); tmp = tf.name
-            try:
-                conn = sqlite3.connect(tmp); conn.row_factory = sqlite3.Row
-                atts = [dict(x) for x in conn.execute(
-                    "SELECT attachment_id, message_id, local_path, attachment_type, file_size FROM dm_local_attachment WHERE conversation_id=?",
-                    (conv_colon,))]
-                entries = [dict(x) for x in conn.execute(
-                    "SELECT entry_id, sequence_number, has_attachment, attachment_types FROM dm_entry WHERE conversation_id=? AND deleted=0 ORDER BY timestamp DESC LIMIT 12",
-                    (conv_colon,))]
-                total = conn.execute("SELECT COUNT(*) FROM dm_local_attachment").fetchone()[0]
-                return {"total_local_attachment": total, "conv_attachments": atts, "conv_entries": entries}
-            finally:
-                conn.close(); os.unlink(tmp)
-        finally:
-            cached = getattr(context, "_xchat_opfs_page", None)
-            if page is not cached:
-                await page.close()
-            await XChatContextPool.get().release(auth_token, context)
-
-
 def query_dm_entries(
     conn: Any, conv_id_colon: str, limit: int = 50
 ) -> list[dict[str, Any]]:
@@ -1014,43 +980,27 @@ async def recover_opfs_media_for_events(
     `dm_local_attachment` memetakan message_id (= entry_id) → local_path file
     terdekripsi di OPFS. Baca bytes via read_xchat_opfs_file, cache sebagai
     attachment proxy (cache_e2ee_media). Set `_xapi_attachments` + state ready
-    HANYA bila jumlah terpulihkan >= jumlah lampiran yang diharapkan (terhitung
-    dari `attachmentId` dalam contents BLOB) — supaya menfess multi-foto tidak
-    terposting parsial. Bila belum lengkap, biarkan pending (R80 fallback).
+    bila >= 1 lampiran terpulihkan. XChat headless jarang mengunduh media
+    (download lazy saat render yang tak pernah terjadi), jadi menunggu SEMUA
+    foto berarti text-only permanen via R80 — memposting media yang tersedia
+    lebih baik daripada kehilangan semuanya. Bila 0 terpulihkan, biarkan
+    pending (siklus berikut mencoba lagi; R80 menjamin tenggat text-only).
     Mutasi `events` in-place; bounded `max_files` bacaan per panggilan.
     """
     tables = {r[0] for r in conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
     if "dm_local_attachment" not in tables:
         return
-    try:
-        _total_la = conn.execute("SELECT COUNT(*) FROM dm_local_attachment").fetchone()[0]
-        log.info("R90: snapshot dm_local_attachment total=%d", _total_la)
-    except Exception:
-        pass
-    by_id = {str(r.get("entry_id") or ""): r for r in rows}
-    _cc = by_id.get("cc57d878-7fee-43b4-b9db-3b59f4c54f2e")
-    log.info(
-        "R90: rows=%d cc57_present=%s cc57_hasatt=%s cc57_textlen=%s pending_events=%d",
-        len(rows), _cc is not None,
-        (_cc or {}).get("has_attachment"),
-        len((_cc or {}).get("plain_text") or ""),
-        sum(1 for e in events if e.get("_xchat_media_pending")),
-    )
     reads = 0
     for ev in events:
         if not ev.get("_xchat_media_pending"):
             continue
         eid = str(ev.get("id") or "")
-        row = by_id.get(eid) or {}
-        contents = row.get("contents")
-        expected = (
-            contents.count(b"attachmentId")
-            if isinstance(contents, (bytes, bytearray)) else 0
-        )
         try:
-            locals_ = [dict(x) for x in conn.execute(
-                "SELECT * FROM dm_local_attachment WHERE message_id=?", (eid,))]
+            cur = conn.execute(
+                "SELECT * FROM dm_local_attachment WHERE message_id=?", (eid,))
+            cols = [d[0] for d in cur.description]
+            locals_ = [dict(zip(cols, r)) for r in cur.fetchall()]
         except Exception:
             continue
         atts: list[dict[str, Any]] = []
@@ -1074,11 +1024,7 @@ async def recover_opfs_media_for_events(
             )
             if cached:
                 atts.append(cached)
-        log.info(
-            "R90: entry %s expected=%d recovered=%d locals=%d",
-            eid, expected, len(atts), len(locals_),
-        )
-        if atts and (expected <= 0 or len(atts) >= expected):
+        if atts:
             ev["_xapi_attachments"] = atts
             ev["attachments"] = {
                 "media_keys": [

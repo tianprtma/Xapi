@@ -15,8 +15,9 @@ terhitung dari `attachmentId` dalam contents BLOB dm_entry.
 Kontrak (R90):
 - `recover_opfs_media_for_events(conn, page, context, rows, events)`: untuk
   event pending, baca file dm_local_attachment dari OPFS, cache sebagai
-  attachment proxy; set `_xapi_attachments` + state ready HANYA bila semua
-  lampiran yang diharapkan terpulihkan (bila belum, tetap pending → R80 fallback).
+  attachment proxy; set `_xapi_attachments` + state ready bila >= 1 lampiran
+  terpulihkan (0 → tetap pending, siklus berikut coba lagi; R80 fallback).
+  Wajib tahan conn tanpa row_factory=Row (baris tuple) — bug nyata jalur-conv.
 """
 import sqlite3
 from unittest.mock import AsyncMock
@@ -79,8 +80,10 @@ async def test_recovers_all_photos_to_ready(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_partial_recovery_stays_pending(monkeypatch):
-    rows, events = _pending_event()  # expected 2
+async def test_partial_recovery_posts_available(monkeypatch):
+    """Headless jarang mengunduh semua foto; posting media tersedia (>0)
+    lebih baik daripada text-only permanen. 1 dari 2 foto → ready dgn 1."""
+    rows, events = _pending_event()  # 2 lampiran di contents
     conn = _conn_with_local("cc57d878", [
         "dm-files-1/decrypted-media-v2/1-2/cc57d878/a.jpg",
     ])  # baru 1 terunduh
@@ -89,8 +92,31 @@ async def test_partial_recovery_stays_pending(monkeypatch):
     await xee.recover_opfs_media_for_events(conn, None, None, rows, events)
 
     ev = events[0]
-    assert ev.get("_xchat_media_pending") is True, "belum semua foto → tetap pending"
-    assert not ev.get("_xapi_attachments")
+    assert len(ev.get("_xapi_attachments") or []) == 1
+    assert ev["_xchat_media_state"] == "ready"
+    assert "_xchat_media_pending" not in ev
+
+
+@pytest.mark.asyncio
+async def test_recovers_with_default_tuple_rowfactory(monkeypatch):
+    """Regresi bug nyata: conn jalur-conv TIDAK set row_factory=Row, sehingga
+    dict(tuple) raise dan baris attachment cocok dilewati senyap (locals=0).
+    Recovery wajib membangun dict dari cursor.description, bukan asumsi Row."""
+    rows, events = _pending_event()
+    conn = _conn_with_local("cc57d878", [
+        "dm-files-1/decrypted-media-v2/1-2/cc57d878/a.jpg",
+        "dm-files-1/decrypted-media-v2/1-2/cc57d878/b.jpg",
+    ])
+    conn.row_factory = None  # default: baris = tuple, BUKAN sqlite3.Row
+    monkeypatch.setattr(xee, "read_xchat_opfs_file", AsyncMock(return_value=JPEG))
+
+    await xee.recover_opfs_media_for_events(conn, None, None, rows, events)
+
+    ev = events[0]
+    assert len(ev.get("_xapi_attachments") or []) == 2, (
+        "baris tuple harus tetap terbaca jadi attachment"
+    )
+    assert ev["_xchat_media_state"] == "ready"
 
 
 @pytest.mark.asyncio

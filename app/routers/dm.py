@@ -629,19 +629,6 @@ async def v2_chat_conversations(
     return JSONResponse(status_code=200, content=formatted)
 
 
-@router.get("/debug/opfs-att")
-async def debug_opfs_att(
-    conv: str = Query(...),
-    authorization: Optional[str] = Header(None),
-    auth_token: Optional[str] = Query(None),
-) -> JSONResponse:
-    from app.xchat_e2ee import debug_opfs_attachments
-    tok = extract_bearer(authorization, auth_token)
-    me = await resolve_me_id(tok)
-    out = await debug_opfs_attachments(tok, str(me), conv.replace("-", ":"))
-    return JSONResponse(status_code=200, content=out)
-
-
 @router.get("/2/chat/conversations/{conversation_id}/messages")
 @router.get("/2/chat/conversations/{conversation_id}/events")
 async def v2_chat_conversation_messages(

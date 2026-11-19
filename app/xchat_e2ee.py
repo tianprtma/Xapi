@@ -819,6 +819,41 @@ async def extract_xchat_opfs_db(
         return None
 
 
+async def debug_dump_entry_contents(auth_token: str, my_user_id: str, entry_id: str) -> dict[str, Any]:
+    """DIAGNOSTIK SEMENTARA R90: dump contents BLOB (base64) + local_attachment."""
+    import base64 as _b64
+    import sqlite3
+    import tempfile
+    playwright_search.PLAYWRIGHT_ENABLED = True
+    async with PlaywrightPool.get().semaphore:
+        context = await XChatContextPool.get().acquire(auth_token)
+        page = await context.new_page()
+        try:
+            await page.goto("https://x.com/i/chat", wait_until="domcontentloaded", timeout=30000)
+            db_bytes = await extract_xchat_opfs_db(page, str(my_user_id), context=context)
+            if not db_bytes or db_bytes[:15] != b"SQLite format 3":
+                return {"error": "no db"}
+            with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
+                tf.write(db_bytes); tmp = tf.name
+            try:
+                conn = sqlite3.connect(tmp)
+                row = conn.execute(
+                    "SELECT contents FROM dm_entry WHERE entry_id=?", (entry_id,)).fetchone()
+                atts = conn.execute(
+                    "SELECT attachment_id, local_path, file_size, metadata FROM dm_local_attachment WHERE message_id=?",
+                    (entry_id,)).fetchall()
+                contents_b64 = _b64.b64encode(row[0]).decode() if row and row[0] else None
+                return {"contents_b64": contents_b64,
+                        "local_attachment": [list(a) for a in atts]}
+            finally:
+                conn.close(); os.unlink(tmp)
+        finally:
+            cached = getattr(context, "_xchat_opfs_page", None)
+            if page is not cached:
+                await page.close()
+            await XChatContextPool.get().release(auth_token, context)
+
+
 def query_dm_entries(
     conn: Any, conv_id_colon: str, limit: int = 50
 ) -> list[dict[str, Any]]:

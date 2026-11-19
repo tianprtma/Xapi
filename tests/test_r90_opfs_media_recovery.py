@@ -77,6 +77,9 @@ async def test_recovers_all_photos_to_ready(monkeypatch):
     assert ev["_xchat_media_state"] == "ready"
     assert "_xchat_media_pending" not in ev
     assert ev["attachments"]["media_keys"]
+    # R91: metadata kelengkapan media
+    assert ev["_xchat_media_expected"] == 2
+    assert ev["_xchat_media_recovered"] == 2
 
 
 @pytest.mark.asyncio
@@ -95,6 +98,9 @@ async def test_partial_recovery_posts_available(monkeypatch):
     assert len(ev.get("_xapi_attachments") or []) == 1
     assert ev["_xchat_media_state"] == "ready"
     assert "_xchat_media_pending" not in ev
+    # R91: parsial — expected 2, recovered 1 (bot pakai ini utk note ke sender)
+    assert ev["_xchat_media_expected"] == 2
+    assert ev["_xchat_media_recovered"] == 1
 
 
 @pytest.mark.asyncio

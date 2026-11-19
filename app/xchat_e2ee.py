@@ -150,7 +150,19 @@ async def _ensure_pin_unlocked(page: Any, dm_pin: Optional[str]) -> bool:
     try:
         state = await page.wait_for_function(
             """({pinSel, dmSel}) => {
-                const host = document.querySelector('[data-testid="xchatEmbedRoute"]');
+                const host = (() => {
+    if (window.__xchatHost && window.__xchatHost.isConnected
+        && (window.__xchatHost.shadowRoot || window.__xchatHost.querySelector('[data-testid^="dm-"]'))) {
+        return window.__xchatHost;
+    }
+    const legacy = document.querySelector('[data-testid="xchatEmbedRoute"]');
+    if (legacy && legacy.shadowRoot) { window.__xchatHost = legacy; return legacy; }
+    for (const el of document.querySelectorAll('*')) {
+        const sr = el.shadowRoot;
+        if (sr && sr.querySelector('[data-testid^="dm-"]')) { window.__xchatHost = el; return el; }
+    }
+    return null;
+})();
                 const root = host?.shadowRoot || document;
                 if (window.location.href.includes('/pin/') || root.querySelectorAll(pinSel).length >= 4) {
                     return 'pin';
@@ -178,7 +190,19 @@ async def _ensure_pin_unlocked(page: Any, dm_pin: Optional[str]) -> bool:
         try:
             pin_check = await page.evaluate(
                 """(pinSel) => {
-                    const host = document.querySelector('[data-testid="xchatEmbedRoute"]');
+                    const host = (() => {
+    if (window.__xchatHost && window.__xchatHost.isConnected
+        && (window.__xchatHost.shadowRoot || window.__xchatHost.querySelector('[data-testid^="dm-"]'))) {
+        return window.__xchatHost;
+    }
+    const legacy = document.querySelector('[data-testid="xchatEmbedRoute"]');
+    if (legacy && legacy.shadowRoot) { window.__xchatHost = legacy; return legacy; }
+    for (const el of document.querySelectorAll('*')) {
+        const sr = el.shadowRoot;
+        if (sr && sr.querySelector('[data-testid^="dm-"]')) { window.__xchatHost = el; return el; }
+    }
+    return null;
+})();
                     const root = host?.shadowRoot || document;
                     return {
                         gate: window.location.href.includes('/pin/')
@@ -197,7 +221,19 @@ async def _ensure_pin_unlocked(page: Any, dm_pin: Optional[str]) -> bool:
                 try:
                     stable = await page.wait_for_function(
                         """(pinSel) => {
-                            const host = document.querySelector('[data-testid="xchatEmbedRoute"]');
+                            const host = (() => {
+    if (window.__xchatHost && window.__xchatHost.isConnected
+        && (window.__xchatHost.shadowRoot || window.__xchatHost.querySelector('[data-testid^="dm-"]'))) {
+        return window.__xchatHost;
+    }
+    const legacy = document.querySelector('[data-testid="xchatEmbedRoute"]');
+    if (legacy && legacy.shadowRoot) { window.__xchatHost = legacy; return legacy; }
+    for (const el of document.querySelectorAll('*')) {
+        const sr = el.shadowRoot;
+        if (sr && sr.querySelector('[data-testid^="dm-"]')) { window.__xchatHost = el; return el; }
+    }
+    return null;
+})();
                             const root = host?.shadowRoot || document;
                             if (window.location.href.includes('/pin/')
                                 || root.querySelectorAll(pinSel).length >= 4) {
@@ -227,7 +263,19 @@ async def _ensure_pin_unlocked(page: Any, dm_pin: Optional[str]) -> bool:
     if not needs_pin:
         has_pin_inputs = await page.evaluate(
             """(pinSel) => {
-                const host = document.querySelector('[data-testid="xchatEmbedRoute"]');
+                const host = (() => {
+    if (window.__xchatHost && window.__xchatHost.isConnected
+        && (window.__xchatHost.shadowRoot || window.__xchatHost.querySelector('[data-testid^="dm-"]'))) {
+        return window.__xchatHost;
+    }
+    const legacy = document.querySelector('[data-testid="xchatEmbedRoute"]');
+    if (legacy && legacy.shadowRoot) { window.__xchatHost = legacy; return legacy; }
+    for (const el of document.querySelectorAll('*')) {
+        const sr = el.shadowRoot;
+        if (sr && sr.querySelector('[data-testid^="dm-"]')) { window.__xchatHost = el; return el; }
+    }
+    return null;
+})();
                 const root = host?.shadowRoot || document;
                 return root.querySelectorAll(pinSel).length >= 4;
             }""",
@@ -247,7 +295,19 @@ async def _ensure_pin_unlocked(page: Any, dm_pin: Optional[str]) -> bool:
     try:
         await page.wait_for_function(
             """(pinSel) => {
-                const host = document.querySelector('[data-testid="xchatEmbedRoute"]');
+                const host = (() => {
+    if (window.__xchatHost && window.__xchatHost.isConnected
+        && (window.__xchatHost.shadowRoot || window.__xchatHost.querySelector('[data-testid^="dm-"]'))) {
+        return window.__xchatHost;
+    }
+    const legacy = document.querySelector('[data-testid="xchatEmbedRoute"]');
+    if (legacy && legacy.shadowRoot) { window.__xchatHost = legacy; return legacy; }
+    for (const el of document.querySelectorAll('*')) {
+        const sr = el.shadowRoot;
+        if (sr && sr.querySelector('[data-testid^="dm-"]')) { window.__xchatHost = el; return el; }
+    }
+    return null;
+})();
                 const root = host?.shadowRoot || document;
                 return root.querySelectorAll(pinSel).length >= 4;
             }""",
@@ -260,7 +320,19 @@ async def _ensure_pin_unlocked(page: Any, dm_pin: Optional[str]) -> bool:
     for idx, digit in enumerate(dm_pin):
         focused = await page.evaluate(
             """({pinSel, index}) => {
-                const host = document.querySelector('[data-testid="xchatEmbedRoute"]');
+                const host = (() => {
+    if (window.__xchatHost && window.__xchatHost.isConnected
+        && (window.__xchatHost.shadowRoot || window.__xchatHost.querySelector('[data-testid^="dm-"]'))) {
+        return window.__xchatHost;
+    }
+    const legacy = document.querySelector('[data-testid="xchatEmbedRoute"]');
+    if (legacy && legacy.shadowRoot) { window.__xchatHost = legacy; return legacy; }
+    for (const el of document.querySelectorAll('*')) {
+        const sr = el.shadowRoot;
+        if (sr && sr.querySelector('[data-testid^="dm-"]')) { window.__xchatHost = el; return el; }
+    }
+    return null;
+})();
                 const root = host?.shadowRoot || document;
                 const inputs = root.querySelectorAll(pinSel);
                 const input = inputs[index];
@@ -284,7 +356,19 @@ async def _ensure_pin_unlocked(page: Any, dm_pin: Optional[str]) -> bool:
     try:
         await page.wait_for_function(
             """(dmSel) => {
-                const host = document.querySelector('[data-testid="xchatEmbedRoute"]');
+                const host = (() => {
+    if (window.__xchatHost && window.__xchatHost.isConnected
+        && (window.__xchatHost.shadowRoot || window.__xchatHost.querySelector('[data-testid^="dm-"]'))) {
+        return window.__xchatHost;
+    }
+    const legacy = document.querySelector('[data-testid="xchatEmbedRoute"]');
+    if (legacy && legacy.shadowRoot) { window.__xchatHost = legacy; return legacy; }
+    for (const el of document.querySelectorAll('*')) {
+        const sr = el.shadowRoot;
+        if (sr && sr.querySelector('[data-testid^="dm-"]')) { window.__xchatHost = el; return el; }
+    }
+    return null;
+})();
                 const root = host?.shadowRoot || document;
                 const dmReady = Boolean(root.querySelector(dmSel) || document.querySelector(dmSel));
                 return dmReady;
@@ -325,7 +409,19 @@ async def unlock_and_read_xchat_inbox(
             try:
                 await page.wait_for_function(
                     """() => {
-                        const host = document.querySelector('[data-testid="xchatEmbedRoute"]');
+                        const host = (() => {
+    if (window.__xchatHost && window.__xchatHost.isConnected
+        && (window.__xchatHost.shadowRoot || window.__xchatHost.querySelector('[data-testid^="dm-"]'))) {
+        return window.__xchatHost;
+    }
+    const legacy = document.querySelector('[data-testid="xchatEmbedRoute"]');
+    if (legacy && legacy.shadowRoot) { window.__xchatHost = legacy; return legacy; }
+    for (const el of document.querySelectorAll('*')) {
+        const sr = el.shadowRoot;
+        if (sr && sr.querySelector('[data-testid^="dm-"]')) { window.__xchatHost = el; return el; }
+    }
+    return null;
+})();
                         const root = host?.shadowRoot || document;
                         return root.querySelectorAll('a[href*="/i/chat/"]').length > 0;
                     }""",
@@ -340,7 +436,19 @@ async def unlock_and_read_xchat_inbox(
             try:
                 await page.wait_for_function(
                     """() => {
-                        const host = document.querySelector('[data-testid="xchatEmbedRoute"]');
+                        const host = (() => {
+    if (window.__xchatHost && window.__xchatHost.isConnected
+        && (window.__xchatHost.shadowRoot || window.__xchatHost.querySelector('[data-testid^="dm-"]'))) {
+        return window.__xchatHost;
+    }
+    const legacy = document.querySelector('[data-testid="xchatEmbedRoute"]');
+    if (legacy && legacy.shadowRoot) { window.__xchatHost = legacy; return legacy; }
+    for (const el of document.querySelectorAll('*')) {
+        const sr = el.shadowRoot;
+        if (sr && sr.querySelector('[data-testid^="dm-"]')) { window.__xchatHost = el; return el; }
+    }
+    return null;
+})();
                         const root = host?.shadowRoot || document;
                         const items = [...root.querySelectorAll('[data-testid^="dm-conversation-item-"]')];
                         if (items.length === 0) return false;
@@ -361,7 +469,19 @@ async def unlock_and_read_xchat_inbox(
             for scroll_idx in range(max_scrolls):
                 batch = await page.evaluate(
                     """(myId) => {
-                        const host = document.querySelector('[data-testid="xchatEmbedRoute"]');
+                        const host = (() => {
+    if (window.__xchatHost && window.__xchatHost.isConnected
+        && (window.__xchatHost.shadowRoot || window.__xchatHost.querySelector('[data-testid^="dm-"]'))) {
+        return window.__xchatHost;
+    }
+    const legacy = document.querySelector('[data-testid="xchatEmbedRoute"]');
+    if (legacy && legacy.shadowRoot) { window.__xchatHost = legacy; return legacy; }
+    for (const el of document.querySelectorAll('*')) {
+        const sr = el.shadowRoot;
+        if (sr && sr.querySelector('[data-testid^="dm-"]')) { window.__xchatHost = el; return el; }
+    }
+    return null;
+})();
                         const root = host?.shadowRoot || document;
                         const parseRelAge = (desc) => {
                             if (!desc || typeof desc !== 'string') return null;
@@ -491,7 +611,19 @@ async def unlock_and_read_xchat_inbox(
                 # memberi ~19 baris dan percakapan 'gelap' tak pernah terlihat).
                 scrolled = await page.evaluate(
                     """() => {
-                        const host = document.querySelector('[data-testid="xchatEmbedRoute"]');
+                        const host = (() => {
+    if (window.__xchatHost && window.__xchatHost.isConnected
+        && (window.__xchatHost.shadowRoot || window.__xchatHost.querySelector('[data-testid^="dm-"]'))) {
+        return window.__xchatHost;
+    }
+    const legacy = document.querySelector('[data-testid="xchatEmbedRoute"]');
+    if (legacy && legacy.shadowRoot) { window.__xchatHost = legacy; return legacy; }
+    for (const el of document.querySelectorAll('*')) {
+        const sr = el.shadowRoot;
+        if (sr && sr.querySelector('[data-testid^="dm-"]')) { window.__xchatHost = el; return el; }
+    }
+    return null;
+})();
                         const root = host?.shadowRoot || document;
                         const candidates = [
                             root.querySelector('[data-testid="dm-conversation-scroller"]'),
@@ -638,9 +770,23 @@ async def unlock_and_read_xchat_conversation(
                     )
                     try:
                         await page.wait_for_function(
-                            """() => !!document.querySelector(
-                                '[data-testid="xchatEmbedRoute"]'
-                            )""",
+                            """() => {
+                                window.__xchatHost = (() => {
+                                    const legacy = document.querySelector('[data-testid="xchatEmbedRoute"]');
+                                    if (legacy && legacy.shadowRoot) return legacy;
+                                    // R86: DOM baru — embed me-render dm-* di dalam
+                                    // shadow host GENERIK (tanpa testid). Cari host
+                                    // mana pun yang shadowRoot-nya berisi elemen dm-.
+                                    for (const el of document.querySelectorAll('*')) {
+                                        const sr = el.shadowRoot;
+                                        if (sr && sr.querySelector('[data-testid^="dm-"]')) {
+                                            return el;
+                                        }
+                                    }
+                                    return null;
+                                })();
+                                return !!window.__xchatHost;
+                            }""",
                             timeout=15000,
                         )
                         context._xchat_embed_warmed = True
@@ -678,7 +824,19 @@ async def unlock_and_read_xchat_conversation(
             try:
                 await page.wait_for_function(
                     """() => {
-                        const host = document.querySelector('[data-testid="xchatEmbedRoute"]');
+                        const host = (() => {
+    if (window.__xchatHost && window.__xchatHost.isConnected
+        && (window.__xchatHost.shadowRoot || window.__xchatHost.querySelector('[data-testid^="dm-"]'))) {
+        return window.__xchatHost;
+    }
+    const legacy = document.querySelector('[data-testid="xchatEmbedRoute"]');
+    if (legacy && legacy.shadowRoot) { window.__xchatHost = legacy; return legacy; }
+    for (const el of document.querySelectorAll('*')) {
+        const sr = el.shadowRoot;
+        if (sr && sr.querySelector('[data-testid^="dm-"]')) { window.__xchatHost = el; return el; }
+    }
+    return null;
+})();
                         const root = host?.shadowRoot || document;
                         return root.querySelectorAll('[data-dm-message-row], [data-testid^="message-text-"]').length > 0;
                     }""",
@@ -691,7 +849,19 @@ async def unlock_and_read_xchat_conversation(
             try:
                 await page.wait_for_function(
                     """() => {
-                        const host = document.querySelector('[data-testid="xchatEmbedRoute"]');
+                        const host = (() => {
+    if (window.__xchatHost && window.__xchatHost.isConnected
+        && (window.__xchatHost.shadowRoot || window.__xchatHost.querySelector('[data-testid^="dm-"]'))) {
+        return window.__xchatHost;
+    }
+    const legacy = document.querySelector('[data-testid="xchatEmbedRoute"]');
+    if (legacy && legacy.shadowRoot) { window.__xchatHost = legacy; return legacy; }
+    for (const el of document.querySelectorAll('*')) {
+        const sr = el.shadowRoot;
+        if (sr && sr.querySelector('[data-testid^="dm-"]')) { window.__xchatHost = el; return el; }
+    }
+    return null;
+})();
                         const root = host?.shadowRoot || document;
                         const rows = root.querySelectorAll('[data-dm-message-row]');
                         if (rows.length === 0) return true;
@@ -708,7 +878,19 @@ async def unlock_and_read_xchat_conversation(
 
             rows_data = await page.evaluate(
                 """async ({convId, myId, peerId}) => {
-                    const host = document.querySelector('[data-testid="xchatEmbedRoute"]');
+                    const host = (() => {
+    if (window.__xchatHost && window.__xchatHost.isConnected
+        && (window.__xchatHost.shadowRoot || window.__xchatHost.querySelector('[data-testid^="dm-"]'))) {
+        return window.__xchatHost;
+    }
+    const legacy = document.querySelector('[data-testid="xchatEmbedRoute"]');
+    if (legacy && legacy.shadowRoot) { window.__xchatHost = legacy; return legacy; }
+    for (const el of document.querySelectorAll('*')) {
+        const sr = el.shadowRoot;
+        if (sr && sr.querySelector('[data-testid^="dm-"]')) { window.__xchatHost = el; return el; }
+    }
+    return null;
+})();
                     const root = host?.shadowRoot || document;
                     // Virtualisasi XChat: baris lama (termasuk baris foto) hanya
                     // dimaterialisasi setelah di-scroll. Scroll dulu ke bawah-atas
@@ -973,7 +1155,19 @@ async def send_xchat_dm_via_browser(
 
             await page.wait_for_function(
                 """(sel) => {
-                    const host = document.querySelector('[data-testid="xchatEmbedRoute"]');
+                    const host = (() => {
+    if (window.__xchatHost && window.__xchatHost.isConnected
+        && (window.__xchatHost.shadowRoot || window.__xchatHost.querySelector('[data-testid^="dm-"]'))) {
+        return window.__xchatHost;
+    }
+    const legacy = document.querySelector('[data-testid="xchatEmbedRoute"]');
+    if (legacy && legacy.shadowRoot) { window.__xchatHost = legacy; return legacy; }
+    for (const el of document.querySelectorAll('*')) {
+        const sr = el.shadowRoot;
+        if (sr && sr.querySelector('[data-testid^="dm-"]')) { window.__xchatHost = el; return el; }
+    }
+    return null;
+})();
                     const root = host?.shadowRoot || document;
                     return Boolean(root.querySelector(sel));
                 }""",
@@ -983,7 +1177,19 @@ async def send_xchat_dm_via_browser(
 
             prev_msg_count = await page.evaluate(
                 """() => {
-                    const host = document.querySelector('[data-testid="xchatEmbedRoute"]');
+                    const host = (() => {
+    if (window.__xchatHost && window.__xchatHost.isConnected
+        && (window.__xchatHost.shadowRoot || window.__xchatHost.querySelector('[data-testid^="dm-"]'))) {
+        return window.__xchatHost;
+    }
+    const legacy = document.querySelector('[data-testid="xchatEmbedRoute"]');
+    if (legacy && legacy.shadowRoot) { window.__xchatHost = legacy; return legacy; }
+    for (const el of document.querySelectorAll('*')) {
+        const sr = el.shadowRoot;
+        if (sr && sr.querySelector('[data-testid^="dm-"]')) { window.__xchatHost = el; return el; }
+    }
+    return null;
+})();
                     const root = host?.shadowRoot || document;
                     return root.querySelectorAll('[data-testid^="message-text-"]').length;
                 }"""
@@ -991,7 +1197,19 @@ async def send_xchat_dm_via_browser(
 
             inserted = await page.evaluate(
                 """({sel, msg}) => {
-                    const host = document.querySelector('[data-testid="xchatEmbedRoute"]');
+                    const host = (() => {
+    if (window.__xchatHost && window.__xchatHost.isConnected
+        && (window.__xchatHost.shadowRoot || window.__xchatHost.querySelector('[data-testid^="dm-"]'))) {
+        return window.__xchatHost;
+    }
+    const legacy = document.querySelector('[data-testid="xchatEmbedRoute"]');
+    if (legacy && legacy.shadowRoot) { window.__xchatHost = legacy; return legacy; }
+    for (const el of document.querySelectorAll('*')) {
+        const sr = el.shadowRoot;
+        if (sr && sr.querySelector('[data-testid^="dm-"]')) { window.__xchatHost = el; return el; }
+    }
+    return null;
+})();
                     const root = host?.shadowRoot || document;
                     const el = root.querySelector(sel);
                     if (!el) return false;
@@ -1022,7 +1240,19 @@ async def send_xchat_dm_via_browser(
             try:
                 await page.wait_for_function(
                     """({sel, prevCount}) => {
-                        const host = document.querySelector('[data-testid="xchatEmbedRoute"]');
+                        const host = (() => {
+    if (window.__xchatHost && window.__xchatHost.isConnected
+        && (window.__xchatHost.shadowRoot || window.__xchatHost.querySelector('[data-testid^="dm-"]'))) {
+        return window.__xchatHost;
+    }
+    const legacy = document.querySelector('[data-testid="xchatEmbedRoute"]');
+    if (legacy && legacy.shadowRoot) { window.__xchatHost = legacy; return legacy; }
+    for (const el of document.querySelectorAll('*')) {
+        const sr = el.shadowRoot;
+        if (sr && sr.querySelector('[data-testid^="dm-"]')) { window.__xchatHost = el; return el; }
+    }
+    return null;
+})();
                         const root = host?.shadowRoot || document;
                         const el = root.querySelector(sel);
                         const val = el ? ((el.value ?? el.textContent) || '').trim() : '';

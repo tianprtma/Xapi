@@ -170,10 +170,12 @@ async def _ensure_pin_unlocked(page: Any, dm_pin: Optional[str]) -> bool:
     if state_val == "ready" and "/pin/" not in page.url:
         # XChat merender shell dm-container sementara sebelum redirect ke
         # gate PIN — 'ready' prematur membuat pin tidak pernah diketik dan
-        # inbox kosong. Konfirmasi stabil: kalau dalam settle window gate
-        # PIN muncul (URL /pin/ atau 4 input), batal 'ready'.
+        # inbox kosong. R84: konfirmasi stabil via POLL CEPAT (bukan sleep
+        # mati 2.5s yang dibayar setiap fetch): tunggu kondisi tetap 'ready'
+        # DAN link percakapan muncul selama 1.2s. Gate PIN transient yang
+        # muncul akan menggagalkan poll → lanjut jalur unlock. Shell kosong
+        # (tanpa link) tetap memakai jalur hati-hati lama.
         try:
-            await asyncio.sleep(2.5)
             pin_check = await page.evaluate(
                 """(pinSel) => {
                     const host = document.querySelector('[data-testid="xchatEmbedRoute"]');
@@ -189,7 +191,31 @@ async def _ensure_pin_unlocked(page: Any, dm_pin: Optional[str]) -> bool:
             if pin_check.get("gate"):
                 log.info("XChat shell transient terdeteksi — lanjut unlock PIN")
                 state_val = "pin"
-            elif not pin_check.get("links"):
+            elif pin_check.get("links"):
+                # R84: stabil-cepat — poll hingga 1.2s; gate transient yang
+                # menyusul muncul sebagai 'pin'.
+                try:
+                    stable = await page.wait_for_function(
+                        """(pinSel) => {
+                            const host = document.querySelector('[data-testid="xchatEmbedRoute"]');
+                            const root = host?.shadowRoot || document;
+                            if (window.location.href.includes('/pin/')
+                                || root.querySelectorAll(pinSel).length >= 4) {
+                                return 'pin';
+                            }
+                            return root.querySelectorAll('a[href*="/i/chat/"]').length > 0;
+                        }""",
+                        arg=PIN_INPUT_SELECTOR,
+                        timeout=1200,
+                    )
+                    stable_val = await stable.json_value()
+                    if stable_val == "pin":
+                        log.info("Gate PIN muncul saat konfirmasi cepat — lanjut unlock")
+                        state_val = "pin"
+                except Exception:
+                    # Poll timeout tanpa gate = tetap ready (link sudah ada).
+                    pass
+            else:
                 state_val = "pin"  # tidak ada isi → kemungkinan besar gate menyusul
         except Exception:  # noqa: BLE001
             pass

@@ -729,6 +729,58 @@ _OPFS_DB_JS = """async (fileName) => {
 }"""
 
 
+_OPFS_FILE_JS = """async (path) => {
+    // R90: baca file OPFS sembarang (mis. media terdekripsi
+    // dm-files-<viewer>/decrypted-media-v2/.../<hash>.jpg) sebagai base64.
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+    for (let i = 0; i < 10; i++) {
+        if (navigator.storage && navigator.storage.getDirectory) break;
+        await sleep(300);
+    }
+    if (!navigator.storage || !navigator.storage.getDirectory) return null;
+    try {
+        const parts = String(path).split('/').filter(Boolean);
+        let dir = await navigator.storage.getDirectory();
+        for (let i = 0; i < parts.length - 1; i++) {
+            dir = await dir.getDirectoryHandle(parts[i]);
+        }
+        const fh = await dir.getFileHandle(parts[parts.length - 1]);
+        const bytes = new Uint8Array(await (await fh.getFile()).arrayBuffer());
+        let bin = '';
+        for (let i = 0; i < bytes.length; i += 0x8000) {
+            bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+        }
+        return btoa(bin);
+    } catch (e) {
+        return null;
+    }
+}"""
+
+
+async def read_xchat_opfs_file(
+    page: Any, path: str, *, context: Any = None
+) -> Optional[bytes]:
+    """R90: baca bytes file OPFS via path relatif root (reuse page cache R87.2)."""
+    target = page
+    if context is not None:
+        cached = getattr(context, "_xchat_opfs_page", None)
+        if cached is not None:
+            try:
+                _ = cached.url
+                target = cached
+            except Exception:
+                target = page
+    b64 = await target.evaluate(_OPFS_FILE_JS, path)
+    if not b64 and target is not page:
+        b64 = await page.evaluate(_OPFS_FILE_JS, path)
+    if not b64:
+        return None
+    try:
+        return base64.b64decode(b64)
+    except Exception:
+        return None
+
+
 async def extract_xchat_opfs_db(
     page: Any, viewer_id: str, *, context: Any = None
 ) -> Optional[bytes]:
@@ -816,6 +868,22 @@ async def debug_inspect_opfs_media(
                     if "media" in t.lower() or "attach" in t.lower():
                         out["sample_" + t] = [
                             dict(x) for x in conn.execute(f"SELECT * FROM '{t}' LIMIT 3")]
+                if "dm_local_attachment" in tables:
+                    locals_ = [dict(x) for x in conn.execute(
+                        "SELECT * FROM dm_local_attachment WHERE message_id=?",
+                        (entry_id,))]
+                    files = []
+                    for la in locals_:
+                        lp = la.get("local_path")
+                        raw = await read_xchat_opfs_file(page, lp, context=context) if lp else None
+                        files.append({
+                            "local_path": lp,
+                            "attachment_type": la.get("attachment_type"),
+                            "file_size_db": la.get("file_size"),
+                            "read_bytes": len(raw) if raw else 0,
+                            "magic": raw[:4].hex() if raw else None,
+                        })
+                    out["local_files"] = files
                 return out
             finally:
                 conn.close()

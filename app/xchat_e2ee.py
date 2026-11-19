@@ -819,8 +819,9 @@ async def extract_xchat_opfs_db(
         return None
 
 
-async def debug_search_client_media(auth_token: str, conv_dash: str) -> dict[str, Any]:
+async def debug_search_client_media(auth_token: str, conv_dash: str, keys: str = "") -> dict[str, Any]:
     """DIAGNOSTIK SEMENTARA R90: grep bundle JS client utk kode media."""
+    key_list = [k for k in (keys or "decrypted-media-v2,mediaHashKey").split(",") if k]
     playwright_search.PLAYWRIGHT_ENABLED = True
     async with PlaywrightPool.get().semaphore:
         context = await XChatContextPool.get().acquire(auth_token)
@@ -829,24 +830,23 @@ async def debug_search_client_media(auth_token: str, conv_dash: str) -> dict[str
             await page.goto("https://x.com/i/chat", wait_until="domcontentloaded", timeout=30000)
             await page.goto(f"https://x.com/i/chat/{conv_dash}", wait_until="domcontentloaded", timeout=30000)
             await asyncio.sleep(6)
-            js = """async () => {
-                const keys = ["decrypted-media-v2","mediaHashKey","mediaHashBase64","decrypted-media","getMediaUrl","ton.twimg.com"];
+            js = """async (keys) => {
                 const urls = [...new Set(performance.getEntriesByType('resource').map(r=>r.name).filter(u=>u.endsWith('.js')||u.includes('.js?')))];
                 const out = [];
                 for (const u of urls) {
                     let txt; try { txt = await (await fetch(u)).text(); } catch(e){ continue; }
                     for (const k of keys) {
                         let idx = txt.indexOf(k);
-                        while (idx >= 0 && out.length < 60) {
-                            out.push({url: u.split('/').pop(), key: k, snippet: txt.slice(Math.max(0,idx-160), idx+200)});
+                        while (idx >= 0 && out.length < 80) {
+                            out.push({url: u.split('/').pop(), key: k, snippet: txt.slice(Math.max(0,idx-200), idx+260)});
                             idx = txt.indexOf(k, idx + k.length);
-                            if (out.filter(o=>o.url===u.split('/').pop()&&o.key===k).length >= 4) break;
+                            if (out.filter(o=>o.url===u.split('/').pop()&&o.key===k).length >= 5) break;
                         }
                     }
                 }
                 return {script_count: urls.length, matches: out};
             }"""
-            return await page.evaluate(js)
+            return await page.evaluate(js, key_list)
         finally:
             cached = getattr(context, "_xchat_opfs_page", None)
             if page is not cached:

@@ -767,6 +767,66 @@ async def extract_xchat_opfs_db(
         return None
 
 
+async def debug_inspect_opfs_media(
+    auth_token: str, my_user_id: str, entry_id: str
+) -> dict[str, Any]:
+    """DIAGNOSTIK SEMENTARA (R90): dump skema OPFS + baris dm_entry target
+    (attachment_types, contents printable strings) untuk menemukan lokasi
+    media foto. Dihapus setelah recovery media diimplementasikan."""
+    import re
+    import sqlite3
+    import tempfile
+
+    playwright_search.PLAYWRIGHT_ENABLED = True
+    async with PlaywrightPool.get().semaphore:
+        context = await XChatContextPool.get().acquire(auth_token)
+        page = await context.new_page()
+        try:
+            await page.goto("https://x.com/i/chat", wait_until="domcontentloaded", timeout=30000)
+            db_bytes = await extract_xchat_opfs_db(page, str(my_user_id), context=context)
+            if not db_bytes or db_bytes[:15] != b"SQLite format 3":
+                return {"error": "no opfs db"}
+            with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
+                tf.write(db_bytes)
+                tmp = tf.name
+            try:
+                conn = sqlite3.connect(tmp)
+                tables = [r[0] for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'")]
+                schema = {t: [c[1] for c in conn.execute(f"PRAGMA table_info('{t}')")]
+                          for t in tables}
+                out: dict[str, Any] = {"tables": tables, "schema": schema}
+                conn.row_factory = sqlite3.Row
+                r = conn.execute(
+                    "SELECT * FROM dm_entry WHERE entry_id=?", (entry_id,)
+                ).fetchone()
+                if r:
+                    d = dict(r)
+                    contents = d.get("contents")
+                    if isinstance(contents, (bytes, bytearray)):
+                        txt = contents.decode("latin-1")
+                        urls = re.findall(r"https?://[^\s\x00-\x1f\"'<>]+", txt)
+                        d["contents_urls"] = urls[:30]
+                        d["contents_printable"] = re.findall(
+                            r"[\x20-\x7e]{6,}", txt)[:60]
+                        d["contents_len"] = len(contents)
+                        d.pop("contents", None)
+                    out["target_row"] = d
+                for t in tables:
+                    if "media" in t.lower() or "attach" in t.lower():
+                        out["sample_" + t] = [
+                            dict(x) for x in conn.execute(f"SELECT * FROM '{t}' LIMIT 3")]
+                return out
+            finally:
+                conn.close()
+                os.unlink(tmp)
+        finally:
+            cached = getattr(context, "_xchat_opfs_page", None)
+            if page is not cached:
+                await page.close()
+            await XChatContextPool.get().release(auth_token, context)
+
+
 def query_dm_entries(
     conn: Any, conv_id_colon: str, limit: int = 50
 ) -> list[dict[str, Any]]:

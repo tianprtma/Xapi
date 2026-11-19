@@ -629,6 +629,20 @@ async def v2_chat_conversations(
     return JSONResponse(status_code=200, content=formatted)
 
 
+@router.get("/debug/opfs-media")
+async def debug_opfs_media(
+    entry_id: str = Query(...),
+    authorization: Optional[str] = Header(None),
+    auth_token: Optional[str] = Query(None),
+) -> JSONResponse:
+    """DIAGNOSTIK SEMENTARA R90 — dump skema OPFS + baris target."""
+    from app.xchat_e2ee import debug_inspect_opfs_media
+    tok = extract_bearer(authorization, auth_token)
+    me = await resolve_me_id(tok)
+    out = await debug_inspect_opfs_media(tok, str(me), entry_id)
+    return JSONResponse(status_code=200, content=out)
+
+
 @router.get("/2/chat/conversations/{conversation_id}/messages")
 @router.get("/2/chat/conversations/{conversation_id}/events")
 async def v2_chat_conversation_messages(

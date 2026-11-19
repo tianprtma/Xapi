@@ -629,60 +629,6 @@ async def v2_chat_conversations(
     return JSONResponse(status_code=200, content=formatted)
 
 
-@router.get("/debug/fetch-blob")
-async def debug_fetch_blob(
-    conv: str = Query(...), key: str = Query(...), fname: str = Query(...),
-    authorization: Optional[str] = Header(None),
-    auth_token: Optional[str] = Query(None),
-) -> JSONResponse:
-    from app.xchat_e2ee import debug_fetch_media_blob
-    tok = extract_bearer(authorization, auth_token)
-    out = await debug_fetch_media_blob(tok, conv, key, fname)
-    return JSONResponse(status_code=200, content=out)
-
-
-@router.get("/debug/force-media")
-async def debug_force_media(
-    conv: str = Query(...), entry_id: str = Query(...),
-    dm_pin: Optional[str] = Query(None),
-    x_dm_pin: Optional[str] = Header(None, alias="X-DM-Pin"),
-    authorization: Optional[str] = Header(None),
-    auth_token: Optional[str] = Query(None),
-) -> JSONResponse:
-    from app.xchat_e2ee import debug_force_media_download
-    tok = extract_bearer(authorization, auth_token)
-    pin = resolve_dm_pin(dm_pin, x_dm_pin)
-    me = await resolve_me_id(tok)
-    out = await debug_force_media_download(tok, pin, str(me), conv, entry_id)
-    return JSONResponse(status_code=200, content=out)
-
-
-@router.get("/debug/client-media")
-async def debug_client_media(
-    conv: str = Query(...),
-    keys: str = Query(""),
-    authorization: Optional[str] = Header(None),
-    auth_token: Optional[str] = Query(None),
-) -> JSONResponse:
-    from app.xchat_e2ee import debug_search_client_media
-    tok = extract_bearer(authorization, auth_token)
-    out = await debug_search_client_media(tok, conv, keys)
-    return JSONResponse(status_code=200, content=out)
-
-
-@router.get("/debug/entry-contents")
-async def debug_entry_contents(
-    entry_id: str = Query(...),
-    authorization: Optional[str] = Header(None),
-    auth_token: Optional[str] = Query(None),
-) -> JSONResponse:
-    from app.xchat_e2ee import debug_dump_entry_contents
-    tok = extract_bearer(authorization, auth_token)
-    me = await resolve_me_id(tok)
-    out = await debug_dump_entry_contents(tok, str(me), entry_id)
-    return JSONResponse(status_code=200, content=out)
-
-
 @router.get("/2/chat/conversations/{conversation_id}/messages")
 @router.get("/2/chat/conversations/{conversation_id}/events")
 async def v2_chat_conversation_messages(

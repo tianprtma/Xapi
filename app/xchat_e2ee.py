@@ -1023,6 +1023,11 @@ async def recover_opfs_media_for_events(
         "SELECT name FROM sqlite_master WHERE type='table'")}
     if "dm_local_attachment" not in tables:
         return
+    try:
+        _total_la = conn.execute("SELECT COUNT(*) FROM dm_local_attachment").fetchone()[0]
+        log.info("R90: snapshot dm_local_attachment total=%d", _total_la)
+    except Exception:
+        pass
     by_id = {str(r.get("entry_id") or ""): r for r in rows}
     reads = 0
     for ev in events:

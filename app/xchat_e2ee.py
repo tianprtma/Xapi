@@ -623,6 +623,33 @@ async def unlock_and_read_xchat_conversation(
         try:
             context = await XChatContextPool.get().acquire(auth_token)
             page = await context.new_page()
+            # R85: goto percakapan dari page dingin memaksa X memuat chunk
+            # ondemand XChatEmbed dari server — 27-79s, kadang tidak pernah
+            # termuat (checked=0 berjam-jam). Warmup `/i/chat` SEKALI per
+            # konteks memuat chunk ke cache HTTP: percakapan berikutnya
+            # terbuka ~3s. Aman: host/sesi sama, tidak menyentuh percakapan.
+            ctx_warmed = getattr(context, "_xchat_embed_warmed", False)
+            if not ctx_warmed:
+                try:
+                    await page.goto(
+                        "https://x.com/i/chat",
+                        wait_until="domcontentloaded",
+                        timeout=25000,
+                    )
+                    try:
+                        await page.wait_for_function(
+                            """() => !!document.querySelector(
+                                '[data-testid="xchatEmbedRoute"]'
+                            )""",
+                            timeout=15000,
+                        )
+                        context._xchat_embed_warmed = True
+                    except Exception:
+                        # Embed belum termuat — warmup tetap menghangatkan
+                        # cache JS chunk; coba lagi nanti di fetch berikutnya.
+                        pass
+                except Exception as warm_exc:  # noqa: BLE001
+                    log.debug("Warmup /i/chat gagal (dilanjutkan): %s", warm_exc)
             url = f"https://x.com/i/chat/{norm_conv_id}"
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
             unlocked = await _ensure_pin_unlocked(page, dm_pin)

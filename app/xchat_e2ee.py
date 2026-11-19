@@ -1027,6 +1027,10 @@ async def recover_opfs_media_for_events(
             )
             if cached:
                 atts.append(cached)
+        log.info(
+            "R90: entry %s expected=%d recovered=%d locals=%d",
+            eid, expected, len(atts), len(locals_),
+        )
         if atts and (expected <= 0 or len(atts) >= expected):
             ev["_xapi_attachments"] = atts
             ev["attachments"] = {

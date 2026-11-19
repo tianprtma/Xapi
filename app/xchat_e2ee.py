@@ -819,82 +819,6 @@ async def extract_xchat_opfs_db(
         return None
 
 
-async def debug_inspect_opfs_media(
-    auth_token: str, my_user_id: str, entry_id: str
-) -> dict[str, Any]:
-    """DIAGNOSTIK SEMENTARA (R90): dump skema OPFS + baris dm_entry target
-    (attachment_types, contents printable strings) untuk menemukan lokasi
-    media foto. Dihapus setelah recovery media diimplementasikan."""
-    import re
-    import sqlite3
-    import tempfile
-
-    playwright_search.PLAYWRIGHT_ENABLED = True
-    async with PlaywrightPool.get().semaphore:
-        context = await XChatContextPool.get().acquire(auth_token)
-        page = await context.new_page()
-        try:
-            await page.goto("https://x.com/i/chat", wait_until="domcontentloaded", timeout=30000)
-            db_bytes = await extract_xchat_opfs_db(page, str(my_user_id), context=context)
-            if not db_bytes or db_bytes[:15] != b"SQLite format 3":
-                return {"error": "no opfs db"}
-            with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
-                tf.write(db_bytes)
-                tmp = tf.name
-            try:
-                conn = sqlite3.connect(tmp)
-                tables = [r[0] for r in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'")]
-                schema = {t: [c[1] for c in conn.execute(f"PRAGMA table_info('{t}')")]
-                          for t in tables}
-                out: dict[str, Any] = {"tables": tables, "schema": schema}
-                conn.row_factory = sqlite3.Row
-                r = conn.execute(
-                    "SELECT * FROM dm_entry WHERE entry_id=?", (entry_id,)
-                ).fetchone()
-                if r:
-                    d = dict(r)
-                    contents = d.get("contents")
-                    if isinstance(contents, (bytes, bytearray)):
-                        txt = contents.decode("latin-1")
-                        urls = re.findall(r"https?://[^\s\x00-\x1f\"'<>]+", txt)
-                        d["contents_urls"] = urls[:30]
-                        d["contents_printable"] = re.findall(
-                            r"[\x20-\x7e]{6,}", txt)[:60]
-                        d["contents_len"] = len(contents)
-                        d.pop("contents", None)
-                    out["target_row"] = d
-                for t in tables:
-                    if "media" in t.lower() or "attach" in t.lower():
-                        out["sample_" + t] = [
-                            dict(x) for x in conn.execute(f"SELECT * FROM '{t}' LIMIT 3")]
-                if "dm_local_attachment" in tables:
-                    locals_ = [dict(x) for x in conn.execute(
-                        "SELECT * FROM dm_local_attachment WHERE message_id=?",
-                        (entry_id,))]
-                    files = []
-                    for la in locals_:
-                        lp = la.get("local_path")
-                        raw = await read_xchat_opfs_file(page, lp, context=context) if lp else None
-                        files.append({
-                            "local_path": lp,
-                            "attachment_type": la.get("attachment_type"),
-                            "file_size_db": la.get("file_size"),
-                            "read_bytes": len(raw) if raw else 0,
-                            "magic": raw[:4].hex() if raw else None,
-                        })
-                    out["local_files"] = files
-                return out
-            finally:
-                conn.close()
-                os.unlink(tmp)
-        finally:
-            cached = getattr(context, "_xchat_opfs_page", None)
-            if page is not cached:
-                await page.close()
-            await XChatContextPool.get().release(auth_token, context)
-
-
 def query_dm_entries(
     conn: Any, conv_id_colon: str, limit: int = 50
 ) -> list[dict[str, Any]]:
@@ -904,7 +828,7 @@ def query_dm_entries(
         """
         SELECT entry_id, timestamp, sender_id, plain_text,
                has_attachment, message_status, deleted, event_type,
-               attachment_types
+               attachment_types, contents
         FROM dm_entry
         WHERE conversation_id = ? AND deleted = 0
         ORDER BY timestamp DESC
@@ -914,7 +838,7 @@ def query_dm_entries(
     ).fetchall()
     cols = ["entry_id", "timestamp", "sender_id", "plain_text",
             "has_attachment", "message_status", "deleted", "event_type",
-            "attachment_types"]
+            "attachment_types", "contents"]
     return [dict(zip(cols, r)) for r in rows]
 
 
@@ -1011,16 +935,108 @@ def project_dm_entries_to_events(
             "_xchat_media_state": "none",
         }
         if row.get("has_attachment"):
-            # Lampiran ada di db (contents BLOB / attachment_types) tapi media
-            # bytes tidak tersedia dari jalur ini — tandai pending supaya jalur
-            # media bot menanganinya (R80 menjamin tenggat text-only).
+            # R90: lampiran ditandai pending dulu; recover_opfs_media_for_events
+            # membaca file terdekripsi dari dm_local_attachment (OPFS) dan
+            # mengubahnya jadi ready bila semua foto terpulihkan. R80 menjamin
+            # tenggat text-only bila media tak kunjung lengkap.
             event["_xchat_media_pending"] = True
-            event["_xchat_media_state"] = "pending"
-            event.pop("_xchat_media_state", None)
             event["_xchat_media_state"] = "pending"
         events.append(event)
     events.reverse()  # kronologis
     return events
+
+
+def _mime_from_opfs_path(path: str, attachment_type: Optional[str] = None) -> str:
+    """Tebak MIME file media OPFS dari ekstensi local_path (fallback type)."""
+    p = (path or "").lower()
+    if p.endswith((".jpg", ".jpeg")):
+        return "image/jpeg"
+    if p.endswith(".png"):
+        return "image/png"
+    if p.endswith(".webp"):
+        return "image/webp"
+    if p.endswith(".gif"):
+        return "image/gif"
+    if p.endswith(".mp4"):
+        return "video/mp4"
+    if p.endswith(".mov"):
+        return "video/quicktime"
+    if (attachment_type or "").lower().startswith("mediaimage"):
+        return "image/jpeg"
+    return "image/jpeg"
+
+
+async def recover_opfs_media_for_events(
+    conn: Any,
+    page: Any,
+    context: Any,
+    rows: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+    *,
+    max_files: int = 16,
+) -> None:
+    """R90: pulihkan media foto/video dari OPFS untuk event bertanda pending.
+
+    `dm_local_attachment` memetakan message_id (= entry_id) → local_path file
+    terdekripsi di OPFS. Baca bytes via read_xchat_opfs_file, cache sebagai
+    attachment proxy (cache_e2ee_media). Set `_xapi_attachments` + state ready
+    HANYA bila jumlah terpulihkan >= jumlah lampiran yang diharapkan (terhitung
+    dari `attachmentId` dalam contents BLOB) — supaya menfess multi-foto tidak
+    terposting parsial. Bila belum lengkap, biarkan pending (R80 fallback).
+    Mutasi `events` in-place; bounded `max_files` bacaan per panggilan.
+    """
+    tables = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    if "dm_local_attachment" not in tables:
+        return
+    by_id = {str(r.get("entry_id") or ""): r for r in rows}
+    reads = 0
+    for ev in events:
+        if not ev.get("_xchat_media_pending"):
+            continue
+        eid = str(ev.get("id") or "")
+        row = by_id.get(eid) or {}
+        contents = row.get("contents")
+        expected = (
+            contents.count(b"attachmentId")
+            if isinstance(contents, (bytes, bytearray)) else 0
+        )
+        try:
+            locals_ = [dict(x) for x in conn.execute(
+                "SELECT * FROM dm_local_attachment WHERE message_id=?", (eid,))]
+        except Exception:
+            continue
+        atts: list[dict[str, Any]] = []
+        for la in locals_:
+            if reads >= max_files:
+                break
+            lp = la.get("local_path")
+            if not lp:
+                continue
+            raw = await read_xchat_opfs_file(page, lp, context=context)
+            reads += 1
+            if not raw:
+                continue
+            mime = _mime_from_opfs_path(lp, la.get("attachment_type"))
+            kind = "video" if mime.startswith("video") else "photo"
+            data_url = f"data:{mime};base64," + base64.b64encode(raw).decode("ascii")
+            cached = cache_e2ee_media(
+                data_url,
+                key_hint=f"{eid}_{la.get('attachment_id') or reads}",
+                kind=kind,
+            )
+            if cached:
+                atts.append(cached)
+        if atts and (expected <= 0 or len(atts) >= expected):
+            ev["_xapi_attachments"] = atts
+            ev["attachments"] = {
+                "media_keys": [
+                    f"{'7' if a.get('kind') == 'video' else '3'}_{a['media_id']}"
+                    for a in atts
+                ]
+            }
+            ev["_xchat_media_state"] = "ready"
+            ev.pop("_xchat_media_pending", None)
 
 
 def project_xchat_message_rows(
@@ -1173,27 +1189,38 @@ async def unlock_and_read_xchat_conversation(
                         with _tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
                             tf.write(db_bytes)
                             tmp_path = tf.name
+                        conn = _sqlite3.connect(tmp_path)
                         try:
-                            conn = _sqlite3.connect(tmp_path)
                             rows = query_dm_entries(
                                 conn, norm_conv_id.replace("-", ":"), max_results
+                            )
+                            if rows:
+                                events = project_dm_entries_to_events(
+                                    rows, norm_conv_id
+                                )
+                                # R90: pulihkan media foto/video dari OPFS
+                                # (dm_local_attachment) untuk event pending.
+                                try:
+                                    await recover_opfs_media_for_events(
+                                        conn, page, context, rows, events
+                                    )
+                                except Exception as media_exc:  # noqa: BLE001
+                                    log.debug(
+                                        "R90: recovery media OPFS gagal (%s) — pending",
+                                        media_exc,
+                                    )
+                                log.info(
+                                    "R87: OPFS sqlite memulihkan %d event percakapan %s",
+                                    len(events), norm_conv_id,
+                                )
+                                return events[:max_results]
+                            log.debug(
+                                "R87: OPFS sqlite kosong untuk %s — lanjut jalur DOM",
+                                norm_conv_id,
                             )
                         finally:
                             conn.close()
                             os.unlink(tmp_path)
-                        if rows:
-                            events = project_dm_entries_to_events(
-                                rows, norm_conv_id
-                            )
-                            log.info(
-                                "R87: OPFS sqlite memulihkan %d event percakapan %s",
-                                len(events), norm_conv_id,
-                            )
-                            return events[:max_results]
-                        log.debug(
-                            "R87: OPFS sqlite kosong untuk %s — lanjut jalur DOM",
-                            norm_conv_id,
-                        )
                 except Exception as opfs_exc:  # noqa: BLE001
                     log.debug("R87: baca OPFS sqlite gagal (%s) — lanjut DOM", opfs_exc)
 

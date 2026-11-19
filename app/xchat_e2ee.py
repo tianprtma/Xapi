@@ -18,6 +18,7 @@ import logging
 import os
 import secrets
 import time
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import playwright_search
@@ -661,6 +662,111 @@ async def unlock_and_read_xchat_inbox(
                 await XChatContextPool.get().release(auth_token, context)
 
 
+# ── R87: pembacaan XChat via SQLite OPFS ────────────────────────────────────
+# XChat generasi baru (Vite + Module Federation) menyimpan pesan di SQLite
+# OPFS `backups/chat_<viewer_id>.db` dan menyinkronkannya lewat websocket.
+# Tabel dm_entry berisi plain_text SUDAH TERDEKRIPSI + entry_id UUID +
+# timestamp epoch-ms + sender_id — mengungguli render DOM yang di headless
+# tidak pernah menampilkan baris pesan (hang 60-90s/conv).
+
+_OPFS_DB_JS = """async (fileName) => {
+    const root = await navigator.storage.getDirectory();
+    try {
+        const dir = await root.getDirectoryHandle('backups');
+        const fh = await dir.getFileHandle(fileName);
+        const bytes = new Uint8Array(await (await fh.getFile()).arrayBuffer());
+        let bin = '';
+        for (let i = 0; i < bytes.length; i += 0x8000) {
+            bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+        }
+        return btoa(bin);
+    } catch (e) {
+        return null;
+    }
+}"""
+
+
+async def extract_xchat_opfs_db(page: Any, viewer_id: str) -> Optional[bytes]:
+    """Baca file SQLite OPFS `backups/chat_<viewer_id>.db` dari halaman X.
+    Kembalikan bytes db, atau None bila file tidak ada."""
+    b64 = await page.evaluate(_OPFS_DB_JS, f"chat_{viewer_id}.db")
+    if not b64:
+        return None
+    try:
+        import base64 as _b64
+        return _b64.b64decode(b64)
+    except Exception:
+        return None
+
+
+def query_dm_entries(
+    conn: Any, conv_id_colon: str, limit: int = 50
+) -> list[dict[str, Any]]:
+    """Query baris dm_entry untuk satu percakapan (id format kolon),
+    terbaru dulu."""
+    rows = conn.execute(
+        """
+        SELECT entry_id, timestamp, sender_id, plain_text,
+               has_attachment, message_status, deleted, event_type,
+               attachment_types
+        FROM dm_entry
+        WHERE conversation_id = ? AND deleted = 0
+        ORDER BY timestamp DESC
+        LIMIT ?
+        """,
+        (conv_id_colon, max(1, int(limit))),
+    ).fetchall()
+    cols = ["entry_id", "timestamp", "sender_id", "plain_text",
+            "has_attachment", "message_status", "deleted", "event_type",
+            "attachment_types"]
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def project_dm_entries_to_events(
+    rows: list[dict[str, Any]], conversation_id: str
+) -> list[dict[str, Any]]:
+    """Baris dm_entry → event format Xapi (kompatibel dengan keluaran
+    unlock_and_read_xchat_conversation)."""
+    conv_dash = conversation_id.replace(":", "-")
+    events: list[dict[str, Any]] = []
+    for row in rows:
+        entry_id = str(row.get("entry_id") or "")
+        text = (row.get("plain_text") or "").strip()
+        if not entry_id or not text:
+            continue
+        if row.get("deleted"):
+            continue
+        ts_ms = row.get("timestamp")
+        created_at = None
+        if isinstance(ts_ms, (int, float)) and ts_ms > 0:
+            created_at = (
+                datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+                .strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+            )
+        event: dict[str, Any] = {
+            "id": entry_id,
+            "event_type": "MessageCreate",
+            "dm_conversation_id": conv_dash,
+            "sender_id": str(row.get("sender_id") or ""),
+            "text": text,
+            "created_at": created_at,
+            "is_outgoing": str(row.get("sender_id") or "") == "" and False,
+            "_xchat_decrypted": True,
+            "_xchat_media_state": "none",
+        }
+        if row.get("has_attachment"):
+            # Lampiran ada di db (contents BLOB / attachment_types) tapi media
+            # bytes tidak tersedia dari jalur ini — tandai pending supaya jalur
+            # media bot menanganinya (R80 menjamin tenggat text-only).
+            event["_xchat_media_pending"] = True
+            event["_xchat_media_state"] = "pending"
+            event.pop("_xchat_media_state", None)
+            event["_xchat_media_state"] = "pending"
+        events.append(event)
+    events.reverse()  # kronologis
+    return events
+
+
 def project_xchat_message_rows(
     rows_data: list[dict[str, Any]], conversation_id: str, max_results: int = 50,
 ) -> list[dict[str, Any]]:
@@ -796,6 +902,45 @@ async def unlock_and_read_xchat_conversation(
                         pass
                 except Exception as warm_exc:  # noqa: BLE001
                     log.debug("Warmup /i/chat gagal (dilanjutkan): %s", warm_exc)
+
+            # R87: JALUR UTAMA BARU — baca SQLite OPFS (sinkron websocket,
+            # plain_text terdekripsi). Halaman /i/chat cukup untuk mengaktifkan
+            # sinkronisasi; tidak perlu menunggu baris DOM pernah dirender
+            # (di headless, XChat baru TIDAK merender baris — hang 60-90s).
+            if my_user_id:
+                try:
+                    db_bytes = await extract_xchat_opfs_db(page, str(my_user_id))
+                    if db_bytes and db_bytes[:15] == b"SQLite format 3":
+                        import sqlite3 as _sqlite3
+                        import tempfile as _tempfile
+
+                        with _tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
+                            tf.write(db_bytes)
+                            tmp_path = tf.name
+                        try:
+                            conn = _sqlite3.connect(tmp_path)
+                            rows = query_dm_entries(
+                                conn, norm_conv_id.replace("-", ":"), max_results
+                            )
+                        finally:
+                            conn.close()
+                            os.unlink(tmp_path)
+                        if rows:
+                            events = project_dm_entries_to_events(
+                                rows, norm_conv_id
+                            )
+                            log.info(
+                                "R87: OPFS sqlite memulihkan %d event percakapan %s",
+                                len(events), norm_conv_id,
+                            )
+                            return events[:max_results]
+                        log.debug(
+                            "R87: OPFS sqlite kosong untuk %s — lanjut jalur DOM",
+                            norm_conv_id,
+                        )
+                except Exception as opfs_exc:  # noqa: BLE001
+                    log.debug("R87: baca OPFS sqlite gagal (%s) — lanjut DOM", opfs_exc)
+
             url = f"https://x.com/i/chat/{norm_conv_id}"
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
             unlocked = await _ensure_pin_unlocked(page, dm_pin)

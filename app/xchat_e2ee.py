@@ -703,6 +703,14 @@ async def unlock_and_read_xchat_inbox(
 # tidak pernah menampilkan baris pesan (hang 60-90s/conv).
 
 _OPFS_DB_JS = """async (fileName) => {
+    // R87.1: navigator.storage.getDirectory bisa undefined di page yang baru
+    // dibuka dari konteks dingin (API belum ter-expose). Poll hingga siap.
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+    for (let i = 0; i < 10; i++) {
+        if (navigator.storage && navigator.storage.getDirectory) break;
+        await sleep(300);
+    }
+    if (!navigator.storage || !navigator.storage.getDirectory) return null;
     const root = await navigator.storage.getDirectory();
     try {
         const dir = await root.getDirectoryHandle('backups');

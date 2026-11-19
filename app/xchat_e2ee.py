@@ -402,6 +402,39 @@ async def unlock_and_read_xchat_inbox(
             context = await XChatContextPool.get().acquire(auth_token)
             page = await context.new_page()
             await page.goto("https://x.com/i/chat", wait_until="domcontentloaded", timeout=30000)
+
+            # R88: JALUR UTAMA — daftar percakapan dari OPFS sqlite (sama
+            # dengan R87). Sinkronisasi websocket sudah berjalan dari /i/chat;
+            # tidak perlu menunggu sidebar DOM dirender (tidak pernah muncul
+            # di headless XChat baru — wait 10-12s sia-sia per sweep).
+            if my_user_id:
+                try:
+                    db_bytes = await extract_xchat_opfs_db(page, str(my_user_id))
+                    if db_bytes and db_bytes[:15] == b"SQLite format 3":
+                        import sqlite3 as _sqlite3
+                        import tempfile as _tempfile
+
+                        with _tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
+                            tf.write(db_bytes)
+                            tmp_path = tf.name
+                        try:
+                            conn = _sqlite3.connect(tmp_path)
+                            rows = query_inbox_rows(
+                                conn, str(my_user_id), max_results
+                            )
+                        finally:
+                            conn.close()
+                            os.unlink(tmp_path)
+                        if rows:
+                            log.info(
+                                "R88: OPFS sqlite memulihkan %d percakapan inbox",
+                                len(rows),
+                            )
+                            return rows[:max_results]
+                        log.debug("R88: OPFS sqlite kosong — lanjut jalur DOM")
+                except Exception as opfs_exc:  # noqa: BLE001
+                    log.debug("R88: baca OPFS sqlite gagal (%s) — lanjut DOM", opfs_exc)
+
             unlocked = await _ensure_pin_unlocked(page, dm_pin)
             if not unlocked:
                 return []
@@ -720,6 +753,66 @@ def query_dm_entries(
             "has_attachment", "message_status", "deleted", "event_type",
             "attachment_types"]
     return [dict(zip(cols, r)) for r in rows]
+
+
+def query_inbox_rows(
+    conn: Any, bot_user_id: str, limit: int = 50
+) -> list[dict[str, Any]]:
+    """R88: daftar percakapan terbaru dari OPFS sqlite — pengganti scraper
+    DOM inbox. Ambil dm_entry terbaru per conversation_id (plain_text jadi
+    preview, timestamp jadi umur) lalu buang percakapan yang dm_conversation
+    menandai deleted. Keluaran meniru unlock_and_read_xchat_inbox: id minus,
+    conv_href, preview_text, relative_age_ms."""
+    convs = conn.execute(
+        """
+        SELECT e.conversation_id AS cid,
+               e.timestamp AS ts,
+               e.plain_text AS preview,
+               e.sender_id AS sender
+        FROM dm_entry e
+        JOIN (
+            SELECT conversation_id, MAX(timestamp) AS max_ts
+            FROM dm_entry
+            WHERE deleted = 0 AND conversation_id IS NOT NULL
+            GROUP BY conversation_id
+        ) latest
+          ON latest.conversation_id = e.conversation_id
+         AND latest.max_ts = e.timestamp
+        WHERE e.deleted = 0
+        ORDER BY e.timestamp DESC
+        LIMIT ?
+        """,
+        (max(1, int(limit)) * 2,),
+    ).fetchall()
+    now_ms = int(time.time() * 1000)
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for cid, ts, preview, sender in convs:
+        if not cid or ":" not in cid or cid in seen:
+            continue
+        dash_id = cid.replace(":", "-")
+        try:
+            deleted_flag = conn.execute(
+                "SELECT deleted FROM dm_conversation WHERE conversation_id = ?",
+                (cid,),
+            ).fetchone()
+            if deleted_flag and deleted_flag[0]:
+                continue
+        except Exception:
+            pass
+        seen.add(cid)
+        out.append({
+            "id": dash_id,
+            "conv_href": f"/i/chat/{dash_id}",
+            "preview_text": (preview or "")[:120],
+            "relative_age_ms": max(0, now_ms - (ts or now_ms)),
+            "is_unread": False,
+            "last_sender_id": str(sender or ""),
+            "last_ts": ts,
+        })
+        if len(out) >= max(1, int(limit)):
+            break
+    return out
 
 
 def project_dm_entries_to_events(

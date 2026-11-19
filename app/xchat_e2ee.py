@@ -1029,6 +1029,14 @@ async def recover_opfs_media_for_events(
     except Exception:
         pass
     by_id = {str(r.get("entry_id") or ""): r for r in rows}
+    _cc = by_id.get("cc57d878-7fee-43b4-b9db-3b59f4c54f2e")
+    log.info(
+        "R90: rows=%d cc57_present=%s cc57_hasatt=%s cc57_textlen=%s pending_events=%d",
+        len(rows), _cc is not None,
+        (_cc or {}).get("has_attachment"),
+        len((_cc or {}).get("plain_text") or ""),
+        sum(1 for e in events if e.get("_xchat_media_pending")),
+    )
     reads = 0
     for ev in events:
         if not ev.get("_xchat_media_pending"):

@@ -819,6 +819,43 @@ async def extract_xchat_opfs_db(
         return None
 
 
+async def debug_dump_bundle(auth_token: str, conv_dash: str, pattern: str) -> dict[str, Any]:
+    """DIAGNOSTIK SEMENTARA R90: simpan bundle JS cocok pattern ke /tmp utk analisis."""
+    playwright_search.PLAYWRIGHT_ENABLED = True
+    async with PlaywrightPool.get().semaphore:
+        context = await XChatContextPool.get().acquire(auth_token)
+        page = await context.new_page()
+        try:
+            await page.goto("https://x.com/i/chat", wait_until="domcontentloaded", timeout=30000)
+            await page.goto(f"https://x.com/i/chat/{conv_dash}", wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(5)
+            js = """async (pattern) => {
+                const urls = [...new Set(performance.getEntriesByType('resource').map(r=>r.name).filter(u=>u.includes('.js')))];
+                const match = urls.filter(u=>u.includes(pattern));
+                const out = [];
+                for (const u of match) {
+                    try { const txt = await (await fetch(u)).text();
+                        const fname = '/tmp/bundle_' + u.split('/').pop().split('?')[0];
+                        out.push({url: u, fname, bytes: txt.length, text: txt});
+                    } catch(e){ out.push({url: u, error: String(e)}); }
+                }
+                return out;
+            }"""
+            results = await page.evaluate(js, pattern)
+            saved = []
+            for r in results:
+                if r.get("text"):
+                    with open(r["fname"], "w") as f:
+                        f.write(r["text"])
+                    saved.append({"url": r["url"], "fname": r["fname"], "bytes": r["bytes"]})
+            return {"saved": saved}
+        finally:
+            cached = getattr(context, "_xchat_opfs_page", None)
+            if page is not cached:
+                await page.close()
+            await XChatContextPool.get().release(auth_token, context)
+
+
 def query_dm_entries(
     conn: Any, conv_id_colon: str, limit: int = 50
 ) -> list[dict[str, Any]]:

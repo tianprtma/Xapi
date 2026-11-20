@@ -781,6 +781,13 @@ async def read_xchat_opfs_file(
         return None
 
 
+# R95: cache bytes db OPFS per (context, viewer) dengan TTL pendek. Semua
+# percakapan berbagi file db yang sama; membaca ulang 18MB per conv mubazir
+# dan membuat fase fetch watch 3-4 menit. TTL pendek menjaga freshness.
+_OPFS_DB_CACHE_TTL = float(os.environ.get("XCHAT_OPFS_DB_CACHE_TTL_SEC", "20"))
+_OPFS_DB_CACHE: dict[tuple[int, str], tuple[float, bytes]] = {}
+
+
 async def extract_xchat_opfs_db(
     page: Any, viewer_id: str, *, context: Any = None
 ) -> Optional[bytes]:
@@ -790,7 +797,14 @@ async def extract_xchat_opfs_db(
     kadang tidak punya API itu (probe 3x: run-1 sukses, run-2/3 undefined).
     Bila berhasil, page disimpan sebagai `_xchat_opfs_page` pada konteks dan
     dipakai ulang untuk pemanggilan berikutnya.
+    R95: bytes di-cache per (context, viewer) selama TTL agar fetch watch
+    beruntun tidak membaca ulang file 18MB per percakapan.
     Kembalikan bytes db, atau None bila file tidak ada."""
+    cache_key = (id(context), str(viewer_id)) if context is not None else None
+    if cache_key is not None and _OPFS_DB_CACHE_TTL > 0:
+        hit = _OPFS_DB_CACHE.get(cache_key)
+        if hit is not None and (time.monotonic() - hit[0]) < _OPFS_DB_CACHE_TTL:
+            return hit[1]
     target = page
     if context is not None:
         cached = getattr(context, "_xchat_opfs_page", None)
@@ -814,9 +828,12 @@ async def extract_xchat_opfs_db(
             pass
     try:
         import base64 as _b64
-        return _b64.b64decode(b64)
+        data = _b64.b64decode(b64)
     except Exception:
         return None
+    if cache_key is not None and _OPFS_DB_CACHE_TTL > 0:
+        _OPFS_DB_CACHE[cache_key] = (time.monotonic(), data)
+    return data
 
 
 def query_dm_entries(

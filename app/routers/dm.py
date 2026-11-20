@@ -632,13 +632,14 @@ async def v2_chat_conversations(
 @router.get("/debug/key-material")
 async def debug_key_material_route(
     conv: str = Query(...),
+    tag_like: str = Query(""),
     authorization: Optional[str] = Header(None),
     auth_token: Optional[str] = Query(None),
 ) -> JSONResponse:
     from app.xchat_e2ee import debug_key_material
     tok = extract_bearer(authorization, auth_token)
     me = await resolve_me_id(tok)
-    out = await debug_key_material(tok, str(me), conv)
+    out = await debug_key_material(tok, str(me), conv, tag_like)
     return JSONResponse(status_code=200, content=out)
 
 

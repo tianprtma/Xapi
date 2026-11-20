@@ -1004,8 +1004,10 @@ async def debug_media_cdn_probe(auth_token: str, my_user_id: str, conv_dash: str
             await XChatContextPool.get().release(auth_token, context)
 
 
-async def debug_key_material(auth_token: str, my_user_id: str, conv_dash: str) -> dict[str, Any]:
-    """DIAGNOSTIK RE crypto: dump tabel kunci OPFS (schema + sample)."""
+async def debug_key_material(auth_token: str, my_user_id: str, conv_dash: str,
+                             tag_like: str = "") -> dict[str, Any]:
+    """DIAGNOSTIK RE crypto: dump tabel kunci OPFS (schema + sample).
+    tag_like: filter dm_key_material.tag (LIKE), dump hex penuh max 30 baris."""
     import sqlite3
     import tempfile
     playwright_search.PLAYWRIGHT_ENABLED = True
@@ -1042,6 +1044,28 @@ async def debug_key_material(auth_token: str, my_user_id: str, conv_dash: str) -
                         out[t] = {"cols": cols, "count": cnt, "sample": sample}
                     except Exception as e:
                         out[t] = {"error": str(e)[:60]}
+                if tag_like:
+                    rows = conn.execute(
+                        "SELECT tag, bytes FROM dm_key_material WHERE tag LIKE ? LIMIT 30",
+                        (tag_like,)).fetchall()
+                    out["tag_matches"] = [
+                        {"tag": t, "len": len(b) if isinstance(b, (bytes, bytearray)) else None,
+                         "hex": b.hex() if isinstance(b, (bytes, bytearray)) else str(b)}
+                        for t, b in rows]
+                import re as _re
+                from collections import Counter
+                pats = Counter()
+                for (t,) in conn.execute("SELECT tag FROM dm_key_material"):
+                    pats[_re.sub(r"\d+", "N", str(t))] += 1
+                out["tag_patterns"] = dict(pats.most_common(30))
+                try:
+                    rows = conn.execute(
+                        "SELECT * FROM dm_conversation_key_versions WHERE conversation_id = ?",
+                        (cc,)).fetchall()
+                    cols = [c[1] for c in conn.execute("PRAGMA table_info(dm_conversation_key_versions)")]
+                    out["conv_key_versions"] = [dict(zip(cols, r)) for r in rows]
+                except Exception as e:
+                    out["conv_key_versions"] = {"error": str(e)[:60]}
                 return out
             finally:
                 conn.close(); os.unlink(tmp)

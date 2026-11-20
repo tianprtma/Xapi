@@ -865,7 +865,14 @@ async def debug_opfs_conv_media(auth_token: str, my_user_id: str, conv_dash: str
                 la = conn.execute(
                     "SELECT attachment_id, message_id, local_path, attachment_type, file_size FROM dm_local_attachment WHERE conversation_id=?",
                     (cc,)).fetchall()
-                return {"entries": [list(r) for r in entries], "local_attachment": [list(r) for r in la]}
+                try:
+                    convrow = conn.execute(
+                        "SELECT * FROM dm_conversation WHERE conversation_id=?", (cc,)).fetchall()
+                    convinfo = [list(r) for r in convrow]
+                except Exception:
+                    convinfo = []
+                return {"entries": [list(r) for r in entries], "local_attachment": [list(r) for r in la],
+                        "conversation": convinfo}
             finally:
                 conn.close(); os.unlink(tmp)
         finally:

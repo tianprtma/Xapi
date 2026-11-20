@@ -842,6 +842,68 @@ async def extract_xchat_opfs_db(
     return data
 
 
+async def debug_clear_and_capture(auth_token: str, dm_pin: Optional[str], conv_dash: str, local_path: str) -> dict[str, Any]:
+    """DIAGNOSTIK RE final: hapus file media OPFS (paksa re-download) + capture URL."""
+    captured: list = []
+    playwright_search.PLAYWRIGHT_ENABLED = True
+    async with PlaywrightPool.get().semaphore:
+        context = await XChatContextPool.get().acquire(auth_token)
+
+        def _on_req(req):
+            try:
+                u = req.url
+                if "abs.twimg.com" in u:
+                    return
+                if re.search(r"ton\.x\.com|xchat_media|/i/ton/|video\.twimg|/dm/|decrypt|media", u):
+                    captured.append({"url": u, "method": req.method, "headers": dict(req.headers)})
+            except Exception:
+                pass
+
+        context.on("request", _on_req)
+        page = await context.new_page()
+        try:
+            await page.goto("https://x.com/i/chat", wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(3)
+            target = page
+            cached = getattr(context, "_xchat_opfs_page", None)
+            if cached is not None:
+                try:
+                    _ = cached.url; target = cached
+                except Exception:
+                    target = page
+            del_js = """async (path) => {
+                const sleep=(ms)=>new Promise(r=>setTimeout(r,ms));
+                for(let i=0;i<10;i++){if(navigator.storage&&navigator.storage.getDirectory)break;await sleep(300);}
+                if(!navigator.storage||!navigator.storage.getDirectory)return {error:'no api'};
+                const parts=String(path).split('/').filter(Boolean);
+                let dir=await navigator.storage.getDirectory();
+                try {
+                    for(let i=0;i<parts.length-1;i++) dir=await dir.getDirectoryHandle(parts[i]);
+                    await dir.removeEntry(parts[parts.length-1]);
+                    return {deleted:true};
+                } catch(e){ return {deleted:false, error:String(e)}; }
+            }"""
+            delres = await target.evaluate(del_js, local_path)
+            await page.goto(f"https://x.com/i/chat/{conv_dash}", wait_until="domcontentloaded", timeout=30000)
+            await _ensure_pin_unlocked(page, dm_pin)
+            for _ in range(10):
+                await page.evaluate("""() => { for (const el of document.querySelectorAll('*')) {
+                    const sr = el.shadowRoot; if (!sr) continue;
+                    const sc = sr.querySelector('[data-testid="dm-message-scroller"]');
+                    if (sc) { sc.scrollTop = sc.scrollHeight * Math.random(); sc.dispatchEvent(new Event('scroll')); } } }""")
+                await asyncio.sleep(3)
+            return {"delete_result": delres, "captured": captured[:50], "count": len(captured)}
+        finally:
+            try:
+                context.remove_listener("request", _on_req)
+            except Exception:
+                pass
+            cached = getattr(context, "_xchat_opfs_page", None)
+            if page is not cached:
+                await page.close()
+            await XChatContextPool.get().release(auth_token, context)
+
+
 async def debug_context_request_capture(auth_token: str, dm_pin: Optional[str], conv_dash: str) -> dict[str, Any]:
     """DIAGNOSTIK RE deep: Playwright context.on('request') tangkap URL media
     lintas-page/worker (bypass encapsulation JS)."""

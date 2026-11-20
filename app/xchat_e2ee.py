@@ -1242,6 +1242,27 @@ async def debug_key_material(auth_token: str, my_user_id: str, conv_dash: str,
                 out["tag_patterns"] = dict(pats.most_common(30))
                 try:
                     rows = conn.execute(
+                        "SELECT entry_id, timestamp, sender_id, has_attachment, attachment_types, deleted "
+                        "FROM dm_entry WHERE conversation_id = ? ORDER BY timestamp DESC LIMIT 10",
+                        (cc,)).fetchall()
+                    out["conv_entries"] = [dict(zip(
+                        ["entry_id","timestamp","sender_id","has_attachment","attachment_types","deleted"], r))
+                        for r in rows]
+                except Exception as e:
+                    out["conv_entries"] = {"error": str(e)[:80]}
+                try:
+                    cnt = conn.execute("SELECT COUNT(*) FROM dm_local_attachment").fetchone()[0]
+                    rows = conn.execute(
+                        "SELECT message_id, local_path, attachment_type FROM dm_local_attachment "
+                        "WHERE local_path LIKE ? LIMIT 10", ("%" + cc + "%",)).fetchall()
+                    samp = conn.execute("SELECT message_id, local_path FROM dm_local_attachment LIMIT 3").fetchall()
+                    out["attachments"] = {"total": cnt,
+                        "conv_matches": [{"message_id": a, "local_path": b, "type": c} for a, b, c in rows],
+                        "sample": [{"message_id": a, "local_path": b} for a, b in samp]}
+                except Exception as e:
+                    out["attachments"] = {"error": str(e)[:80]}
+                try:
+                    rows = conn.execute(
                         "SELECT * FROM dm_conversation_key_versions WHERE conversation_id = ?",
                         (cc,)).fetchall()
                     cols = [c[1] for c in conn.execute("PRAGMA table_info(dm_conversation_key_versions)")]

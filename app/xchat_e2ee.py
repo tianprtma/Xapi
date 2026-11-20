@@ -904,6 +904,151 @@ async def debug_clear_and_capture(auth_token: str, dm_pin: Optional[str], conv_d
             await XChatContextPool.get().release(auth_token, context)
 
 
+_CRYPTO_HOOK_JS = """() => {
+  if (globalThis.__mf_crypto_hooked) return 'already';
+  globalThis.__mf_crypto_hooked = true;
+  const log = globalThis.__mf_crypto_log = [];
+  const cap = (o) => { if (log.length < 600) log.push(o); };
+  const hex = (b, n) => { try { const u = new Uint8Array(b); let s=''; for (let i=0;i<Math.min(u.length,n);i++) s+=u[i].toString(16).padStart(2,'0'); return s; } catch(e){ return String(e); } };
+  const blen = (b) => { try { return new Uint8Array(b).length; } catch(e){ return -1; } };
+  const s = crypto.subtle;
+  const wrap = (name) => {
+    const orig = s[name].bind(s);
+    s[name] = async function(...args) {
+      const rec = {op:name, t:Date.now()};
+      try {
+        if (name==='importKey') {
+          rec.format=args[0]; rec.algo=args[2];
+          if (args[0]==='raw'||args[0]==='pkcs8'||args[0]==='spki') { rec.keyHex=hex(args[1],96); rec.keyLen=blen(args[1]); }
+          if (args[0]==='jwk') { rec.jwk=args[1]; }
+        } else if (name==='decrypt'||name==='encrypt') {
+          rec.algo={name:args[0].name, iv:args[0].iv?hex(args[0].iv,32):null, tagLength:args[0].tagLength};
+          rec.dataLen=blen(args[2]); rec.dataHex=hex(args[2],48);
+        } else if (name==='digest') {
+          rec.algo=args[0]; rec.dataLen=blen(args[1]); rec.dataHex=hex(args[1],160);
+        } else if (name==='deriveBits') {
+          rec.algo=args[0]; rec.bits=args[2];
+        }
+      } catch(e){ rec.err=String(e); }
+      const out = await orig(...args);
+      try {
+        if (name==='decrypt'||name==='digest'||name==='deriveBits') { rec.outLen=blen(out); rec.outHex=hex(out,64); }
+      } catch(e){}
+      cap(rec);
+      return out;
+    };
+  };
+  ['importKey','decrypt','encrypt','digest','deriveBits'].forEach(wrap);
+  return 'hooked';
+}"""
+
+
+async def debug_crypto_hook(auth_token: str, dm_pin: Optional[str], my_user_id: str,
+                            conv_dash: str, entry_id: str) -> dict[str, Any]:
+    """DIAGNOSTIK RE dinamis: hook crypto.subtle (page+worker), hapus file media
+    OPFS entry terkait (paksa re-download+decrypt oleh client), kumpulkan trace
+    key/iv/plaintext. Mengungkap skema dekripsi media tanpa RE statis penuh."""
+    import sqlite3
+    import tempfile
+    captured: list = []
+    playwright_search.PLAYWRIGHT_ENABLED = True
+    async with PlaywrightPool.get().semaphore:
+        context = await XChatContextPool.get().acquire(auth_token)
+
+        def _on_req(req):
+            try:
+                u = req.url
+                if "ton.x.com" in u or "xchat_media" in u:
+                    captured.append(u)
+            except Exception:
+                pass
+
+        context.on("request", _on_req)
+        page = await context.new_page()
+
+        def _on_worker(w):
+            try:
+                asyncio.get_event_loop().create_task(w.evaluate(_CRYPTO_HOOK_JS))
+            except Exception:
+                pass
+
+        page.on("worker", _on_worker)
+        try:
+            await page.goto("https://x.com/i/chat", wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(3)
+            await page.evaluate(_CRYPTO_HOOK_JS)
+            for w in page.workers():
+                try:
+                    await w.evaluate(_CRYPTO_HOOK_JS)
+                except Exception:
+                    pass
+            db_bytes = await extract_xchat_opfs_db(page, str(my_user_id), context=context, force=True)
+            local_path = None
+            if db_bytes and db_bytes[:15] == b"SQLite format 3":
+                with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
+                    tf.write(db_bytes); tmp = tf.name
+                try:
+                    conn = sqlite3.connect(tmp)
+                    row = conn.execute(
+                        "SELECT local_path FROM dm_local_attachment WHERE message_id = ?",
+                        (entry_id,)).fetchone()
+                    if row:
+                        local_path = row[0]
+                    conn.close()
+                finally:
+                    os.unlink(tmp)
+            delres = None
+            if local_path:
+                target = page
+                cached = getattr(context, "_xchat_opfs_page", None)
+                if cached is not None:
+                    try:
+                        _ = cached.url; target = cached
+                        await target.evaluate(_CRYPTO_HOOK_JS)
+                    except Exception:
+                        target = page
+                del_js = """async (path) => {
+                    const parts=String(path).split('/').filter(Boolean);
+                    let dir=await navigator.storage.getDirectory();
+                    try {
+                        for(let i=0;i<parts.length-1;i++) dir=await dir.getDirectoryHandle(parts[i]);
+                        await dir.removeEntry(parts[parts.length-1]);
+                        return {deleted:true};
+                    } catch(e){ return {deleted:false, error:String(e)}; }
+                }"""
+                delres = await target.evaluate(del_js, local_path)
+            await page.goto(f"https://x.com/i/chat/{conv_dash}", wait_until="domcontentloaded", timeout=30000)
+            await _ensure_pin_unlocked(page, dm_pin)
+            await page.evaluate(_CRYPTO_HOOK_JS)
+            for _ in range(6):
+                await page.evaluate("""() => { for (const el of document.querySelectorAll('*')) {
+                    const sr = el.shadowRoot; if (!sr) continue;
+                    const sc = sr.querySelector('[data-testid="dm-message-scroller"]');
+                    if (sc) { sc.scrollTop = sc.scrollHeight * Math.random(); sc.dispatchEvent(new Event('scroll')); } } }""")
+                await asyncio.sleep(2)
+            logs = []
+            try:
+                logs.append({"src": "page", "log": await page.evaluate("globalThis.__mf_crypto_log || []")})
+            except Exception as e:
+                logs.append({"src": "page", "error": str(e)[:80]})
+            for i, w in enumerate(page.workers()):
+                try:
+                    logs.append({"src": f"worker{i}:{w.url[-60:]}", "log": await w.evaluate("globalThis.__mf_crypto_log || []")})
+                except Exception as e:
+                    logs.append({"src": f"worker{i}", "error": str(e)[:80]})
+            return {"local_path": local_path, "delete_result": delres,
+                    "media_urls": captured[:20], "crypto_logs": logs}
+        finally:
+            try:
+                context.remove_listener("request", _on_req)
+            except Exception:
+                pass
+            cached = getattr(context, "_xchat_opfs_page", None)
+            if page is not cached:
+                await page.close()
+            await XChatContextPool.get().release(auth_token, context)
+
+
 async def debug_context_request_capture(auth_token: str, dm_pin: Optional[str], conv_dash: str) -> dict[str, Any]:
     """DIAGNOSTIK RE deep: Playwright context.on('request') tangkap URL media
     lintas-page/worker (bypass encapsulation JS)."""

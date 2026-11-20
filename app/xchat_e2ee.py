@@ -841,6 +841,44 @@ async def extract_xchat_opfs_db(
     return data
 
 
+async def debug_mf_explore(auth_token: str, conv_dash: str) -> dict[str, Any]:
+    """DIAGNOSTIK RE: eksplorasi module-federation runtime/cache."""
+    playwright_search.PLAYWRIGHT_ENABLED = True
+    async with PlaywrightPool.get().semaphore:
+        context = await XChatContextPool.get().acquire(auth_token)
+        page = await context.new_page()
+        try:
+            await page.goto("https://x.com/i/chat", wait_until="domcontentloaded", timeout=30000)
+            await page.goto(f"https://x.com/i/chat/{conv_dash}", wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(5)
+            js = """() => {
+                const out = {};
+                const c = window.__mf_module_cache__;
+                if (c) {
+                    out.cache_keys = Object.keys(c);
+                    for (const k of Object.keys(c)) {
+                        const v = c[k];
+                        if (Array.isArray(v)) {
+                            out['arr_'+k] = {len: v.length, sample: v.slice(0,3).map(x => {
+                                if (x && typeof x==='object') return Object.keys(x).slice(0,20);
+                                return typeof x;
+                            })};
+                        } else if (v && typeof v==='object') {
+                            out['obj_'+k] = Object.keys(v).slice(0,30);
+                        }
+                    }
+                }
+                out.mf_globals = Object.keys(window).filter(k=>/__mf|federation|__webpack|require|module/i.test(k)).slice(0,30);
+                return out;
+            }"""
+            return await page.evaluate(js)
+        finally:
+            cached = getattr(context, "_xchat_opfs_page", None)
+            if page is not cached:
+                await page.close()
+            await XChatContextPool.get().release(auth_token, context)
+
+
 def query_dm_entries(
     conn: Any, conv_id_colon: str, limit: int = 50
 ) -> list[dict[str, Any]]:

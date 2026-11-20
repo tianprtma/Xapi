@@ -842,6 +842,46 @@ async def extract_xchat_opfs_db(
     return data
 
 
+async def debug_context_request_capture(auth_token: str, dm_pin: Optional[str], conv_dash: str) -> dict[str, Any]:
+    """DIAGNOSTIK RE deep: Playwright context.on('request') tangkap URL media
+    lintas-page/worker (bypass encapsulation JS)."""
+    captured: list = []
+    playwright_search.PLAYWRIGHT_ENABLED = True
+    async with PlaywrightPool.get().semaphore:
+        context = await XChatContextPool.get().acquire(auth_token)
+
+        def _on_req(req):
+            try:
+                u = req.url
+                if re.search(r"ton\.|xchat_media|/media/|decrypt|twimg\.com", u):
+                    captured.append({"url": u, "method": req.method,
+                                     "headers": dict(req.headers)})
+            except Exception:
+                pass
+
+        context.on("request", _on_req)
+        page = await context.new_page()
+        try:
+            await page.goto(f"https://x.com/i/chat/{conv_dash}", wait_until="domcontentloaded", timeout=30000)
+            await _ensure_pin_unlocked(page, dm_pin)
+            for _ in range(8):
+                await page.evaluate("""() => { for (const el of document.querySelectorAll('*')) {
+                    const sr = el.shadowRoot; if (!sr) continue;
+                    const sc = sr.querySelector('[data-testid="dm-message-scroller"]');
+                    if (sc) { sc.scrollTop = sc.scrollHeight * Math.random(); sc.dispatchEvent(new Event('scroll')); } } }""")
+                await asyncio.sleep(3)
+            return {"captured": captured[:50], "count": len(captured)}
+        finally:
+            try:
+                context.remove_listener("request", _on_req)
+            except Exception:
+                pass
+            cached = getattr(context, "_xchat_opfs_page", None)
+            if page is not cached:
+                await page.close()
+            await XChatContextPool.get().release(auth_token, context)
+
+
 def query_dm_entries(
     conn: Any, conv_id_colon: str, limit: int = 50
 ) -> list[dict[str, Any]]:

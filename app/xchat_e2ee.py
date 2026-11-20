@@ -16,6 +16,7 @@ import base64
 import hashlib
 import logging
 import os
+import re
 import secrets
 import time
 from datetime import datetime, timezone
@@ -840,45 +841,6 @@ async def extract_xchat_opfs_db(
     return data
 
 
-async def debug_entry_contents(auth_token: str, my_user_id: str, entry_id: str) -> dict[str, Any]:
-    """DIAGNOSTIK SEMENTARA: dump contents BLOB satu entry (cari link tweet)."""
-    import base64 as _b64
-    import re
-    import sqlite3
-    import tempfile
-    playwright_search.PLAYWRIGHT_ENABLED = True
-    async with PlaywrightPool.get().semaphore:
-        context = await XChatContextPool.get().acquire(auth_token)
-        page = await context.new_page()
-        try:
-            await page.goto("https://x.com/i/chat", wait_until="domcontentloaded", timeout=30000)
-            await asyncio.sleep(3)
-            db_bytes = await extract_xchat_opfs_db(page, str(my_user_id), context=context, force=True)
-            if not db_bytes or db_bytes[:15] != b"SQLite format 3":
-                return {"error": "no db"}
-            with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
-                tf.write(db_bytes); tmp = tf.name
-            try:
-                conn = sqlite3.connect(tmp)
-                row = conn.execute("SELECT contents, plain_text, attachment_types FROM dm_entry WHERE entry_id=?",
-                                   (entry_id,)).fetchone()
-                if not row:
-                    return {"error": "no entry"}
-                contents = row[0] or b""
-                txt = contents.decode("latin-1")
-                urls = re.findall(r"https?://[^\s\x00-\x1f\"'<>]+", txt)
-                printable = re.findall(r"[\x20-\x7e]{5,}", txt)
-                return {"plain_text": row[1], "attachment_types": row[2],
-                        "urls": urls[:30], "printable": printable[:80]}
-            finally:
-                conn.close(); os.unlink(tmp)
-        finally:
-            cached = getattr(context, "_xchat_opfs_page", None)
-            if page is not cached:
-                await page.close()
-            await XChatContextPool.get().release(auth_token, context)
-
-
 def query_dm_entries(
     conn: Any, conv_id_colon: str, limit: int = 50
 ) -> list[dict[str, Any]]:
@@ -962,6 +924,26 @@ def query_inbox_rows(
     return out
 
 
+# R100: URL tweet yang dibagikan sender (attachment Post) tersimpan di contents
+# BLOB, bukan plain_text. Ekstrak URL bersih (tanpa tracking ?a=&s= / garbage
+# biner) agar bot meng-append-nya ke teks post sebagai quote card.
+_POST_URL_RE = re.compile(
+    rb"https?://(?:www\.)?(?:x\.com|twitter\.com)/[A-Za-z0-9_]+/status/\d+"
+)
+
+
+def _extract_post_links(contents: Any) -> list[str]:
+    """R100: daftar URL tweet (x.com/twitter.com /status/) dari contents BLOB."""
+    if not isinstance(contents, (bytes, bytearray)):
+        return []
+    out: list[str] = []
+    for m in _POST_URL_RE.finditer(contents):
+        url = m.group(0).decode("ascii")
+        if url not in out:
+            out.append(url)
+    return out
+
+
 def project_dm_entries_to_events(
     rows: list[dict[str, Any]], conversation_id: str
 ) -> list[dict[str, Any]]:
@@ -994,13 +976,23 @@ def project_dm_entries_to_events(
             "_xchat_decrypted": True,
             "_xchat_media_state": "none",
         }
-        if row.get("has_attachment"):
-            # R90: lampiran ditandai pending dulu; recover_opfs_media_for_events
-            # membaca file terdekripsi dari dm_local_attachment (OPFS) dan
-            # mengubahnya jadi ready bila semua foto terpulihkan. R80 menjamin
-            # tenggat text-only bila media tak kunjung lengkap.
+        # R100: link tweet yang dibagikan (attachment Post) ada di contents,
+        # bukan plain_text — ekstrak ke status_links agar ikut terposting.
+        post_links = _extract_post_links(row.get("contents"))
+        if post_links:
+            event["status_links"] = post_links
+        att_types = str(row.get("attachment_types") or "").lower()
+        if row.get("has_attachment") and att_types == "media":
+            # R90: lampiran media (foto/video) ditandai pending dulu;
+            # recover_opfs_media_for_events membaca file terdekripsi dari
+            # dm_local_attachment (OPFS) dan mengubahnya jadi ready bila
+            # terpulihkan. R80 menjamin tenggat text-only bila tak lengkap.
             event["_xchat_media_pending"] = True
             event["_xchat_media_state"] = "pending"
+        elif post_links:
+            # R100: attachment link (Post tweet) bukan media yang perlu
+            # diunduh — langsung post teks + link, jangan media-pending.
+            event["_xchat_media_state"] = "none"
         events.append(event)
     events.reverse()  # kronologis
     return events

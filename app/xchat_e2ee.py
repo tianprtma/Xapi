@@ -840,6 +840,45 @@ async def extract_xchat_opfs_db(
     return data
 
 
+async def debug_entry_contents(auth_token: str, my_user_id: str, entry_id: str) -> dict[str, Any]:
+    """DIAGNOSTIK SEMENTARA: dump contents BLOB satu entry (cari link tweet)."""
+    import base64 as _b64
+    import re
+    import sqlite3
+    import tempfile
+    playwright_search.PLAYWRIGHT_ENABLED = True
+    async with PlaywrightPool.get().semaphore:
+        context = await XChatContextPool.get().acquire(auth_token)
+        page = await context.new_page()
+        try:
+            await page.goto("https://x.com/i/chat", wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(3)
+            db_bytes = await extract_xchat_opfs_db(page, str(my_user_id), context=context, force=True)
+            if not db_bytes or db_bytes[:15] != b"SQLite format 3":
+                return {"error": "no db"}
+            with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
+                tf.write(db_bytes); tmp = tf.name
+            try:
+                conn = sqlite3.connect(tmp)
+                row = conn.execute("SELECT contents, plain_text, attachment_types FROM dm_entry WHERE entry_id=?",
+                                   (entry_id,)).fetchone()
+                if not row:
+                    return {"error": "no entry"}
+                contents = row[0] or b""
+                txt = contents.decode("latin-1")
+                urls = re.findall(r"https?://[^\s\x00-\x1f\"'<>]+", txt)
+                printable = re.findall(r"[\x20-\x7e]{5,}", txt)
+                return {"plain_text": row[1], "attachment_types": row[2],
+                        "urls": urls[:30], "printable": printable[:80]}
+            finally:
+                conn.close(); os.unlink(tmp)
+        finally:
+            cached = getattr(context, "_xchat_opfs_page", None)
+            if page is not cached:
+                await page.close()
+            await XChatContextPool.get().release(auth_token, context)
+
+
 def query_dm_entries(
     conn: Any, conv_id_colon: str, limit: int = 50
 ) -> list[dict[str, Any]]:

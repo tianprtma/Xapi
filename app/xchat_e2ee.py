@@ -908,7 +908,7 @@ _CRYPTO_HOOK_BODY = """
   if (globalThis.__mf_crypto_hooked) return 'already';
   globalThis.__mf_crypto_hooked = true;
   const log = globalThis.__mf_crypto_log = [];
-  const cap = (o) => { if (log.length < 600) log.push(o); };
+  const cap = (o) => { if (log.length < 4000) log.push(o); };
   const hex = (b, n) => { try { const u = new Uint8Array(b); let s=''; for (let i=0;i<Math.min(u.length,n);i++) s+=u[i].toString(16).padStart(2,'0'); return s; } catch(e){ return String(e); } };
   const blen = (b) => { try { return new Uint8Array(b).length; } catch(e){ return -1; } };
   const s = crypto.subtle;
@@ -925,6 +925,8 @@ _CRYPTO_HOOK_BODY = """
           rec.algo={name:args[0].name, iv:args[0].iv?hex(args[0].iv,32):null, tagLength:args[0].tagLength};
           rec.dataLen=blen(args[2]); rec.dataHex=hex(args[2],48);
         } else if (name==='digest') {
+          const dh=hex(args[1],8);
+          if (dh.startsWith('47455421')||dh.startsWith('504f5354')) { return orig(...args); }
           rec.algo=args[0]; rec.dataLen=blen(args[1]); rec.dataHex=hex(args[1],160);
         } else if (name==='deriveBits') {
           rec.algo=args[0]; rec.bits=args[2];
@@ -993,7 +995,7 @@ async def debug_crypto_hook(auth_token: str, dm_pin: Optional[str], my_user_id: 
         context.on("request", _on_req)
         page = await context.new_page()
         try:
-            await page.set_viewport_size({"width": 1280, "height": 6000})
+            await page.set_viewport_size({"width": 1280, "height": 4000})
         except Exception:
             pass
 
@@ -1113,6 +1115,19 @@ async def debug_crypto_hook(auth_token: str, dm_pin: Optional[str], my_user_id: 
                 return info;
             }"""
             scan_log = []
+            hold_js = """() => { let done=false;
+                const walk=(root)=>{ for (const el of root.querySelectorAll('*')) {
+                    const sr=el.shadowRoot; if(!sr) continue;
+                    const sc=sr.querySelector('[data-testid="dm-message-scroller"]');
+                    if(sc){ sc.scrollTop=0; sc.dispatchEvent(new Event('scroll')); done=true; }
+                    walk(sr); } };
+                walk(document); return done; }"""
+            for _ in range(30):
+                try:
+                    await page.evaluate(hold_js)
+                except Exception:
+                    pass
+                await asyncio.sleep(0.3)
             for i in range(20):
                 frac = 1.0 - (i / 19.0)
                 try:

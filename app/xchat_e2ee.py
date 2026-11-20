@@ -863,42 +863,6 @@ async def extract_xchat_opfs_db(
     return data
 
 
-async def debug_entry_contents(auth_token: str, my_user_id: str, conv_dash: str,
-                               entry_id: str) -> dict[str, Any]:
-    """DIAGNOSTIK sementara: strings contents BLOB entry (verifikasi sufiks /video/1)."""
-    import sqlite3
-    import tempfile
-    playwright_search.PLAYWRIGHT_ENABLED = True
-    async with PlaywrightPool.get().semaphore:
-        context = await XChatContextPool.get().acquire(auth_token)
-        page = await context.new_page()
-        try:
-            await page.goto("https://x.com/i/chat", wait_until="domcontentloaded", timeout=30000)
-            await asyncio.sleep(3)
-            db_bytes = await extract_xchat_opfs_db(page, str(my_user_id), context=context, force=True)
-            if not db_bytes or db_bytes[:15] != b"SQLite format 3":
-                return {"error": "no db"}
-            with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
-                tf.write(db_bytes); tmp = tf.name
-            try:
-                conn = sqlite3.connect(tmp)
-                row = conn.execute("SELECT contents FROM dm_entry WHERE entry_id = ?",
-                                   (entry_id,)).fetchone()
-                contents = row[0] if row else b""
-                if isinstance(contents, str):
-                    contents = contents.encode()
-                strings = re.findall(rb"[\x20-\x7e]{4,}", contents or b"")
-                conn.close()
-                return {"strings": [s.decode() for s in strings][:80]}
-            finally:
-                conn.close(); os.unlink(tmp)
-        finally:
-            cached = getattr(context, "_xchat_opfs_page", None)
-            if page is not cached:
-                await page.close()
-            await XChatContextPool.get().release(auth_token, context)
-
-
 def query_dm_entries(
     conn: Any, conv_id_colon: str, limit: int = 50
 ) -> list[dict[str, Any]]:
@@ -987,6 +951,7 @@ def query_inbox_rows(
 # biner) agar bot meng-append-nya ke teks post sebagai quote card.
 _POST_URL_RE = re.compile(
     rb"https?://(?:www\.)?(?:x\.com|twitter\.com)/[A-Za-z0-9_]+/status/\d+"
+    rb"(?:/(?:photo|video)/\d+)?"
 )
 
 

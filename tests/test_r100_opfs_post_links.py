@@ -53,3 +53,27 @@ def test_twitter_com_link_also_extracted():
     events = xee.project_dm_entries_to_events([_row(contents)], "1-2")
     links = events[0].get("status_links") or []
     assert "https://twitter.com/someone/status/1234567890" in links
+
+
+def test_video_permalink_suffix_preserved():
+    # R103: sender share link /video/1 — sufiks WAJIB utuh agar X render kartu
+    # video inline, bukan quote tweet. Kasus nyata conv 930812366488403968.
+    contents = b"curlx9https://x.com/viiccc89/status/2123778200404987934/video/1\xff\xff"
+    events = xee.project_dm_entries_to_events([_row(contents)], "1-2")
+    links = events[0].get("status_links") or []
+    assert "https://x.com/viiccc89/status/2123778200404987934/video/1" in links, links
+
+
+def test_photo_permalink_suffix_preserved():
+    contents = b"curlx9https://x.com/someone/status/1234567890/photo/1\xff\xff"
+    events = xee.project_dm_entries_to_events([_row(contents)], "1-2")
+    links = events[0].get("status_links") or []
+    assert "https://x.com/someone/status/1234567890/photo/1" in links, links
+
+
+def test_bare_status_link_still_bare():
+    contents = b"curlxQhttps://x.com/someone/status/1234567890?s=20\xff\xff"
+    events = xee.project_dm_entries_to_events([_row(contents)], "1-2")
+    links = events[0].get("status_links") or []
+    assert "https://x.com/someone/status/1234567890" in links
+    assert all("/video/" not in l and "/photo/" not in l for l in links)

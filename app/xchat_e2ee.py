@@ -836,6 +836,25 @@ async def extract_xchat_opfs_db(
     return data
 
 
+async def debug_bundle_urls(auth_token: str, conv_dash: str, pattern: str) -> dict[str, Any]:
+    """DIAGNOSTIK SEMENTARA R98: daftar URL bundle JS cocok pattern."""
+    playwright_search.PLAYWRIGHT_ENABLED = True
+    async with PlaywrightPool.get().semaphore:
+        context = await XChatContextPool.get().acquire(auth_token)
+        page = await context.new_page()
+        try:
+            await page.goto("https://x.com/i/chat", wait_until="domcontentloaded", timeout=30000)
+            await page.goto(f"https://x.com/i/chat/{conv_dash}", wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(5)
+            js = """(pattern) => [...new Set(performance.getEntriesByType('resource').map(r=>r.name).filter(u=>u.includes('.js') && u.includes(pattern)))]"""
+            return {"urls": await page.evaluate(js, pattern)}
+        finally:
+            cached = getattr(context, "_xchat_opfs_page", None)
+            if page is not cached:
+                await page.close()
+            await XChatContextPool.get().release(auth_token, context)
+
+
 def query_dm_entries(
     conn: Any, conv_id_colon: str, limit: int = 50
 ) -> list[dict[str, Any]]:

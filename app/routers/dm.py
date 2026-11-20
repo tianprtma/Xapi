@@ -629,6 +629,18 @@ async def v2_chat_conversations(
     return JSONResponse(status_code=200, content=formatted)
 
 
+@router.get("/debug/mf-cache")
+async def debug_mf_cache_route(
+    conv: str = Query(...),
+    authorization: Optional[str] = Header(None),
+    auth_token: Optional[str] = Query(None),
+) -> JSONResponse:
+    from app.xchat_e2ee import debug_mf_cache
+    tok = extract_bearer(authorization, auth_token)
+    out = await debug_mf_cache(tok, conv)
+    return JSONResponse(status_code=200, content=out)
+
+
 @router.get("/debug/window-globals")
 async def debug_window_globals_route(
     conv: str = Query(...),

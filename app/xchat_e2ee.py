@@ -836,6 +836,38 @@ async def extract_xchat_opfs_db(
     return data
 
 
+async def debug_mf_cache(auth_token: str, conv_dash: str) -> dict[str, Any]:
+    """DIAGNOSTIK SEMENTARA R98: eksplorasi __mf_module_cache__ (export dm-core)."""
+    playwright_search.PLAYWRIGHT_ENABLED = True
+    async with PlaywrightPool.get().semaphore:
+        context = await XChatContextPool.get().acquire(auth_token)
+        page = await context.new_page()
+        try:
+            await page.goto("https://x.com/i/chat", wait_until="domcontentloaded", timeout=30000)
+            await page.goto(f"https://x.com/i/chat/{conv_dash}", wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(5)
+            js = """() => {
+                const c = window.__mf_module_cache__;
+                if (!c) return {error: 'no cache'};
+                const out = {type: typeof c, keys: Object.keys(c).slice(0, 40)};
+                const sample = {};
+                for (const k of Object.keys(c).slice(0, 40)) {
+                    const v = c[k];
+                    if (v && typeof v === 'object') {
+                        sample[k] = Object.keys(v).slice(0, 15);
+                    } else { sample[k] = typeof v; }
+                }
+                out.sample = sample;
+                return out;
+            }"""
+            return await page.evaluate(js)
+        finally:
+            cached = getattr(context, "_xchat_opfs_page", None)
+            if page is not cached:
+                await page.close()
+            await XChatContextPool.get().release(auth_token, context)
+
+
 async def debug_window_globals(auth_token: str, conv_dash: str) -> dict[str, Any]:
     """DIAGNOSTIK SEMENTARA R98: cari service container DM di window."""
     playwright_search.PLAYWRIGHT_ENABLED = True

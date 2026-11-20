@@ -995,7 +995,7 @@ async def debug_crypto_hook(auth_token: str, dm_pin: Optional[str], my_user_id: 
         context.on("request", _on_req)
         page = await context.new_page()
         try:
-            await page.set_viewport_size({"width": 1280, "height": 4000})
+            await page.set_viewport_size({"width": 1280, "height": 6000})
         except Exception:
             pass
 
@@ -1017,6 +1017,7 @@ async def debug_crypto_hook(auth_token: str, dm_pin: Optional[str], my_user_id: 
                     pass
             db_bytes = await extract_xchat_opfs_db(page, str(my_user_id), context=context, force=True)
             local_path = None
+            target_mhk = None
             att_rows: list = []
             if db_bytes and db_bytes[:15] == b"SQLite format 3":
                 with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
@@ -1028,6 +1029,13 @@ async def debug_crypto_hook(auth_token: str, dm_pin: Optional[str], my_user_id: 
                         (entry_id,)).fetchone()
                     if row:
                         local_path = row[0]
+                    crow = conn.execute("SELECT contents FROM dm_entry WHERE entry_id = ?",
+                                        (entry_id,)).fetchone()
+                    if crow and crow[0]:
+                        cb = crow[0] if isinstance(crow[0], (bytes, bytearray)) else str(crow[0]).encode()
+                        mm = re.search(rb"mediaHashKey.j([A-Za-z0-9_-]{10})", cb)
+                        if mm:
+                            target_mhk = mm.group(1).decode()
                     cc = conv_dash.replace("-", ":")
                     for r in conn.execute(
                             "SELECT a.message_id, a.local_path, a.attachment_type, a.file_size "
@@ -1058,21 +1066,6 @@ async def debug_crypto_hook(auth_token: str, dm_pin: Optional[str], my_user_id: 
                     } catch(e){ return {deleted:false, error:String(e)}; }
                 }"""
                 delres = await target.evaluate(del_js, local_path)
-            await page.goto(f"https://x.com/i/chat/{conv_dash}", wait_until="domcontentloaded", timeout=30000)
-            await _ensure_pin_unlocked(page, dm_pin)
-            try:
-                await page.evaluate(_CRYPTO_HOOK_JS)
-            except Exception:
-                pass
-            for _ in range(6):
-                try:
-                    await page.evaluate("""() => { for (const el of document.querySelectorAll('*')) {
-                        const sr = el.shadowRoot; if (!sr) continue;
-                        const sc = sr.querySelector('[data-testid="dm-message-scroller"]');
-                        if (sc) { sc.scrollTop = sc.scrollHeight * Math.random(); sc.dispatchEvent(new Event('scroll')); } } }""")
-                except Exception:
-                    pass
-                await asyncio.sleep(2)
             exist_js = """async (paths) => {
                 const out = [];
                 for (const p of paths) {
@@ -1109,32 +1102,38 @@ async def debug_crypto_hook(auth_token: str, dm_pin: Optional[str], my_user_id: 
                         info.imgs++;
                         if (String(img.src).startsWith('blob:')) info.blobImgs++;
                     }
-                    if (root.body && root.body.innerText && root.body.innerText.includes('Wots marketing')) info.targetVisible = true;
                 };
                 walk(document);
                 return info;
             }"""
             scan_log = []
-            hold_js = """() => { let done=false;
-                const walk=(root)=>{ for (const el of root.querySelectorAll('*')) {
-                    const sr=el.shadowRoot; if(!sr) continue;
-                    const sc=sr.querySelector('[data-testid="dm-message-scroller"]');
-                    if(sc){ sc.scrollTop=0; sc.dispatchEvent(new Event('scroll')); done=true; }
-                    walk(sr); } };
-                walk(document); return done; }"""
-            for _ in range(30):
+            recovered = False
+            for attempt in range(4):
+                await page.goto(f"https://x.com/i/chat/{conv_dash}", wait_until="domcontentloaded", timeout=30000)
+                await _ensure_pin_unlocked(page, dm_pin)
                 try:
-                    await page.evaluate(hold_js)
+                    await page.evaluate(_CRYPTO_HOOK_JS)
                 except Exception:
                     pass
-                await asyncio.sleep(0.3)
-            for i in range(20):
-                frac = 1.0 - (i / 19.0)
-                try:
-                    scan_log.append(await page.evaluate(scan_js, frac))
-                except Exception:
-                    pass
-                await asyncio.sleep(1.2)
+                for _ in range(4):
+                    try:
+                        await page.evaluate("""() => { for (const el of document.querySelectorAll('*')) {
+                            const sr = el.shadowRoot; if (!sr) continue;
+                            const sc = sr.querySelector('[data-testid="dm-message-scroller"]');
+                            if (sc) { sc.scrollTop = sc.scrollHeight * Math.random(); sc.dispatchEvent(new Event('scroll')); } } }""")
+                    except Exception:
+                        pass
+                    await asyncio.sleep(1.5)
+                for i in range(20):
+                    frac = 1.0 - (i / 19.0)
+                    try:
+                        scan_log.append(await page.evaluate(scan_js, frac))
+                    except Exception:
+                        pass
+                    await asyncio.sleep(1.0)
+                if target_mhk and any(u.endswith('/' + target_mhk) for u in captured):
+                    recovered = True
+                    break
             post_att = []
             post_files = []
             try:
@@ -1173,7 +1172,8 @@ async def debug_crypto_hook(auth_token: str, dm_pin: Optional[str], my_user_id: 
                     files_state = await page.evaluate(exist_js, [a["local_path"] for a in att_rows])
                 except Exception as e:
                     files_state = [{"error": str(e)[:80]}]
-            return {"local_path": local_path, "delete_result": delres,
+            return {"local_path": local_path, "target_mhk": target_mhk,
+                    "recovered": recovered, "delete_result": delres,
                     "attachment_rows": att_rows, "files_state": files_state,
                     "post_attachment_rows": post_att, "post_files_state": post_files,
                     "scan_log": scan_log,

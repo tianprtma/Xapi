@@ -1053,7 +1053,7 @@ async def debug_crypto_hook(auth_token: str, dm_pin: Optional[str], my_user_id: 
                                         (entry_id,)).fetchone()
                     if crow and crow[0]:
                         cb = crow[0] if isinstance(crow[0], (bytes, bytearray)) else str(crow[0]).encode()
-                        mm = re.search(rb"mediaHashKey.j([A-Za-z0-9_-]{10})", cb)
+                        mm = re.search(rb"mediaHashKeyj([A-Za-z0-9_-]{10})", cb)
                         if mm:
                             target_mhk = mm.group(1).decode()
                     cc = conv_dash.replace("-", ":")

@@ -946,6 +946,7 @@ _CRYPTO_HOOK_JS = "() => {" + _CRYPTO_HOOK_BODY + "}"
 _WORKER_HOOK_INIT = """
 (() => {
   const body = %s;
+  try { body(); } catch(e) {}
   const OrigWorker = window.Worker;
   if (!OrigWorker || window.__mf_worker_wrapped) return;
   window.__mf_worker_wrapped = true;
@@ -953,7 +954,7 @@ _WORKER_HOOK_INIT = """
     try {
       const u = String(url);
       if ((u.startsWith('blob:') || u.startsWith('data:') || !u.startsWith('http')) && (!opts || opts.type !== 'module')) {
-        const wrapper = body + '\\n;importScripts("' + u + '");';
+        const wrapper = '(' + body.toString() + ')();\\n;importScripts("' + u + '");';
         const nb = new Blob([wrapper], {type: 'application/javascript'});
         return new OrigWorker(URL.createObjectURL(nb), opts);
       }
@@ -962,7 +963,7 @@ _WORKER_HOOK_INIT = """
   };
   window.Worker.prototype = OrigWorker.prototype;
 })();
-""" % ("(() => {" + _CRYPTO_HOOK_BODY + "})()",)
+""" % ("(function() {" + _CRYPTO_HOOK_BODY + "})",)
 
 
 async def debug_crypto_hook(auth_token: str, dm_pin: Optional[str], my_user_id: str,
@@ -1066,6 +1067,39 @@ async def debug_crypto_hook(auth_token: str, dm_pin: Optional[str], my_user_id: 
                 except Exception:
                     pass
                 await asyncio.sleep(2)
+            scan_js = """(frac) => {
+                let info = {scroller:false, imgs:0, blobImgs:0, targetVisible:false, scrollTop:0, scrollHeight:0};
+                const walk = (root) => {
+                    for (const el of root.querySelectorAll('*')) {
+                        const sr = el.shadowRoot;
+                        if (sr) {
+                            const sc = sr.querySelector('[data-testid="dm-message-scroller"]');
+                            if (sc) {
+                                info.scroller = true;
+                                sc.scrollTop = sc.scrollHeight * frac;
+                                sc.dispatchEvent(new Event('scroll'));
+                                info.scrollTop = sc.scrollTop; info.scrollHeight = sc.scrollHeight;
+                            }
+                            walk(sr);
+                        }
+                    }
+                    for (const img of root.querySelectorAll('img')) {
+                        info.imgs++;
+                        if (String(img.src).startsWith('blob:')) info.blobImgs++;
+                    }
+                    if (root.body && root.body.innerText && root.body.innerText.includes('Wots marketing')) info.targetVisible = true;
+                };
+                walk(document);
+                return info;
+            }"""
+            scan_log = []
+            for i in range(20):
+                frac = 1.0 - (i / 19.0)
+                try:
+                    scan_log.append(await page.evaluate(scan_js, frac))
+                except Exception:
+                    pass
+                await asyncio.sleep(1.2)
             logs = []
             try:
                 logs.append({"src": "page", "log": await page.evaluate("globalThis.__mf_crypto_log || []")})
@@ -1100,6 +1134,7 @@ async def debug_crypto_hook(auth_token: str, dm_pin: Optional[str], my_user_id: 
                     files_state = [{"error": str(e)[:80]}]
             return {"local_path": local_path, "delete_result": delres,
                     "attachment_rows": att_rows, "files_state": files_state,
+                    "scan_log": scan_log,
                     "media_urls": captured[:20], "crypto_logs": logs}
         finally:
             try:

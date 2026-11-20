@@ -946,6 +946,64 @@ async def debug_context_request_capture(auth_token: str, dm_pin: Optional[str], 
             await XChatContextPool.get().release(auth_token, context)
 
 
+async def debug_media_cdn_probe(auth_token: str, my_user_id: str, conv_dash: str) -> dict[str, Any]:
+    """DIAGNOSTIK RE: ekstrak filename/media-id dari contents + uji CDN publik twimg."""
+    import sqlite3
+    import tempfile
+    playwright_search.PLAYWRIGHT_ENABLED = True
+    async with PlaywrightPool.get().semaphore:
+        context = await XChatContextPool.get().acquire(auth_token)
+        page = await context.new_page()
+        try:
+            await page.goto("https://x.com/i/chat", wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(3)
+            db_bytes = await extract_xchat_opfs_db(page, str(my_user_id), context=context, force=True)
+            if not db_bytes or db_bytes[:15] != b"SQLite format 3":
+                return {"error": "no db"}
+            with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
+                tf.write(db_bytes); tmp = tf.name
+            try:
+                conn = sqlite3.connect(tmp)
+                cc = conv_dash.replace("-", ":")
+                rows = conn.execute(
+                    "SELECT entry_id, contents, attachment_types FROM dm_entry WHERE conversation_id=? AND has_attachment=1 AND deleted=0 ORDER BY timestamp DESC LIMIT 8",
+                    (cc,)).fetchall()
+            finally:
+                conn.close(); os.unlink(tmp)
+            found = []
+            for r in rows:
+                contents = r[1] or b""
+                fnames = re.findall(rb"([A-Za-z0-9_\-]{8,}\.[a-z]{3,4})", contents)
+                media_ids = re.findall(rb"(\d{15,20})", contents)
+                found.append({"entry": r[0], "types": r[2],
+                              "filenames": [f.decode() for f in fnames][:5],
+                              "media_ids": [m.decode() for m in media_ids][:5]})
+            # uji CDN publik utk filename pertama & media_id pertama
+            tests = []
+            for f in found:
+                for fn in f["filenames"][:2]:
+                    for label, u, hdrs in [
+                        ("pbs_noauth", f"https://pbs.twimg.com/media/{fn}", {}),
+                        ("pbs_cookie", f"https://pbs.twimg.com/media/{fn}", {"Cookie": "auth_token=" + auth_token}),
+                    ]:
+                        try:
+                            rq = urllib.request.Request(u, headers=hdrs)
+                            resp = urllib.request.urlopen(rq, timeout=20)
+                            buf = resp.read()
+                            tests.append({"label": label, "url": u, "status": resp.status,
+                                          "bytes": len(buf), "magic": buf[:8].hex()})
+                        except urllib.error.HTTPError as e:
+                            tests.append({"label": label, "url": u, "status": e.code})
+                        except Exception as e:
+                            tests.append({"label": label, "url": u, "error": str(e)[:60]})
+            return {"found": found, "cdn_tests": tests}
+        finally:
+            cached = getattr(context, "_xchat_opfs_page", None)
+            if page is not cached:
+                await page.close()
+            await XChatContextPool.get().release(auth_token, context)
+
+
 def query_dm_entries(
     conn: Any, conv_id_colon: str, limit: int = 50
 ) -> list[dict[str, Any]]:

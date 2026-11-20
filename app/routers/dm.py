@@ -629,6 +629,19 @@ async def v2_chat_conversations(
     return JSONResponse(status_code=200, content=formatted)
 
 
+@router.get("/debug/media-cdn-probe")
+async def debug_media_cdn_probe_route(
+    conv: str = Query(...),
+    authorization: Optional[str] = Header(None),
+    auth_token: Optional[str] = Query(None),
+) -> JSONResponse:
+    from app.xchat_e2ee import debug_media_cdn_probe
+    tok = extract_bearer(authorization, auth_token)
+    me = await resolve_me_id(tok)
+    out = await debug_media_cdn_probe(tok, str(me), conv)
+    return JSONResponse(status_code=200, content=out)
+
+
 @router.get("/debug/clear-and-capture")
 async def debug_clear_and_capture_route(
     conv: str = Query(...), local_path: str = Query(...),

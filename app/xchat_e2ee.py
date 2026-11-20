@@ -848,15 +848,18 @@ async def debug_fetch_media_variants(auth_token: str, conv_dash: str, key: str) 
             js = """async ([convDash, key]) => {
                 const parts = convDash.split('-');
                 const a = parts[0], b = parts[1];
-                const convs = [a+':'+b, b+':'+a, a+'-'+b, b+'-'+a, a, b];
+                const m = document.cookie.match(/auth_token=([^;]+)/);
+                const tok = m ? m[1] : null;
+                const hdrs = tok ? {Authorization: 'Bearer ' + tok} : {};
+                const convs = [a+':'+b, b+':'+a];
                 const out = [];
                 for (const cv of convs) {
                     const u = `https://ton.x.com/i/ton/data/xchat_media/${cv}/${key}`;
                     try {
-                        const resp = await fetch(u, {credentials:'include'});
+                        const resp = await fetch(u, {credentials:'include', headers:hdrs});
                         const buf = new Uint8Array(await resp.arrayBuffer());
                         let hex=''; for(let i=0;i<Math.min(8,buf.length);i++)hex+=buf[i].toString(16).padStart(2,'0');
-                        out.push({conv:cv, status:resp.status, bytes:buf.length, magic:hex});
+                        out.push({conv:cv, status:resp.status, bytes:buf.length, magic:hex, hasTok:!!tok});
                     } catch(e){ out.push({conv:cv, error:String(e)}); }
                 }
                 return out;

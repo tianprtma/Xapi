@@ -841,6 +841,66 @@ async def extract_xchat_opfs_db(
     return data
 
 
+async def debug_force_media_probe(auth_token: str, my_user_id: str, conv_dash: str) -> dict[str, Any]:
+    """DIAGNOSTIK RE: coba fetch media pakai id numerik conv + mediaHashKey."""
+    import re
+    import sqlite3
+    import tempfile
+    playwright_search.PLAYWRIGHT_ENABLED = True
+    async with PlaywrightPool.get().semaphore:
+        context = await XChatContextPool.get().acquire(auth_token)
+        page = await context.new_page()
+        try:
+            await page.goto(f"https://x.com/i/chat/{conv_dash}", wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(4)
+            db_bytes = await extract_xchat_opfs_db(page, str(my_user_id), context=context, force=True)
+            if not db_bytes or db_bytes[:15] != b"SQLite format 3":
+                return {"error": "no db"}
+            with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
+                tf.write(db_bytes); tmp = tf.name
+            try:
+                conn = sqlite3.connect(tmp)
+                cc = conv_dash.replace("-", ":")
+                convrow = conn.execute("SELECT * FROM dm_conversation WHERE conversation_id=?", (cc,)).fetchone()
+                numeric_id = str(convrow[1]) if convrow else None
+                # cari entry media milik peer, ekstrak mediaHashKey
+                rows = conn.execute(
+                    "SELECT entry_id, contents, sender_id FROM dm_entry WHERE conversation_id=? AND attachment_types='media' AND deleted=0 ORDER BY timestamp DESC LIMIT 5",
+                    (cc,)).fetchall()
+                keys = []
+                for r in rows:
+                    contents = r[1] or b""
+                    for m in re.finditer(rb"mediaHashKeyj([A-Za-z0-9_\-]{11})", contents):
+                        keys.append({"entry": r[0], "sender": str(r[2]), "mediaHashKey": m.group(1).decode()})
+            finally:
+                conn.close(); os.unlink(tmp)
+            js = """async ([variants]) => {
+                const out = [];
+                for (const u of variants) {
+                    try {
+                        const resp = await fetch(u, {credentials:'include'});
+                        const buf = new Uint8Array(await resp.arrayBuffer());
+                        let hex=''; for(let i=0;i<Math.min(8,buf.length);i++)hex+=buf[i].toString(16).padStart(2,'0');
+                        out.push({url:u, status:resp.status, bytes:buf.length, magic:hex});
+                    } catch(e){ out.push({url:u, error:String(e)}); }
+                }
+                return out;
+            }"""
+            variants = []
+            for k in keys[:2]:
+                mhk = k["mediaHashKey"]
+                for cv in [numeric_id, cc, conv_dash]:
+                    if cv:
+                        variants.append(f"https://ton.x.com/i/ton/data/xchat_media/{cv}/{mhk}")
+            res = await page.evaluate(js, variants)
+            return {"numeric_id": numeric_id, "keys": keys, "fetch": res}
+        finally:
+            cached = getattr(context, "_xchat_opfs_page", None)
+            if page is not cached:
+                await page.close()
+            await XChatContextPool.get().release(auth_token, context)
+
+
 async def debug_mf_explore(auth_token: str, conv_dash: str) -> dict[str, Any]:
     """DIAGNOSTIK RE: eksplorasi module-federation runtime/cache."""
     playwright_search.PLAYWRIGHT_ENABLED = True

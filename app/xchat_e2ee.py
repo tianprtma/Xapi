@@ -866,9 +866,11 @@ async def debug_opfs_conv_media(auth_token: str, my_user_id: str, conv_dash: str
                     "SELECT attachment_id, message_id, local_path, attachment_type, file_size FROM dm_local_attachment WHERE conversation_id=?",
                     (cc,)).fetchall()
                 try:
+                    cols = [c[1] for c in conn.execute("PRAGMA table_info(dm_conversation)")]
+                    conn.row_factory = sqlite3.Row
                     convrow = conn.execute(
                         "SELECT * FROM dm_conversation WHERE conversation_id=?", (cc,)).fetchall()
-                    convinfo = [list(r) for r in convrow]
+                    convinfo = [{k: r[k] for k in cols if r[k] not in (None, 0)} for r in convrow]
                 except Exception:
                     convinfo = []
                 return {"entries": [list(r) for r in entries], "local_attachment": [list(r) for r in la],

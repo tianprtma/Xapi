@@ -629,22 +629,6 @@ async def v2_chat_conversations(
     return JSONResponse(status_code=200, content=formatted)
 
 
-@router.get("/debug/opfs-conv-media")
-async def debug_opfs_conv_media_route(
-    conv: str = Query(...),
-    dm_pin: Optional[str] = Query(None),
-    x_dm_pin: Optional[str] = Header(None, alias="X-DM-Pin"),
-    authorization: Optional[str] = Header(None),
-    auth_token: Optional[str] = Query(None),
-) -> JSONResponse:
-    from app.xchat_e2ee import debug_opfs_conv_media
-    tok = extract_bearer(authorization, auth_token)
-    pin = resolve_dm_pin(dm_pin, x_dm_pin)
-    me = await resolve_me_id(tok)
-    out = await debug_opfs_conv_media(tok, str(me), conv, pin)
-    return JSONResponse(status_code=200, content=out)
-
-
 @router.get("/2/chat/conversations/{conversation_id}/messages")
 @router.get("/2/chat/conversations/{conversation_id}/events")
 async def v2_chat_conversation_messages(

@@ -1298,6 +1298,18 @@ async def debug_force_render(auth_token: str, dm_pin: Optional[str], my_user_id:
             orig_db = await extract_xchat_opfs_db(page, str(my_user_id), context=context, force=True)
             if not orig_db or orig_db[:15] != b"SQLite format 3":
                 return {"error": "no db"}
+            ls_js = """async () => {
+                const out = [];
+                const dir = await navigator.storage.getDirectory();
+                for await (const [name, h] of dir.entries()) {
+                    out.push({name, kind: h.kind});
+                }
+                return out;
+            }"""
+            try:
+                opfs_root = await page.evaluate(ls_js)
+            except Exception as e:
+                opfs_root = [{"error": str(e)[:80]}]
             cc = conv_dash.replace("-", ":")
             with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
                 tf.write(orig_db); tmp = tf.name
@@ -1359,6 +1371,7 @@ async def debug_force_render(auth_token: str, dm_pin: Optional[str], my_user_id:
             except Exception:
                 pass
             return {"target_mhk": target_mhk, "mod_info": mod_info, "recovered": recovered,
+                    "opfs_root": opfs_root,
                     "media_urls": captured, "post_attachment": post_att}
         finally:
             if orig_db:

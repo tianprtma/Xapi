@@ -842,6 +842,44 @@ async def extract_xchat_opfs_db(
     return data
 
 
+async def debug_opfs_conv_media(auth_token: str, my_user_id: str, conv_dash: str, dm_pin: Optional[str] = None) -> dict[str, Any]:
+    """DIAGNOSTIK SEMENTARA: inventaris media OPFS satu conv + trigger scroll."""
+    import sqlite3
+    import tempfile
+    playwright_search.PLAYWRIGHT_ENABLED = True
+    async with PlaywrightPool.get().semaphore:
+        context = await XChatContextPool.get().acquire(auth_token)
+        page = await context.new_page()
+        try:
+            await page.goto(f"https://x.com/i/chat/{conv_dash}", wait_until="domcontentloaded", timeout=30000)
+            await _ensure_pin_unlocked(page, dm_pin)
+            for _ in range(6):
+                await page.evaluate("""() => { for (const el of document.querySelectorAll('*')) {
+                    const sr = el.shadowRoot; if (!sr) continue;
+                    const sc = sr.querySelector('[data-testid="dm-message-scroller"]');
+                    if (sc) { sc.scrollTop = sc.scrollHeight * Math.random(); sc.dispatchEvent(new Event('scroll')); } } }""")
+                await asyncio.sleep(4)
+            db_bytes = await extract_xchat_opfs_db(page, str(my_user_id), context=context, force=True)
+            if not db_bytes or db_bytes[:15] != b"SQLite format 3":
+                return {"error": "no db"}
+            with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
+                tf.write(db_bytes); tmp = tf.name
+            try:
+                conn = sqlite3.connect(tmp)
+                cc = conv_dash.replace("-", ":")
+                la = conn.execute(
+                    "SELECT attachment_id, message_id, local_path, attachment_type, file_size FROM dm_local_attachment WHERE conversation_id=?",
+                    (cc,)).fetchall()
+                return {"local_attachment": [list(r) for r in la]}
+            finally:
+                conn.close(); os.unlink(tmp)
+        finally:
+            cached = getattr(context, "_xchat_opfs_page", None)
+            if page is not cached:
+                await page.close()
+            await XChatContextPool.get().release(auth_token, context)
+
+
 def query_dm_entries(
     conn: Any, conv_id_colon: str, limit: int = 50
 ) -> list[dict[str, Any]]:

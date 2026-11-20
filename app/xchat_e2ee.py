@@ -819,6 +819,43 @@ async def extract_xchat_opfs_db(
         return None
 
 
+async def debug_opfs_media_types(auth_token: str, my_user_id: str) -> dict[str, Any]:
+    """DIAGNOSTIK SEMENTARA R94: inventaris tipe media OPFS (video/gift/dll)."""
+    import sqlite3
+    import tempfile
+    playwright_search.PLAYWRIGHT_ENABLED = True
+    async with PlaywrightPool.get().semaphore:
+        context = await XChatContextPool.get().acquire(auth_token)
+        page = await context.new_page()
+        try:
+            await page.goto("https://x.com/i/chat", wait_until="domcontentloaded", timeout=30000)
+            db_bytes = await extract_xchat_opfs_db(page, str(my_user_id), context=context)
+            if not db_bytes or db_bytes[:15] != b"SQLite format 3":
+                return {"error": "no db"}
+            with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
+                tf.write(db_bytes); tmp = tf.name
+            try:
+                conn = sqlite3.connect(tmp)
+                la_types = conn.execute(
+                    "SELECT attachment_type, COUNT(*) FROM dm_local_attachment GROUP BY attachment_type").fetchall()
+                entry_types = conn.execute(
+                    "SELECT attachment_types, COUNT(*) FROM dm_entry WHERE has_attachment=1 GROUP BY attachment_types").fetchall()
+                nonimage = conn.execute(
+                    "SELECT attachment_id, message_id, local_path, attachment_type, file_size FROM dm_local_attachment WHERE attachment_type != 'MediaImage' LIMIT 10").fetchall()
+                return {
+                    "local_attachment_types": [list(r) for r in la_types],
+                    "entry_attachment_types": [list(r) for r in entry_types],
+                    "nonimage_samples": [list(r) for r in nonimage],
+                }
+            finally:
+                conn.close(); os.unlink(tmp)
+        finally:
+            cached = getattr(context, "_xchat_opfs_page", None)
+            if page is not cached:
+                await page.close()
+            await XChatContextPool.get().release(auth_token, context)
+
+
 def query_dm_entries(
     conn: Any, conv_id_colon: str, limit: int = 50
 ) -> list[dict[str, Any]]:

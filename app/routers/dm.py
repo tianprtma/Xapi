@@ -629,15 +629,15 @@ async def v2_chat_conversations(
     return JSONResponse(status_code=200, content=formatted)
 
 
-@router.get("/debug/dump-bundle")
-async def debug_dump_bundle_route(
-    conv: str = Query(...), pattern: str = Query("dm-core"),
+@router.get("/debug/media-types")
+async def debug_media_types(
     authorization: Optional[str] = Header(None),
     auth_token: Optional[str] = Query(None),
 ) -> JSONResponse:
-    from app.xchat_e2ee import debug_dump_bundle
+    from app.xchat_e2ee import debug_opfs_media_types
     tok = extract_bearer(authorization, auth_token)
-    out = await debug_dump_bundle(tok, conv, pattern)
+    me = await resolve_me_id(tok)
+    out = await debug_opfs_media_types(tok, str(me))
     return JSONResponse(status_code=200, content=out)
 
 

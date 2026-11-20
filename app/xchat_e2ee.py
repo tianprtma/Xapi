@@ -874,25 +874,25 @@ async def debug_force_media_probe(auth_token: str, my_user_id: str, conv_dash: s
                         keys.append({"entry": r[0], "sender": str(r[2]), "mediaHashKey": m.group(1).decode()})
             finally:
                 conn.close(); os.unlink(tmp)
-            js = """async ([variants]) => {
+            js = """async ([variants, tok]) => {
                 const out = [];
                 for (const u of variants) {
                     try {
-                        const resp = await fetch(u, {credentials:'include'});
+                        const resp = await fetch(u, {credentials:'include', headers:{Authorization:'Bearer '+tok}});
                         const buf = new Uint8Array(await resp.arrayBuffer());
                         let hex=''; for(let i=0;i<Math.min(8,buf.length);i++)hex+=buf[i].toString(16).padStart(2,'0');
-                        out.push({url:u, status:resp.status, bytes:buf.length, magic:hex});
+                        out.push({url:u, status:resp.status, bytes:buf.length, magic:hex, ctype:resp.headers.get('content-type')});
                     } catch(e){ out.push({url:u, error:String(e)}); }
                 }
                 return out;
             }"""
             variants = []
-            for k in keys[:2]:
+            for k in keys[:1]:
                 mhk = k["mediaHashKey"]
                 for cv in [numeric_id, cc, conv_dash]:
                     if cv:
                         variants.append(f"https://ton.x.com/i/ton/data/xchat_media/{cv}/{mhk}")
-            res = await page.evaluate(js, variants)
+            res = await page.evaluate(js, [variants, auth_token])
             return {"numeric_id": numeric_id, "keys": keys, "fetch": res}
         finally:
             cached = getattr(context, "_xchat_opfs_page", None)

@@ -851,18 +851,31 @@ async def debug_fetch_intercept(auth_token: str, dm_pin: Optional[str], conv_das
         try:
             await page.evaluate("""() => {
                 window.__capturedReqs = [];
+                window.__workerMsgs = [];
+                window.__workers = [];
                 if (!window.__fetchPatched) {
                     const orig = window.fetch;
                     window.fetch = function(...args) {
                         try {
                             const u = typeof args[0]==='string' ? args[0] : (args[0] && args[0].url);
-                            const init = args[1] || {};
-                            if (u && /ton\\.|xchat_media|media|decrypt/i.test(u)) {
-                                window.__capturedReqs.push({url: u, method: init.method||'GET',
-                                    headers: init.headers ? JSON.parse(JSON.stringify(init.headers)) : null});
-                            }
+                            if (u && /ton\\.|xchat_media|media|decrypt/i.test(u))
+                                window.__capturedReqs.push({url: u});
                         } catch(e){}
                         return orig.apply(this, args);
+                    };
+                    const OrigWorker = window.Worker;
+                    window.Worker = function(...args) {
+                        const w = new OrigWorker(...args);
+                        window.__workers.push(String(args[0]).slice(0,80));
+                        const origPost = w.postMessage.bind(w);
+                        w.postMessage = function(msg, ...rest) {
+                            try { window.__workerMsgs.push({dir:'out', s: JSON.stringify(msg).slice(0,300)}); } catch(e){}
+                            return origPost(msg, ...rest);
+                        };
+                        w.addEventListener('message', (ev) => {
+                            try { window.__workerMsgs.push({dir:'in', s: JSON.stringify(ev.data).slice(0,300)}); } catch(e){}
+                        });
+                        return w;
                     };
                     window.__fetchPatched = true;
                 }
@@ -875,8 +888,9 @@ async def debug_fetch_intercept(auth_token: str, dm_pin: Optional[str], conv_das
                     const sc = sr.querySelector('[data-testid="dm-message-scroller"]');
                     if (sc) { sc.scrollTop = sc.scrollHeight * Math.random(); sc.dispatchEvent(new Event('scroll')); } } }""")
                 await asyncio.sleep(3)
-            reqs = await page.evaluate("() => window.__capturedReqs || []")
-            return {"captured": reqs[:40], "count": len(reqs)}
+            data = await page.evaluate("() => ({reqs: window.__capturedReqs||[], workers: window.__workers||[], msgs: window.__workerMsgs||[]})")
+            return {"fetch_count": len(data["reqs"]), "workers": data["workers"],
+                    "worker_msgs": data["msgs"][:50], "msg_count": len(data["msgs"])}
         finally:
             cached = getattr(context, "_xchat_opfs_page", None)
             if page is not cached:

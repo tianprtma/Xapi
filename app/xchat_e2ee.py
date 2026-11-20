@@ -904,7 +904,7 @@ async def debug_clear_and_capture(auth_token: str, dm_pin: Optional[str], conv_d
             await XChatContextPool.get().release(auth_token, context)
 
 
-_CRYPTO_HOOK_JS = """() => {
+_CRYPTO_HOOK_BODY = """
   if (globalThis.__mf_crypto_hooked) return 'already';
   globalThis.__mf_crypto_hooked = true;
   const log = globalThis.__mf_crypto_log = [];
@@ -940,7 +940,29 @@ _CRYPTO_HOOK_JS = """() => {
   };
   ['importKey','decrypt','encrypt','digest','deriveBits'].forEach(wrap);
   return 'hooked';
-}"""
+"""
+_CRYPTO_HOOK_JS = "() => {" + _CRYPTO_HOOK_BODY + "}"
+# Init script: bungkus Worker klasik agar hook terpasang SEBELUM kode worker jalan.
+_WORKER_HOOK_INIT = """
+(() => {
+  const body = %s;
+  const OrigWorker = window.Worker;
+  if (!OrigWorker || window.__mf_worker_wrapped) return;
+  window.__mf_worker_wrapped = true;
+  window.Worker = function(url, opts) {
+    try {
+      const u = String(url);
+      if ((u.startsWith('blob:') || u.startsWith('data:') || !u.startsWith('http')) && (!opts || opts.type !== 'module')) {
+        const wrapper = body + '\\n;importScripts("' + u + '");';
+        const nb = new Blob([wrapper], {type: 'application/javascript'});
+        return new OrigWorker(URL.createObjectURL(nb), opts);
+      }
+    } catch(e) {}
+    return new OrigWorker(url, opts);
+  };
+  window.Worker.prototype = OrigWorker.prototype;
+})();
+""" % ("(() => {" + _CRYPTO_HOOK_BODY + "})()",)
 
 
 async def debug_crypto_hook(auth_token: str, dm_pin: Optional[str], my_user_id: str,
@@ -954,6 +976,10 @@ async def debug_crypto_hook(auth_token: str, dm_pin: Optional[str], my_user_id: 
     playwright_search.PLAYWRIGHT_ENABLED = True
     async with PlaywrightPool.get().semaphore:
         context = await XChatContextPool.get().acquire(auth_token)
+        try:
+            await context.add_init_script(_WORKER_HOOK_INIT)
+        except Exception:
+            pass
 
         def _on_req(req):
             try:

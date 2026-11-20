@@ -836,6 +836,33 @@ async def extract_xchat_opfs_db(
     return data
 
 
+async def debug_window_globals(auth_token: str, conv_dash: str) -> dict[str, Any]:
+    """DIAGNOSTIK SEMENTARA R98: cari service container DM di window."""
+    playwright_search.PLAYWRIGHT_ENABLED = True
+    async with PlaywrightPool.get().semaphore:
+        context = await XChatContextPool.get().acquire(auth_token)
+        page = await context.new_page()
+        try:
+            await page.goto("https://x.com/i/chat", wait_until="domcontentloaded", timeout=30000)
+            await page.goto(f"https://x.com/i/chat/{conv_dash}", wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(5)
+            js = """() => {
+                const keys = Object.keys(window).filter(k => /xchat|dm|chat|store|app|service|module|federation|container|__/i.test(k));
+                const fed = Object.keys(window).filter(k => typeof window[k]==='object' && window[k] && (window[k].get || window[k].init));
+                const detail = {};
+                for (const k of keys.slice(0, 60)) {
+                    try { detail[k] = typeof window[k]; } catch(e){ detail[k]='err'; }
+                }
+                return {keys, fed, detail};
+            }"""
+            return await page.evaluate(js)
+        finally:
+            cached = getattr(context, "_xchat_opfs_page", None)
+            if page is not cached:
+                await page.close()
+            await XChatContextPool.get().release(auth_token, context)
+
+
 async def debug_capture_media_request(auth_token: str, dm_pin: Optional[str], conv_dash: str) -> dict[str, Any]:
     """DIAGNOSTIK SEMENTARA R98: tangkap request xchat_media asli client."""
     captured: list = []

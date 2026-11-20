@@ -629,6 +629,18 @@ async def v2_chat_conversations(
     return JSONResponse(status_code=200, content=formatted)
 
 
+@router.get("/debug/window-globals")
+async def debug_window_globals_route(
+    conv: str = Query(...),
+    authorization: Optional[str] = Header(None),
+    auth_token: Optional[str] = Query(None),
+) -> JSONResponse:
+    from app.xchat_e2ee import debug_window_globals
+    tok = extract_bearer(authorization, auth_token)
+    out = await debug_window_globals(tok, conv)
+    return JSONResponse(status_code=200, content=out)
+
+
 @router.get("/debug/capture-media")
 async def debug_capture_media_route(
     conv: str = Query(...),

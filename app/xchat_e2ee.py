@@ -836,6 +836,40 @@ async def extract_xchat_opfs_db(
     return data
 
 
+async def debug_capture_media_request(auth_token: str, dm_pin: Optional[str], conv_dash: str) -> dict[str, Any]:
+    """DIAGNOSTIK SEMENTARA R98: tangkap request xchat_media asli client."""
+    captured: list = []
+    playwright_search.PLAYWRIGHT_ENABLED = True
+    async with PlaywrightPool.get().semaphore:
+        context = await XChatContextPool.get().acquire(auth_token)
+        page = await context.new_page()
+
+        def _on_req(req):
+            u = req.url
+            if "xchat_media" in u or "ton.x.com" in u or "ton.twimg.com" in u:
+                captured.append({"url": u, "method": req.method,
+                                 "headers": dict(req.headers)})
+
+        page.on("request", _on_req)
+        try:
+            await page.goto("https://x.com/i/chat", wait_until="domcontentloaded", timeout=30000)
+            await page.goto(f"https://x.com/i/chat/{conv_dash}", wait_until="domcontentloaded", timeout=30000)
+            await _ensure_pin_unlocked(page, dm_pin)
+            for _ in range(6):
+                await page.evaluate("""() => { for (const el of document.querySelectorAll('*')) {
+                    const sr = el.shadowRoot; if (!sr) continue;
+                    const sc = sr.querySelector('[data-testid="dm-message-scroller"]');
+                    if (sc) { sc.scrollTop = 0; sc.dispatchEvent(new Event('scroll')); } } }""")
+                await asyncio.sleep(4)
+            return {"captured": captured[:20], "count": len(captured)}
+        finally:
+            page.remove_listener("request", _on_req)
+            cached = getattr(context, "_xchat_opfs_page", None)
+            if page is not cached:
+                await page.close()
+            await XChatContextPool.get().release(auth_token, context)
+
+
 async def debug_fetch_xchat_media(auth_token: str, conv_dash: str, media_hash_key: str) -> dict[str, Any]:
     """DIAGNOSTIK SEMENTARA R98: fetch blob media via URL benar
     xchat_media/<conv_id>/<mediaHashKey> (browser auth)."""

@@ -1027,12 +1027,18 @@ async def debug_crypto_hook(auth_token: str, dm_pin: Optional[str], my_user_id: 
                 delres = await target.evaluate(del_js, local_path)
             await page.goto(f"https://x.com/i/chat/{conv_dash}", wait_until="domcontentloaded", timeout=30000)
             await _ensure_pin_unlocked(page, dm_pin)
-            await page.evaluate(_CRYPTO_HOOK_JS)
+            try:
+                await page.evaluate(_CRYPTO_HOOK_JS)
+            except Exception:
+                pass
             for _ in range(6):
-                await page.evaluate("""() => { for (const el of document.querySelectorAll('*')) {
-                    const sr = el.shadowRoot; if (!sr) continue;
-                    const sc = sr.querySelector('[data-testid="dm-message-scroller"]');
-                    if (sc) { sc.scrollTop = sc.scrollHeight * Math.random(); sc.dispatchEvent(new Event('scroll')); } } }""")
+                try:
+                    await page.evaluate("""() => { for (const el of document.querySelectorAll('*')) {
+                        const sr = el.shadowRoot; if (!sr) continue;
+                        const sc = sr.querySelector('[data-testid="dm-message-scroller"]');
+                        if (sc) { sc.scrollTop = sc.scrollHeight * Math.random(); sc.dispatchEvent(new Event('scroll')); } } }""")
+                except Exception:
+                    pass
                 await asyncio.sleep(2)
             logs = []
             try:

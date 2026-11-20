@@ -836,6 +836,54 @@ async def extract_xchat_opfs_db(
     return data
 
 
+async def debug_opfs_devlogs(auth_token: str, my_user_id: str) -> dict[str, Any]:
+    """DIAGNOSTIK SEMENTARA R98: baca OPFS dm-dev-logs utk URL unduh media asli."""
+    playwright_search.PLAYWRIGHT_ENABLED = True
+    async with PlaywrightPool.get().semaphore:
+        context = await XChatContextPool.get().acquire(auth_token)
+        page = await context.new_page()
+        try:
+            await page.goto("https://x.com/i/chat", wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(3)
+            target = page
+            cached = getattr(context, "_xchat_opfs_page", None)
+            if cached is not None:
+                try:
+                    _ = cached.url; target = cached
+                except Exception:
+                    target = page
+            js = """async () => {
+                const sleep=(ms)=>new Promise(r=>setTimeout(r,ms));
+                for(let i=0;i<10;i++){if(navigator.storage&&navigator.storage.getDirectory)break;await sleep(300);}
+                if(!navigator.storage||!navigator.storage.getDirectory)return {error:'no api'};
+                const root=await navigator.storage.getDirectory();
+                const out={dirs:[],matches:[]};
+                for await (const [name,h] of root.entries()){out.dirs.push(name+':'+h.kind);}
+                let logdir;
+                try{logdir=await root.getDirectoryHandle('dm-dev-logs');}catch(e){return out;}
+                for await (const [name,h] of logdir.entries()){
+                    if(h.kind!=='file')continue;
+                    try{
+                        const txt=await (await h.getFile()).text();
+                        const lines=txt.split('\\n');
+                        for(const ln of lines){
+                            if(ln.includes('xchat_media')||ln.includes('downloadAndDecrypt')){
+                                out.matches.push(ln.slice(0,400));
+                                if(out.matches.length>=40)return out;
+                            }
+                        }
+                    }catch(e){}
+                }
+                return out;
+            }"""
+            return await target.evaluate(js)
+        finally:
+            cached = getattr(context, "_xchat_opfs_page", None)
+            if page is not cached:
+                await page.close()
+            await XChatContextPool.get().release(auth_token, context)
+
+
 def query_dm_entries(
     conn: Any, conv_id_colon: str, limit: int = 50
 ) -> list[dict[str, Any]]:

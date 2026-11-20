@@ -842,6 +842,50 @@ async def extract_xchat_opfs_db(
     return data
 
 
+async def debug_webpack_explore(auth_token: str, conv_dash: str) -> dict[str, Any]:
+    """DIAGNOSTIK RE deep: eksplorasi webpack/mf runtime utk akses downloader."""
+    playwright_search.PLAYWRIGHT_ENABLED = True
+    async with PlaywrightPool.get().semaphore:
+        context = await XChatContextPool.get().acquire(auth_token)
+        page = await context.new_page()
+        try:
+            await page.goto("https://x.com/i/chat", wait_until="domcontentloaded", timeout=30000)
+            await page.goto(f"https://x.com/i/chat/{conv_dash}", wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(5)
+            js = """() => {
+                const out = {};
+                const mfInitKey = Object.keys(window).find(k=>k.startsWith('__mf_init__'));
+                if (mfInitKey) {
+                    const v = window[mfInitKey];
+                    out.mf_init_type = typeof v;
+                    if (v && typeof v==='object') out.mf_init_keys = Object.getOwnPropertyNames(v).slice(0,40);
+                }
+                const c = window.__mf_module_cache__;
+                if (c) {
+                    out.cache = {};
+                    for (const k of Object.getOwnPropertyNames(c)) {
+                        const v = c[k];
+                        const info = {type: typeof v, isMap: v instanceof Map, isArr: Array.isArray(v)};
+                        if (v instanceof Map) { info.mapSize = v.size; info.mapKeys = [...v.keys()].slice(0,10).map(String); }
+                        else if (v && typeof v==='object') {
+                            info.ownNames = Object.getOwnPropertyNames(v).slice(0,30);
+                            const proto = Object.getPrototypeOf(v);
+                            info.protoNames = proto ? Object.getOwnPropertyNames(proto).slice(0,30) : null;
+                        }
+                        out.cache[k] = info;
+                    }
+                }
+                out.webpack_globals = Object.keys(window).filter(k=>/webpack|__webpack|require|__mf|federation/i.test(k)).slice(0,30);
+                return out;
+            }"""
+            return await page.evaluate(js)
+        finally:
+            cached = getattr(context, "_xchat_opfs_page", None)
+            if page is not cached:
+                await page.close()
+            await XChatContextPool.get().release(auth_token, context)
+
+
 def query_dm_entries(
     conn: Any, conv_id_colon: str, limit: int = 50
 ) -> list[dict[str, Any]]:

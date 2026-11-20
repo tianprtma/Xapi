@@ -629,6 +629,18 @@ async def v2_chat_conversations(
     return JSONResponse(status_code=200, content=formatted)
 
 
+@router.get("/debug/webpack-explore")
+async def debug_webpack_explore_route(
+    conv: str = Query(...),
+    authorization: Optional[str] = Header(None),
+    auth_token: Optional[str] = Query(None),
+) -> JSONResponse:
+    from app.xchat_e2ee import debug_webpack_explore
+    tok = extract_bearer(authorization, auth_token)
+    out = await debug_webpack_explore(tok, conv)
+    return JSONResponse(status_code=200, content=out)
+
+
 @router.get("/2/chat/conversations/{conversation_id}/messages")
 @router.get("/2/chat/conversations/{conversation_id}/events")
 async def v2_chat_conversation_messages(

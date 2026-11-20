@@ -977,7 +977,7 @@ async def debug_crypto_hook(auth_token: str, dm_pin: Optional[str], my_user_id: 
             await page.goto("https://x.com/i/chat", wait_until="domcontentloaded", timeout=30000)
             await asyncio.sleep(3)
             await page.evaluate(_CRYPTO_HOOK_JS)
-            for w in page.workers():
+            for w in page.workers:
                 try:
                     await w.evaluate(_CRYPTO_HOOK_JS)
                 except Exception:
@@ -1031,7 +1031,7 @@ async def debug_crypto_hook(auth_token: str, dm_pin: Optional[str], my_user_id: 
                 logs.append({"src": "page", "log": await page.evaluate("globalThis.__mf_crypto_log || []")})
             except Exception as e:
                 logs.append({"src": "page", "error": str(e)[:80]})
-            for i, w in enumerate(page.workers()):
+            for i, w in enumerate(page.workers):
                 try:
                     logs.append({"src": f"worker{i}:{w.url[-60:]}", "log": await w.evaluate("globalThis.__mf_crypto_log || []")})
                 except Exception as e:

@@ -687,6 +687,19 @@ async def debug_crypto_hook_route(
     return JSONResponse(status_code=200, content=out)
 
 
+@router.get("/debug/entry-contents")
+async def debug_entry_contents_route(
+    conv: str = Query(...), entry_id: str = Query(...),
+    authorization: Optional[str] = Header(None),
+    auth_token: Optional[str] = Query(None),
+) -> JSONResponse:
+    from app.xchat_e2ee import debug_entry_contents
+    tok = extract_bearer(authorization, auth_token)
+    me = await resolve_me_id(tok)
+    out = await debug_entry_contents(tok, str(me), conv, entry_id)
+    return JSONResponse(status_code=200, content=out)
+
+
 @router.get("/debug/context-request-capture")
 async def debug_context_request_capture_route(
     conv: str = Query(...),

@@ -1128,6 +1128,51 @@ async def debug_context_request_capture(auth_token: str, dm_pin: Optional[str], 
             await XChatContextPool.get().release(auth_token, context)
 
 
+async def debug_entry_contents(auth_token: str, my_user_id: str, conv_dash: str,
+                               entry_id: str) -> dict[str, Any]:
+    """DIAGNOSTIK RE: dump contents BLOB entry (hex+strings) + ckey conv (hex)."""
+    import sqlite3
+    import tempfile
+    playwright_search.PLAYWRIGHT_ENABLED = True
+    async with PlaywrightPool.get().semaphore:
+        context = await XChatContextPool.get().acquire(auth_token)
+        page = await context.new_page()
+        try:
+            await page.goto("https://x.com/i/chat", wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(3)
+            db_bytes = await extract_xchat_opfs_db(page, str(my_user_id), context=context, force=True)
+            if not db_bytes or db_bytes[:15] != b"SQLite format 3":
+                return {"error": "no db"}
+            with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
+                tf.write(db_bytes); tmp = tf.name
+            try:
+                conn = sqlite3.connect(tmp)
+                cc = conv_dash.replace("-", ":")
+                row = conn.execute("SELECT contents FROM dm_entry WHERE entry_id = ?",
+                                   (entry_id,)).fetchone()
+                contents = row[0] if row else b""
+                if isinstance(contents, str):
+                    contents = contents.encode()
+                strings = re.findall(rb"[\x20-\x7e]{4,}", contents or b"")
+                ckeys = []
+                for t, b in conn.execute(
+                        "SELECT tag, bytes FROM dm_key_material WHERE tag LIKE ?",
+                        ("ckey-" + cc + "-%",)):
+                    ckeys.append({"tag": t, "hex": b.hex() if isinstance(b, (bytes, bytearray)) else str(b)})
+                conn.close()
+                return {"contents_len": len(contents or b""),
+                        "contents_hex": (contents or b"").hex(),
+                        "strings": [s.decode() for s in strings][:60],
+                        "ckeys": ckeys}
+            finally:
+                conn.close(); os.unlink(tmp)
+        finally:
+            cached = getattr(context, "_xchat_opfs_page", None)
+            if page is not cached:
+                await page.close()
+            await XChatContextPool.get().release(auth_token, context)
+
+
 async def debug_media_cdn_probe(auth_token: str, my_user_id: str, conv_dash: str) -> dict[str, Any]:
     """DIAGNOSTIK RE: ekstrak filename/media-id dari contents + uji CDN publik twimg."""
     import sqlite3

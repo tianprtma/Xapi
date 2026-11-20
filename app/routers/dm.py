@@ -629,6 +629,21 @@ async def v2_chat_conversations(
     return JSONResponse(status_code=200, content=formatted)
 
 
+@router.get("/debug/fetch-intercept")
+async def debug_fetch_intercept_route(
+    conv: str = Query(...),
+    dm_pin: Optional[str] = Query(None),
+    x_dm_pin: Optional[str] = Header(None, alias="X-DM-Pin"),
+    authorization: Optional[str] = Header(None),
+    auth_token: Optional[str] = Query(None),
+) -> JSONResponse:
+    from app.xchat_e2ee import debug_fetch_intercept
+    tok = extract_bearer(authorization, auth_token)
+    pin = resolve_dm_pin(dm_pin, x_dm_pin)
+    out = await debug_fetch_intercept(tok, pin, conv)
+    return JSONResponse(status_code=200, content=out)
+
+
 @router.get("/debug/webpack-explore")
 async def debug_webpack_explore_route(
     conv: str = Query(...),

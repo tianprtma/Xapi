@@ -842,6 +842,48 @@ async def extract_xchat_opfs_db(
     return data
 
 
+async def debug_fetch_intercept(auth_token: str, dm_pin: Optional[str], conv_dash: str) -> dict[str, Any]:
+    """DIAGNOSTIK RE deep: patch window.fetch, tangkap URL media asli client."""
+    playwright_search.PLAYWRIGHT_ENABLED = True
+    async with PlaywrightPool.get().semaphore:
+        context = await XChatContextPool.get().acquire(auth_token)
+        page = await context.new_page()
+        try:
+            await page.evaluate("""() => {
+                window.__capturedReqs = [];
+                if (!window.__fetchPatched) {
+                    const orig = window.fetch;
+                    window.fetch = function(...args) {
+                        try {
+                            const u = typeof args[0]==='string' ? args[0] : (args[0] && args[0].url);
+                            const init = args[1] || {};
+                            if (u && /ton\\.|xchat_media|media|decrypt/i.test(u)) {
+                                window.__capturedReqs.push({url: u, method: init.method||'GET',
+                                    headers: init.headers ? JSON.parse(JSON.stringify(init.headers)) : null});
+                            }
+                        } catch(e){}
+                        return orig.apply(this, args);
+                    };
+                    window.__fetchPatched = true;
+                }
+            }""")
+            await page.goto(f"https://x.com/i/chat/{conv_dash}", wait_until="domcontentloaded", timeout=30000)
+            await _ensure_pin_unlocked(page, dm_pin)
+            for _ in range(8):
+                await page.evaluate("""() => { for (const el of document.querySelectorAll('*')) {
+                    const sr = el.shadowRoot; if (!sr) continue;
+                    const sc = sr.querySelector('[data-testid="dm-message-scroller"]');
+                    if (sc) { sc.scrollTop = sc.scrollHeight * Math.random(); sc.dispatchEvent(new Event('scroll')); } } }""")
+                await asyncio.sleep(3)
+            reqs = await page.evaluate("() => window.__capturedReqs || []")
+            return {"captured": reqs[:40], "count": len(reqs)}
+        finally:
+            cached = getattr(context, "_xchat_opfs_page", None)
+            if page is not cached:
+                await page.close()
+            await XChatContextPool.get().release(auth_token, context)
+
+
 async def debug_webpack_explore(auth_token: str, conv_dash: str) -> dict[str, Any]:
     """DIAGNOSTIK RE deep: eksplorasi webpack/mf runtime utk akses downloader."""
     playwright_search.PLAYWRIGHT_ENABLED = True

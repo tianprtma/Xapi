@@ -984,6 +984,7 @@ async def debug_crypto_hook(auth_token: str, dm_pin: Optional[str], my_user_id: 
                     pass
             db_bytes = await extract_xchat_opfs_db(page, str(my_user_id), context=context, force=True)
             local_path = None
+            att_rows: list = []
             if db_bytes and db_bytes[:15] == b"SQLite format 3":
                 with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
                     tf.write(db_bytes); tmp = tf.name
@@ -994,6 +995,13 @@ async def debug_crypto_hook(auth_token: str, dm_pin: Optional[str], my_user_id: 
                         (entry_id,)).fetchone()
                     if row:
                         local_path = row[0]
+                    cc = conv_dash.replace("-", ":")
+                    for r in conn.execute(
+                            "SELECT a.message_id, a.local_path, a.attachment_type, a.file_size "
+                            "FROM dm_local_attachment a JOIN dm_entry e ON e.entry_id = a.message_id "
+                            "WHERE e.conversation_id = ?", (cc,)):
+                        att_rows.append({"message_id": r[0], "local_path": r[1],
+                                         "type": r[2], "size": r[3]})
                     conn.close()
                 finally:
                     os.unlink(tmp)
@@ -1036,7 +1044,30 @@ async def debug_crypto_hook(auth_token: str, dm_pin: Optional[str], my_user_id: 
                     logs.append({"src": f"worker{i}:{w.url[-60:]}", "log": await w.evaluate("globalThis.__mf_crypto_log || []")})
                 except Exception as e:
                     logs.append({"src": f"worker{i}", "error": str(e)[:80]})
+            exist_js = """async (paths) => {
+                const out = [];
+                for (const p of paths) {
+                    const parts = String(p).split('/').filter(Boolean);
+                    let dir = await navigator.storage.getDirectory();
+                    try {
+                        for (let i=0;i<parts.length-1;i++) dir = await dir.getDirectoryHandle(parts[i]);
+                        const fh = await dir.getFileHandle(parts[parts.length-1]);
+                        const f = await fh.getFile();
+                        const buf = new Uint8Array(await f.slice(0,16).arrayBuffer());
+                        let h=''; for (const b of buf) h+=b.toString(16).padStart(2,'0');
+                        out.push({path:p, exists:true, size:f.size, magic:h});
+                    } catch(e) { out.push({path:p, exists:false}); }
+                }
+                return out;
+            }"""
+            files_state = []
+            if att_rows:
+                try:
+                    files_state = await page.evaluate(exist_js, [a["local_path"] for a in att_rows])
+                except Exception as e:
+                    files_state = [{"error": str(e)[:80]}]
             return {"local_path": local_path, "delete_result": delres,
+                    "attachment_rows": att_rows, "files_state": files_state,
                     "media_urls": captured[:20], "crypto_logs": logs}
         finally:
             try:

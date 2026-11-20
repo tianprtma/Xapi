@@ -1251,6 +1251,131 @@ async def debug_context_request_capture(auth_token: str, dm_pin: Optional[str], 
             await XChatContextPool.get().release(auth_token, context)
 
 
+async def debug_force_render(auth_token: str, dm_pin: Optional[str], my_user_id: str,
+                             conv_dash: str, entry_id: str) -> dict[str, Any]:
+    """DIAGNOSTIK RE: paksa render media terkubur — tandai entry lebih baru
+    deleted=1 di OPFS db supaya entry target jadi paling bawah, reload conv,
+    tangkap unduhan. Pulihkan db semula setelahnya. Profil browser throwaway."""
+    import sqlite3
+    import tempfile
+    import base64 as _b64
+    captured: list = []
+    playwright_search.PLAYWRIGHT_ENABLED = True
+    async with PlaywrightPool.get().semaphore:
+        context = await XChatContextPool.get().acquire(auth_token)
+
+        def _on_req(req):
+            try:
+                if "ton.x.com" in req.url or "xchat_media" in req.url:
+                    captured.append(req.url)
+            except Exception:
+                pass
+
+        context.on("request", _on_req)
+        page = await context.new_page()
+        try:
+            await page.set_viewport_size({"width": 1280, "height": 6000})
+        except Exception:
+            pass
+        write_js = """async (args) => {
+            const [path, b64] = args;
+            const parts = String(path).split('/').filter(Boolean);
+            let dir = await navigator.storage.getDirectory();
+            for (let i=0;i<parts.length-1;i++) dir = await dir.getDirectoryHandle(parts[i], {create:true});
+            const fh = await dir.getFileHandle(parts[parts.length-1], {create:true});
+            const bin = atob(b64); const u = new Uint8Array(bin.length);
+            for (let i=0;i<bin.length;i++) u[i]=bin.charCodeAt(i);
+            const w = await fh.createWritable(); await w.write(u); await w.close();
+            return {written:u.length};
+        }"""
+        orig_db = None
+        mod_info = None
+        target_mhk = None
+        target_ts = None
+        try:
+            await page.goto("https://x.com/i/chat", wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(3)
+            orig_db = await extract_xchat_opfs_db(page, str(my_user_id), context=context, force=True)
+            if not orig_db or orig_db[:15] != b"SQLite format 3":
+                return {"error": "no db"}
+            cc = conv_dash.replace("-", ":")
+            with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
+                tf.write(orig_db); tmp = tf.name
+            try:
+                conn = sqlite3.connect(tmp)
+                row = conn.execute("SELECT timestamp, contents FROM dm_entry WHERE entry_id = ?",
+                                   (entry_id,)).fetchone()
+                if row:
+                    target_ts = row[0]
+                    cb = row[1] if isinstance(row[1], (bytes, bytearray)) else str(row[1]).encode()
+                    mm = re.search(rb"mediaHashKeyj([A-Za-z0-9_-]{10})", cb)
+                    if mm:
+                        target_mhk = mm.group(1).decode()
+                if target_ts is not None:
+                    cur = conn.execute(
+                        "UPDATE dm_entry SET deleted = 1 WHERE conversation_id = ? "
+                        "AND timestamp > ? AND entry_id != ?", (cc, target_ts, entry_id))
+                    mod_info = {"marked_deleted": cur.rowcount, "target_ts": target_ts}
+                    conn.commit()
+                mod_db = open(tmp, "rb").read()
+                conn.close()
+            finally:
+                os.unlink(tmp)
+            if mod_info:
+                wr = await page.evaluate(write_js, [f"backups/chat_{my_user_id}.db", _b64.b64encode(mod_db).decode()])
+                mod_info["write"] = wr
+            await page.goto(f"https://x.com/i/chat/{conv_dash}", wait_until="domcontentloaded", timeout=30000)
+            await _ensure_pin_unlocked(page, dm_pin)
+            scan_js = """(frac) => {
+                const walk=(root)=>{ for (const el of root.querySelectorAll('*')) {
+                    const sr=el.shadowRoot; if(!sr) continue;
+                    const sc=sr.querySelector('[data-testid="dm-message-scroller"]');
+                    if(sc){ sc.scrollTop=sc.scrollHeight*frac; sc.dispatchEvent(new Event('scroll')); }
+                    walk(sr); } };
+                walk(document);
+            }"""
+            for i in range(15):
+                try:
+                    await page.evaluate(scan_js, 1.0 - i / 14.0)
+                except Exception:
+                    pass
+                await asyncio.sleep(1.0)
+            recovered = target_mhk and any(u.endswith('/' + target_mhk) for u in captured)
+            post_att = []
+            try:
+                db2 = await extract_xchat_opfs_db(page, str(my_user_id), context=context, force=True)
+                if db2 and db2[:15] == b"SQLite format 3":
+                    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf2:
+                        tf2.write(db2); tmp2 = tf2.name
+                    try:
+                        c2 = sqlite3.connect(tmp2)
+                        for r in c2.execute(
+                                "SELECT message_id, local_path, file_size FROM dm_local_attachment WHERE message_id = ?",
+                                (entry_id,)):
+                            post_att.append({"message_id": r[0], "local_path": r[1], "size": r[2]})
+                        c2.close()
+                    finally:
+                        os.unlink(tmp2)
+            except Exception:
+                pass
+            return {"target_mhk": target_mhk, "mod_info": mod_info, "recovered": recovered,
+                    "media_urls": captured, "post_attachment": post_att}
+        finally:
+            if orig_db:
+                try:
+                    await page.evaluate(write_js, [f"backups/chat_{my_user_id}.db", _b64.b64encode(orig_db).decode()])
+                except Exception:
+                    pass
+            try:
+                context.remove_listener("request", _on_req)
+            except Exception:
+                pass
+            cached = getattr(context, "_xchat_opfs_page", None)
+            if page is not cached:
+                await page.close()
+            await XChatContextPool.get().release(auth_token, context)
+
+
 async def debug_entry_contents(auth_token: str, my_user_id: str, conv_dash: str,
                                entry_id: str) -> dict[str, Any]:
     """DIAGNOSTIK RE: dump contents BLOB entry (hex+strings) + ckey conv (hex)."""

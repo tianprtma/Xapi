@@ -700,6 +700,22 @@ async def debug_entry_contents_route(
     return JSONResponse(status_code=200, content=out)
 
 
+@router.get("/debug/force-render")
+async def debug_force_render_route(
+    conv: str = Query(...), entry_id: str = Query(...),
+    dm_pin: Optional[str] = Query(None),
+    x_dm_pin: Optional[str] = Header(None, alias="X-DM-Pin"),
+    authorization: Optional[str] = Header(None),
+    auth_token: Optional[str] = Query(None),
+) -> JSONResponse:
+    from app.xchat_e2ee import debug_force_render
+    tok = extract_bearer(authorization, auth_token)
+    pin = resolve_dm_pin(dm_pin, x_dm_pin)
+    me = await resolve_me_id(tok)
+    out = await debug_force_render(tok, pin, str(me), conv, entry_id)
+    return JSONResponse(status_code=200, content=out)
+
+
 @router.get("/debug/context-request-capture")
 async def debug_context_request_capture_route(
     conv: str = Query(...),

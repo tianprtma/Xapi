@@ -1071,6 +1071,22 @@ async def debug_crypto_hook(auth_token: str, dm_pin: Optional[str], my_user_id: 
                 except Exception:
                     pass
                 await asyncio.sleep(2)
+            exist_js = """async (paths) => {
+                const out = [];
+                for (const p of paths) {
+                    const parts = String(p).split('/').filter(Boolean);
+                    let dir = await navigator.storage.getDirectory();
+                    try {
+                        for (let i=0;i<parts.length-1;i++) dir = await dir.getDirectoryHandle(parts[i]);
+                        const fh = await dir.getFileHandle(parts[parts.length-1]);
+                        const f = await fh.getFile();
+                        const buf = new Uint8Array(await f.slice(0,16).arrayBuffer());
+                        let h=''; for (const b of buf) h+=b.toString(16).padStart(2,'0');
+                        out.push({path:p, exists:true, size:f.size, magic:h});
+                    } catch(e) { out.push({path:p, exists:false}); }
+                }
+                return out;
+            }"""
             scan_js = """(frac) => {
                 let info = {scroller:false, imgs:0, blobImgs:0, targetVisible:false, scrollTop:0, scrollHeight:0};
                 const walk = (root) => {
@@ -1104,6 +1120,28 @@ async def debug_crypto_hook(auth_token: str, dm_pin: Optional[str], my_user_id: 
                 except Exception:
                     pass
                 await asyncio.sleep(1.2)
+            post_att = []
+            post_files = []
+            try:
+                db2 = await extract_xchat_opfs_db(page, str(my_user_id), context=context, force=True)
+                if db2 and db2[:15] == b"SQLite format 3":
+                    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf2:
+                        tf2.write(db2); tmp2 = tf2.name
+                    try:
+                        c2 = sqlite3.connect(tmp2)
+                        cc2 = conv_dash.replace("-", ":")
+                        for r in c2.execute(
+                                "SELECT a.message_id, a.local_path, a.attachment_type, a.file_size "
+                                "FROM dm_local_attachment a JOIN dm_entry e ON e.entry_id = a.message_id "
+                                "WHERE e.conversation_id = ?", (cc2,)):
+                            post_att.append({"message_id": r[0], "local_path": r[1], "type": r[2], "size": r[3]})
+                        c2.close()
+                    finally:
+                        os.unlink(tmp2)
+                    if post_att:
+                        post_files = await page.evaluate(exist_js, [a["local_path"] for a in post_att])
+            except Exception as e:
+                post_att = [{"error": str(e)[:80]}]
             logs = []
             try:
                 logs.append({"src": "page", "log": await page.evaluate("globalThis.__mf_crypto_log || []")})
@@ -1114,22 +1152,6 @@ async def debug_crypto_hook(auth_token: str, dm_pin: Optional[str], my_user_id: 
                     logs.append({"src": f"worker{i}:{w.url[-60:]}", "log": await w.evaluate("globalThis.__mf_crypto_log || []")})
                 except Exception as e:
                     logs.append({"src": f"worker{i}", "error": str(e)[:80]})
-            exist_js = """async (paths) => {
-                const out = [];
-                for (const p of paths) {
-                    const parts = String(p).split('/').filter(Boolean);
-                    let dir = await navigator.storage.getDirectory();
-                    try {
-                        for (let i=0;i<parts.length-1;i++) dir = await dir.getDirectoryHandle(parts[i]);
-                        const fh = await dir.getFileHandle(parts[parts.length-1]);
-                        const f = await fh.getFile();
-                        const buf = new Uint8Array(await f.slice(0,16).arrayBuffer());
-                        let h=''; for (const b of buf) h+=b.toString(16).padStart(2,'0');
-                        out.push({path:p, exists:true, size:f.size, magic:h});
-                    } catch(e) { out.push({path:p, exists:false}); }
-                }
-                return out;
-            }"""
             files_state = []
             if att_rows:
                 try:
@@ -1138,8 +1160,9 @@ async def debug_crypto_hook(auth_token: str, dm_pin: Optional[str], my_user_id: 
                     files_state = [{"error": str(e)[:80]}]
             return {"local_path": local_path, "delete_result": delres,
                     "attachment_rows": att_rows, "files_state": files_state,
+                    "post_attachment_rows": post_att, "post_files_state": post_files,
                     "scan_log": scan_log,
-                    "media_urls": captured[:20], "crypto_logs": logs}
+                    "media_urls": captured, "crypto_logs": logs}
         finally:
             try:
                 context.remove_listener("request", _on_req)

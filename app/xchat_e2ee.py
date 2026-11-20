@@ -1185,11 +1185,19 @@ async def debug_entry_contents(auth_token: str, my_user_id: str, conv_dash: str,
                         "SELECT tag, bytes FROM dm_key_material WHERE tag LIKE ?",
                         ("ckey-" + cc + "-%",)):
                     ckeys.append({"tag": t, "hex": b.hex() if isinstance(b, (bytes, bytearray)) else str(b)})
+                convrow = None
+                try:
+                    cols = [c[1] for c in conn.execute("PRAGMA table_info(dm_conversation)")]
+                    cr = conn.execute("SELECT * FROM dm_conversation WHERE conversation_id = ?", (cc,)).fetchone()
+                    if cr:
+                        convrow = {c: (v.hex() if isinstance(v, (bytes, bytearray)) else v) for c, v in zip(cols, cr)}
+                except Exception as e:
+                    convrow = {"error": str(e)[:80]}
                 conn.close()
                 return {"contents_len": len(contents or b""),
                         "contents_hex": (contents or b"").hex(),
                         "strings": [s.decode() for s in strings][:60],
-                        "ckeys": ckeys}
+                        "ckeys": ckeys, "conv_row": convrow}
             finally:
                 conn.close(); os.unlink(tmp)
         finally:

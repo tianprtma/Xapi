@@ -840,8 +840,8 @@ async def extract_xchat_opfs_db(
     return data
 
 
-async def debug_opfs_conv_media(auth_token: str, my_user_id: str, conv_dash: str) -> dict[str, Any]:
-    """DIAGNOSTIK SEMENTARA: inventaris media OPFS satu conv."""
+async def debug_opfs_conv_media(auth_token: str, my_user_id: str, conv_dash: str, dm_pin: Optional[str] = None) -> dict[str, Any]:
+    """DIAGNOSTIK SEMENTARA: inventaris media OPFS satu conv (scroll trigger)."""
     import sqlite3
     import tempfile
     playwright_search.PLAYWRIGHT_ENABLED = True
@@ -850,7 +850,13 @@ async def debug_opfs_conv_media(auth_token: str, my_user_id: str, conv_dash: str
         page = await context.new_page()
         try:
             await page.goto(f"https://x.com/i/chat/{conv_dash}", wait_until="domcontentloaded", timeout=30000)
-            await asyncio.sleep(6)
+            await _ensure_pin_unlocked(page, dm_pin)
+            for _ in range(5):
+                await page.evaluate("""() => { for (const el of document.querySelectorAll('*')) {
+                    const sr = el.shadowRoot; if (!sr) continue;
+                    const sc = sr.querySelector('[data-testid="dm-message-scroller"]');
+                    if (sc) { sc.scrollTop = sc.scrollHeight * Math.random(); sc.dispatchEvent(new Event('scroll')); } } }""")
+                await asyncio.sleep(4)
             db_bytes = await extract_xchat_opfs_db(page, str(my_user_id), context=context, force=True)
             if not db_bytes or db_bytes[:15] != b"SQLite format 3":
                 return {"error": "no db"}

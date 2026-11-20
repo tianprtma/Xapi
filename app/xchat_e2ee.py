@@ -992,6 +992,10 @@ async def debug_crypto_hook(auth_token: str, dm_pin: Optional[str], my_user_id: 
 
         context.on("request", _on_req)
         page = await context.new_page()
+        try:
+            await page.set_viewport_size({"width": 1280, "height": 6000})
+        except Exception:
+            pass
 
         def _on_worker(w):
             try:

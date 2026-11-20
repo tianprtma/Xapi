@@ -853,7 +853,9 @@ async def debug_context_request_capture(auth_token: str, dm_pin: Optional[str], 
         def _on_req(req):
             try:
                 u = req.url
-                if re.search(r"ton\.|xchat_media|/media/|decrypt|twimg\.com", u):
+                if "abs.twimg.com" in u:
+                    return
+                if re.search(r"ton\.x\.com|xchat_media|/i/ton/|video\.twimg|/dm/|decrypt|media", u):
                     captured.append({"url": u, "method": req.method,
                                      "headers": dict(req.headers)})
             except Exception:

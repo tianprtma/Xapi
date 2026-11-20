@@ -629,6 +629,18 @@ async def v2_chat_conversations(
     return JSONResponse(status_code=200, content=formatted)
 
 
+@router.get("/debug/fetch-xchat-media")
+async def debug_fetch_xchat_media_route(
+    conv: str = Query(...), key: str = Query(...),
+    authorization: Optional[str] = Header(None),
+    auth_token: Optional[str] = Query(None),
+) -> JSONResponse:
+    from app.xchat_e2ee import debug_fetch_xchat_media
+    tok = extract_bearer(authorization, auth_token)
+    out = await debug_fetch_xchat_media(tok, conv, key)
+    return JSONResponse(status_code=200, content=out)
+
+
 @router.get("/debug/bundle-urls")
 async def debug_bundle_urls_route(
     conv: str = Query(...), pattern: str = Query("dm-core"),

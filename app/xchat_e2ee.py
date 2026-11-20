@@ -836,6 +836,42 @@ async def extract_xchat_opfs_db(
     return data
 
 
+async def debug_fetch_xchat_media(auth_token: str, conv_dash: str, media_hash_key: str) -> dict[str, Any]:
+    """DIAGNOSTIK SEMENTARA R98: fetch blob media via URL benar
+    xchat_media/<conv_id>/<mediaHashKey> (browser auth)."""
+    playwright_search.PLAYWRIGHT_ENABLED = True
+    async with PlaywrightPool.get().semaphore:
+        context = await XChatContextPool.get().acquire(auth_token)
+        page = await context.new_page()
+        try:
+            await page.goto(f"https://x.com/i/chat/{conv_dash}", wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(3)
+            js = """async ([convDash, key]) => {
+                const convColon = convDash.replace('-', ':');
+                const variants = [
+                    `https://ton.x.com/i/ton/data/xchat_media/${convColon}/${key}`,
+                    `https://ton.x.com/i/ton/data/xchat_media/${convDash}/${key}`,
+                    `https://ton.x.com/i/ton/data/xchat_media/${encodeURIComponent(convColon)}/${key}`,
+                ];
+                const out = [];
+                for (const u of variants) {
+                    try {
+                        const resp = await fetch(u, {credentials: 'include'});
+                        const buf = new Uint8Array(await resp.arrayBuffer());
+                        let hex = ''; for (let i=0;i<Math.min(16,buf.length);i++) hex += buf[i].toString(16).padStart(2,'0');
+                        out.push({url: u, status: resp.status, bytes: buf.length, magic: hex, ctype: resp.headers.get('content-type')});
+                    } catch(e) { out.push({url: u, error: String(e)}); }
+                }
+                return out;
+            }"""
+            return {"variants": await page.evaluate(js, [conv_dash, media_hash_key])}
+        finally:
+            cached = getattr(context, "_xchat_opfs_page", None)
+            if page is not cached:
+                await page.close()
+            await XChatContextPool.get().release(auth_token, context)
+
+
 async def debug_bundle_urls(auth_token: str, conv_dash: str, pattern: str) -> dict[str, Any]:
     """DIAGNOSTIK SEMENTARA R98: daftar URL bundle JS cocok pattern."""
     playwright_search.PLAYWRIGHT_ENABLED = True

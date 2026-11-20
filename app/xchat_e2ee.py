@@ -1004,6 +1004,54 @@ async def debug_media_cdn_probe(auth_token: str, my_user_id: str, conv_dash: str
             await XChatContextPool.get().release(auth_token, context)
 
 
+async def debug_key_material(auth_token: str, my_user_id: str, conv_dash: str) -> dict[str, Any]:
+    """DIAGNOSTIK RE crypto: dump tabel kunci OPFS (schema + sample)."""
+    import sqlite3
+    import tempfile
+    playwright_search.PLAYWRIGHT_ENABLED = True
+    async with PlaywrightPool.get().semaphore:
+        context = await XChatContextPool.get().acquire(auth_token)
+        page = await context.new_page()
+        try:
+            await page.goto("https://x.com/i/chat", wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(3)
+            db_bytes = await extract_xchat_opfs_db(page, str(my_user_id), context=context, force=True)
+            if not db_bytes or db_bytes[:15] != b"SQLite format 3":
+                return {"error": "no db"}
+            with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
+                tf.write(db_bytes); tmp = tf.name
+            try:
+                conn = sqlite3.connect(tmp)
+                out = {}
+                cc = conv_dash.replace("-", ":")
+                for t in ["dm_key_material", "dm_my_keypair_versions", "dm_public_key_cache",
+                          "dm_conversation_key_versions", "dm_pmk_bundle"]:
+                    try:
+                        cols = [c[1] for c in conn.execute(f"PRAGMA table_info({t})")]
+                        cnt = conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+                        rows = conn.execute(f"SELECT * FROM {t} LIMIT 2").fetchall()
+                        sample = []
+                        for r in rows:
+                            rd = {}
+                            for c, v in zip(cols, r):
+                                if isinstance(v, (bytes, bytearray)):
+                                    rd[c] = f"<bytes {len(v)}: {v[:16].hex()}>"
+                                else:
+                                    rd[c] = str(v)[:60]
+                            sample.append(rd)
+                        out[t] = {"cols": cols, "count": cnt, "sample": sample}
+                    except Exception as e:
+                        out[t] = {"error": str(e)[:60]}
+                return out
+            finally:
+                conn.close(); os.unlink(tmp)
+        finally:
+            cached = getattr(context, "_xchat_opfs_page", None)
+            if page is not cached:
+                await page.close()
+            await XChatContextPool.get().release(auth_token, context)
+
+
 def query_dm_entries(
     conn: Any, conv_id_colon: str, limit: int = 50
 ) -> list[dict[str, Any]]:

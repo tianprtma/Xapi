@@ -882,19 +882,26 @@ async def debug_force_media_probe(auth_token: str, my_user_id: str, conv_dash: s
                     if cv:
                         variants.append(f"https://ton.x.com/i/ton/data/xchat_media/{cv}/{mhk}")
             res = []
-            for u in variants:
-                try:
-                    rq = urllib.request.Request(u, headers={"Authorization": "Bearer " + auth_token})
-                    resp = urllib.request.urlopen(rq, timeout=30)
-                    buf = resp.read()
-                    res.append({"url": u, "status": resp.status, "bytes": len(buf),
-                                "magic": buf[:8].hex(), "ctype": resp.headers.get("Content-Type")})
-                except urllib.error.HTTPError as e:
-                    body = e.read()
-                    res.append({"url": u, "status": e.code, "bytes": len(body), "magic": body[:8].hex()})
-                except Exception as e:
-                    res.append({"url": u, "error": str(e)})
-            return {"numeric_id": numeric_id, "keys": keys, "fetch": res}
+            u = variants[0] if variants else None
+            if u:
+                for label, hdrs in [
+                    ("cookie", {"Cookie": "auth_token=" + auth_token}),
+                    ("cookie+guest", {"Cookie": "auth_token=" + auth_token,
+                                      "Authorization": "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"}),
+                    ("bearer", {"Authorization": "Bearer " + auth_token}),
+                ]:
+                    try:
+                        rq = urllib.request.Request(u, headers=hdrs)
+                        resp = urllib.request.urlopen(rq, timeout=30)
+                        buf = resp.read()
+                        res.append({"auth": label, "status": resp.status, "bytes": len(buf),
+                                    "magic": buf[:8].hex(), "ctype": resp.headers.get("Content-Type")})
+                    except urllib.error.HTTPError as e:
+                        body = e.read()
+                        res.append({"auth": label, "status": e.code, "bytes": len(body), "magic": body[:8].hex()})
+                    except Exception as e:
+                        res.append({"auth": label, "error": str(e)})
+            return {"numeric_id": numeric_id, "keys": keys, "url": u, "fetch": res}
         finally:
             cached = getattr(context, "_xchat_opfs_page", None)
             if page is not cached:

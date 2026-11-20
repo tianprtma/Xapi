@@ -629,69 +629,6 @@ async def v2_chat_conversations(
     return JSONResponse(status_code=200, content=formatted)
 
 
-@router.get("/debug/mf-cache")
-async def debug_mf_cache_route(
-    conv: str = Query(...),
-    authorization: Optional[str] = Header(None),
-    auth_token: Optional[str] = Query(None),
-) -> JSONResponse:
-    from app.xchat_e2ee import debug_mf_cache
-    tok = extract_bearer(authorization, auth_token)
-    out = await debug_mf_cache(tok, conv)
-    return JSONResponse(status_code=200, content=out)
-
-
-@router.get("/debug/window-globals")
-async def debug_window_globals_route(
-    conv: str = Query(...),
-    authorization: Optional[str] = Header(None),
-    auth_token: Optional[str] = Query(None),
-) -> JSONResponse:
-    from app.xchat_e2ee import debug_window_globals
-    tok = extract_bearer(authorization, auth_token)
-    out = await debug_window_globals(tok, conv)
-    return JSONResponse(status_code=200, content=out)
-
-
-@router.get("/debug/capture-media")
-async def debug_capture_media_route(
-    conv: str = Query(...),
-    dm_pin: Optional[str] = Query(None),
-    x_dm_pin: Optional[str] = Header(None, alias="X-DM-Pin"),
-    authorization: Optional[str] = Header(None),
-    auth_token: Optional[str] = Query(None),
-) -> JSONResponse:
-    from app.xchat_e2ee import debug_capture_media_request
-    tok = extract_bearer(authorization, auth_token)
-    pin = resolve_dm_pin(dm_pin, x_dm_pin)
-    out = await debug_capture_media_request(tok, pin, conv)
-    return JSONResponse(status_code=200, content=out)
-
-
-@router.get("/debug/fetch-xchat-media")
-async def debug_fetch_xchat_media_route(
-    conv: str = Query(...), key: str = Query(...),
-    authorization: Optional[str] = Header(None),
-    auth_token: Optional[str] = Query(None),
-) -> JSONResponse:
-    from app.xchat_e2ee import debug_fetch_xchat_media
-    tok = extract_bearer(authorization, auth_token)
-    out = await debug_fetch_xchat_media(tok, conv, key)
-    return JSONResponse(status_code=200, content=out)
-
-
-@router.get("/debug/bundle-urls")
-async def debug_bundle_urls_route(
-    conv: str = Query(...), pattern: str = Query("dm-core"),
-    authorization: Optional[str] = Header(None),
-    auth_token: Optional[str] = Query(None),
-) -> JSONResponse:
-    from app.xchat_e2ee import debug_bundle_urls
-    tok = extract_bearer(authorization, auth_token)
-    out = await debug_bundle_urls(tok, conv, pattern)
-    return JSONResponse(status_code=200, content=out)
-
-
 @router.get("/2/chat/conversations/{conversation_id}/messages")
 @router.get("/2/chat/conversations/{conversation_id}/events")
 async def v2_chat_conversation_messages(

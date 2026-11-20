@@ -876,11 +876,16 @@ async def debug_force_media_probe(auth_token: str, my_user_id: str, conv_dash: s
             finally:
                 conn.close(); os.unlink(tmp)
             variants = []
+            parts = conv_dash.split("-")
+            peer = parts[0] if parts[0] != str(my_user_id) else parts[1]
             for k in keys[:1]:
                 mhk = k["mediaHashKey"]
-                for cv in [numeric_id, cc, conv_dash]:
+                for cv in [numeric_id, cc, conv_dash, peer, str(my_user_id),
+                           cc.replace(":", "-"), mhk]:
                     if cv:
                         variants.append(f"https://ton.x.com/i/ton/data/xchat_media/{cv}/{mhk}")
+                variants.append(f"https://ton.x.com/i/ton/data/xchat_media/{mhk}/{numeric_id}")
+                variants.append(f"https://ton.x.com/i/ton/data/xchat_media/{mhk}/{cc}")
             res = []
             hdrs = {"Cookie": "auth_token=" + auth_token}
             for u in variants:

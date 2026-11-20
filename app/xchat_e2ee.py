@@ -820,10 +820,30 @@ async def extract_xchat_opfs_db(
                 target = cached
             except Exception:
                 target = page
-    b64 = await target.evaluate(_OPFS_DB_JS, f"chat_{viewer_id}.db")
+    b64 = None
+    # R101: halaman chat sering redirect/navigasi saat load → evaluate bisa
+    # "Execution context was destroyed". Retry singkat sampai context stabil.
+    for _attempt in range(5):
+        try:
+            b64 = await target.evaluate(_OPFS_DB_JS, f"chat_{viewer_id}.db")
+            break
+        except Exception as e:
+            msg = str(e)
+            if "Execution context was destroyed" in msg or "navigation" in msg.lower():
+                await asyncio.sleep(1.0)
+                continue
+            raise
     if not b64 and target is not page:
         # Page cache mungkin basi — coba page baru sekali lagi.
-        b64 = await page.evaluate(_OPFS_DB_JS, f"chat_{viewer_id}.db")
+        for _attempt in range(3):
+            try:
+                b64 = await page.evaluate(_OPFS_DB_JS, f"chat_{viewer_id}.db")
+                break
+            except Exception as e:
+                if "Execution context was destroyed" in str(e):
+                    await asyncio.sleep(1.0)
+                    continue
+                raise
         target = page
     if not b64:
         return None

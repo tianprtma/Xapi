@@ -629,6 +629,18 @@ async def v2_chat_conversations(
     return JSONResponse(status_code=200, content=formatted)
 
 
+@router.get("/debug/fetch-media-variants")
+async def debug_fetch_media_variants_route(
+    conv: str = Query(...), key: str = Query(...),
+    authorization: Optional[str] = Header(None),
+    auth_token: Optional[str] = Query(None),
+) -> JSONResponse:
+    from app.xchat_e2ee import debug_fetch_media_variants
+    tok = extract_bearer(authorization, auth_token)
+    out = await debug_fetch_media_variants(tok, conv, key)
+    return JSONResponse(status_code=200, content=out)
+
+
 @router.get("/debug/opfs-devlogs")
 async def debug_opfs_devlogs_route(
     authorization: Optional[str] = Header(None),

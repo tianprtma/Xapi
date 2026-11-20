@@ -836,6 +836,39 @@ async def extract_xchat_opfs_db(
     return data
 
 
+async def debug_fetch_media_variants(auth_token: str, conv_dash: str, key: str) -> dict[str, Any]:
+    """DIAGNOSTIK SEMENTARA R98: brute-force format URL media (orientasi conv)."""
+    playwright_search.PLAYWRIGHT_ENABLED = True
+    async with PlaywrightPool.get().semaphore:
+        context = await XChatContextPool.get().acquire(auth_token)
+        page = await context.new_page()
+        try:
+            await page.goto(f"https://x.com/i/chat/{conv_dash}", wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(3)
+            js = """async ([convDash, key]) => {
+                const parts = convDash.split('-');
+                const a = parts[0], b = parts[1];
+                const convs = [a+':'+b, b+':'+a, a+'-'+b, b+'-'+a, a, b];
+                const out = [];
+                for (const cv of convs) {
+                    const u = `https://ton.x.com/i/ton/data/xchat_media/${cv}/${key}`;
+                    try {
+                        const resp = await fetch(u, {credentials:'include'});
+                        const buf = new Uint8Array(await resp.arrayBuffer());
+                        let hex=''; for(let i=0;i<Math.min(8,buf.length);i++)hex+=buf[i].toString(16).padStart(2,'0');
+                        out.push({conv:cv, status:resp.status, bytes:buf.length, magic:hex});
+                    } catch(e){ out.push({conv:cv, error:String(e)}); }
+                }
+                return out;
+            }"""
+            return {"variants": await page.evaluate(js, [conv_dash, key])}
+        finally:
+            cached = getattr(context, "_xchat_opfs_page", None)
+            if page is not cached:
+                await page.close()
+            await XChatContextPool.get().release(auth_token, context)
+
+
 async def debug_opfs_devlogs(auth_token: str, my_user_id: str) -> dict[str, Any]:
     """DIAGNOSTIK SEMENTARA R98: baca OPFS dm-dev-logs utk URL unduh media asli."""
     playwright_search.PLAYWRIGHT_ENABLED = True

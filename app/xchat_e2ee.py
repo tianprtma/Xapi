@@ -786,10 +786,12 @@ async def read_xchat_opfs_file(
 # dan membuat fase fetch watch 3-4 menit. TTL pendek menjaga freshness.
 _OPFS_DB_CACHE_TTL = float(os.environ.get("XCHAT_OPFS_DB_CACHE_TTL_SEC", "20"))
 _OPFS_DB_CACHE: dict[tuple[int, str], tuple[float, bytes]] = {}
+# R99: jeda setelah membuka conv agar client sempat mengunduh media ke OPFS.
+_MEDIA_TRIGGER_WAIT_SEC = float(os.environ.get("XCHAT_MEDIA_TRIGGER_WAIT_SEC", "8"))
 
 
 async def extract_xchat_opfs_db(
-    page: Any, viewer_id: str, *, context: Any = None
+    page: Any, viewer_id: str, *, context: Any = None, force: bool = False
 ) -> Optional[bytes]:
     """Baca file SQLite OPFS `backups/chat_<viewer_id>.db` dari halaman X.
     R87.2: navigator.storage.getDirectory hanya ter-expose di PAGE PERTAMA
@@ -799,9 +801,11 @@ async def extract_xchat_opfs_db(
     dipakai ulang untuk pemanggilan berikutnya.
     R95: bytes di-cache per (context, viewer) selama TTL agar fetch watch
     beruntun tidak membaca ulang file 18MB per percakapan.
+    R99: force=True melewati cache (baca segar) — dipakai setelah memicu
+    unduhan media agar snapshot baru terlihat.
     Kembalikan bytes db, atau None bila file tidak ada."""
     cache_key = (id(context), str(viewer_id)) if context is not None else None
-    if cache_key is not None and _OPFS_DB_CACHE_TTL > 0:
+    if not force and cache_key is not None and _OPFS_DB_CACHE_TTL > 0:
         hit = _OPFS_DB_CACHE.get(cache_key)
         if hit is not None and (time.monotonic() - hit[0]) < _OPFS_DB_CACHE_TTL:
             return hit[1]
@@ -834,42 +838,6 @@ async def extract_xchat_opfs_db(
     if cache_key is not None and _OPFS_DB_CACHE_TTL > 0:
         _OPFS_DB_CACHE[cache_key] = (time.monotonic(), data)
     return data
-
-
-async def debug_opfs_conv_media(auth_token: str, my_user_id: str, conv_dash: str) -> dict[str, Any]:
-    """DIAGNOSTIK SEMENTARA R99: inventaris media OPFS satu conv (video/gift)."""
-    import sqlite3
-    import tempfile
-    playwright_search.PLAYWRIGHT_ENABLED = True
-    async with PlaywrightPool.get().semaphore:
-        context = await XChatContextPool.get().acquire(auth_token)
-        page = await context.new_page()
-        try:
-            await page.goto("https://x.com/i/chat", wait_until="domcontentloaded", timeout=30000)
-            await asyncio.sleep(3)
-            db_bytes = await extract_xchat_opfs_db(page, str(my_user_id), context=context)
-            if not db_bytes or db_bytes[:15] != b"SQLite format 3":
-                return {"error": "no db"}
-            with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
-                tf.write(db_bytes); tmp = tf.name
-            try:
-                conn = sqlite3.connect(tmp)
-                conv_colon = conv_dash.replace("-", ":")
-                entries = conn.execute(
-                    "SELECT entry_id, sender_id, has_attachment, attachment_types, timestamp, substr(plain_text,1,40) FROM dm_entry WHERE conversation_id=? AND deleted=0 ORDER BY timestamp DESC LIMIT 12",
-                    (conv_colon,)).fetchall()
-                la = conn.execute(
-                    "SELECT attachment_id, message_id, local_path, attachment_type, file_size FROM dm_local_attachment WHERE conversation_id=?",
-                    (conv_colon,)).fetchall()
-                return {"entries": [list(r) for r in entries],
-                        "local_attachment": [list(r) for r in la]}
-            finally:
-                conn.close(); os.unlink(tmp)
-        finally:
-            cached = getattr(context, "_xchat_opfs_page", None)
-            if page is not cached:
-                await page.close()
-            await XChatContextPool.get().release(auth_token, context)
 
 
 def query_dm_entries(
@@ -1279,6 +1247,44 @@ async def unlock_and_read_xchat_conversation(
                                         "R90: recovery media OPFS gagal (%s) — pending",
                                         media_exc,
                                     )
+                                # R99: media masih pending = file belum terunduh
+                                # ke OPFS. Baca OPFS saja tidak memicu unduhan;
+                                # membuka halaman conv yang memicu client mengunduh
+                                # media (terutama pesan terbaru). Kunjungi conv,
+                                # tunggu sebentar, baca ulang db (force, bypass
+                                # cache R95) dan recover lagi — supaya media tayang
+                                # bersama menfess, bukan fallback teks setelah 45m.
+                                if any(e.get("_xchat_media_pending") for e in events):
+                                    try:
+                                        await page.goto(
+                                            f"https://x.com/i/chat/{norm_conv_id}",
+                                            wait_until="domcontentloaded", timeout=25000,
+                                        )
+                                        await _ensure_pin_unlocked(page, dm_pin)
+                                        await asyncio.sleep(_MEDIA_TRIGGER_WAIT_SEC)
+                                        db2 = await extract_xchat_opfs_db(
+                                            page, str(my_user_id), context=context, force=True
+                                        )
+                                        if db2 and db2[:15] == b"SQLite format 3":
+                                            with _tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf2:
+                                                tf2.write(db2)
+                                                tmp2 = tf2.name
+                                            conn2 = _sqlite3.connect(tmp2)
+                                            try:
+                                                rows2 = query_dm_entries(
+                                                    conn2, norm_conv_id.replace("-", ":"), max_results
+                                                )
+                                                await recover_opfs_media_for_events(
+                                                    conn2, page, context, rows2, events
+                                                )
+                                            finally:
+                                                conn2.close()
+                                                os.unlink(tmp2)
+                                    except Exception as trig_exc:  # noqa: BLE001
+                                        log.debug(
+                                            "R99: trigger unduh media %s gagal (%s)",
+                                            norm_conv_id, trig_exc,
+                                        )
                                 log.info(
                                     "R87: OPFS sqlite memulihkan %d event percakapan %s",
                                     len(events), norm_conv_id,

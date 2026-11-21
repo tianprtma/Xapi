@@ -1358,6 +1358,7 @@ async def unlock_and_read_xchat_conversation(
                                             walk(sr); } };
                                         walk(document);
                                     }"""
+                                    log.info("R99/R101: trigger unduh media %s mulai (attempts=%d)", norm_conv_id, _MEDIA_TRIGGER_ATTEMPTS)
                                     for _attempt in range(_MEDIA_TRIGGER_ATTEMPTS):
                                         try:
                                             await page.goto(
@@ -1395,6 +1396,8 @@ async def unlock_and_read_xchat_conversation(
                                                 "R99/R101: trigger unduh media %s gagal (%s)",
                                                 norm_conv_id, trig_exc,
                                             )
+                                        still = [e.get("id") for e in events if e.get("_xchat_media_pending")]
+                                        log.info("R99/R101: trigger attempt %d selesai — pending tersisa %d", _attempt + 1, len(still))
                                         if not any(e.get("_xchat_media_pending") for e in events):
                                             break
                                 log.info(

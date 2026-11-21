@@ -914,7 +914,16 @@ async def debug_conv_dom(auth_token: str, dm_pin: Optional[str], my_user_id: str
                     conn.close()
                 finally:
                     conn.close(); os.unlink(tmp)
-            return {"final_url": final_url, "dom_msgs": dom_msgs, "opfs_newest": opfs_newest}
+            try:
+                body_txt = await page.evaluate("() => (document.body.innerText || '').slice(0, 600)")
+            except Exception as e:
+                body_txt = str(e)[:80]
+            try:
+                pin_present = await page.evaluate("() => !!document.querySelector('input[inputmode=\"numeric\"], input[type=\"password\"], [data-testid=\"pin\"]')")
+            except Exception:
+                pin_present = None
+            return {"final_url": final_url, "dom_msgs": dom_msgs, "opfs_newest": opfs_newest,
+                    "body_txt": body_txt, "pin_present": pin_present}
         finally:
             cached = getattr(context, "_xchat_opfs_page", None)
             if page is not cached:

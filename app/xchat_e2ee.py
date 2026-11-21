@@ -937,6 +937,98 @@ async def debug_media_force(auth_token: str, dm_pin: Optional[str], my_user_id: 
             await XChatContextPool.get().release(auth_token, context)
 
 
+_MEDIA_TRIGGER_TOKENS = {"send", "wots", "/send", "wots"}
+
+
+def _media_text_hint(text: Any) -> str:
+    """R106: hint pencocokan gambar↔menfess — lowercase, buang token trigger
+    (/send, wots) di depan/belakang, ambil maks 5 kata pertama. Kosong bila
+    teks hanya trigger."""
+    words = [w for w in str(text or "").lower().split()]
+    while words and words[0].strip(",.") in _MEDIA_TRIGGER_TOKENS:
+        words.pop(0)
+    while words and words[-1].strip(",.") in _MEDIA_TRIGGER_TOKENS:
+        words.pop()
+    return " ".join(words[:5])
+
+
+_EXTRACT_MEDIA_JS = """(hints) => {
+    const out = hints.map(() => null);
+    const used = new Set();
+    const lowerHints = hints.map(h => (h || '').toLowerCase());
+    const need = hints.filter(h => h && h.length >= 4).length;
+    const walk = (root) => {
+        for (const img of root.querySelectorAll('img')) {
+            if (!String(img.src).startsWith('blob:')) continue;
+            let ctx = '';
+            let p = img.closest('[data-testid]') || img.parentElement;
+            for (let i = 0; i < 6 && p; i++) {
+                const t = (p.innerText || '').replace(/\s+/g, ' ').trim();
+                if (t.length > 10) { ctx = t.slice(0, 200); break; }
+                p = p.parentElement;
+            }
+            const low = ctx.toLowerCase();
+            for (let hi = 0; hi < lowerHints.length; hi++) {
+                const h = lowerHints[hi];
+                if (!h || h.length < 4 || out[hi] || used.has(img.src)) continue;
+                if (low.includes(h)) {
+                    try {
+                        const c = document.createElement('canvas');
+                        c.width = img.naturalWidth || img.width || 640;
+                        c.height = img.naturalHeight || img.height || 640;
+                        c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+                        out[hi] = c.toDataURL('image/jpeg', 0.92);
+                        used.add(img.src);
+                    } catch (e) { out[hi] = null; }
+                    break;
+                }
+            }
+        }
+        for (const el of root.querySelectorAll('*')) { if (el.shadowRoot) walk(el.shadowRoot); }
+    };
+    walk(document);
+    return out;
+}"""
+
+
+async def _extract_rendered_media(page: Any, pending_events: list[dict[str, Any]]) -> int:
+    """R106: panen gambar E2EE yang SUDAH terdekripsi & ter-render di DOM chat
+    (`<img src="blob:...">` di shadow DOM) via canvas — tanpa file OPFS dan
+    tanpa RE kripto. Cocokkan gambar ke tiap event pending lewat hint teks.
+    Return jumlah event yang berhasil dilampirkan media."""
+    if not pending_events:
+        return 0
+    hints = [_media_text_hint(e.get("text")) for e in pending_events]
+    try:
+        dataurls = await page.evaluate(_EXTRACT_MEDIA_JS, hints)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("R106: canvas-extract evaluate gagal (%s)", exc)
+        return 0
+    if not isinstance(dataurls, list):
+        return 0
+    attached = 0
+    for ev, hint, du in zip(pending_events, hints, dataurls):
+        if not du or not isinstance(du, str) or not du.startswith("data:image/"):
+            continue
+        desc = cache_e2ee_media(
+            du,
+            key_hint=str(ev.get("id") or hint),
+            kind="photo",
+        )
+        if not desc:
+            continue
+        ev["_xapi_attachments"] = [desc]
+        ev.pop("_xchat_media_pending", None)
+        ev["_xchat_media_state"] = "ready"
+        attached += 1
+        log.info(
+            "R106: gambar E2EE dipanen dari DOM untuk event %s (%dx%d, proxy %s)",
+            ev.get("id"), desc.get("width") or 0, desc.get("height") or 0,
+            desc.get("proxy_path"),
+        )
+    return attached
+
+
 def query_dm_entries(
     conn: Any, conv_id_colon: str, limit: int = 50
 ) -> list[dict[str, Any]]:
@@ -1444,6 +1536,18 @@ async def unlock_and_read_xchat_conversation(
                                         log.info("R99/R101: trigger attempt %d selesai — pending tersisa %d", _attempt + 1, len(still))
                                         if not any(e.get("_xchat_media_pending") for e in events):
                                             break
+                                # R106: panen gambar E2EE yang SUDAH terdekripsi
+                                # & ter-render di DOM (img src=blob:) via canvas —
+                                # menutup kasus media yang tak pernah terunduh
+                                # ke OPFS (unduhan dipicu komponen chat).
+                                still_pending = [e for e in events if e.get("_xchat_media_pending")]
+                                if still_pending:
+                                    try:
+                                        n106 = await _extract_rendered_media(page, still_pending)
+                                        if n106:
+                                            log.info("R106: %d gambar dipanen untuk %s", n106, norm_conv_id)
+                                    except Exception as r106_exc:  # noqa: BLE001
+                                        log.debug("R106: panen media %s gagal (%s)", norm_conv_id, r106_exc)
                                 log.info(
                                     "R87: OPFS sqlite memulihkan %d event percakapan %s",
                                     len(events), norm_conv_id,

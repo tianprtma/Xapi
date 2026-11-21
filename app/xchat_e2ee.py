@@ -906,6 +906,19 @@ async def debug_conv_dom(auth_token: str, dm_pin: Optional[str], my_user_id: str
                 dom_msgs = await page.evaluate(dom_js)
             except Exception as e:
                 dom_msgs = [str(e)[:80]]
+            iframe_info = []
+            try:
+                iframe_info = await page.evaluate("""() => {
+                    const out = [];
+                    for (const f of document.querySelectorAll('iframe')) {
+                        let txt = '', src = f.src || '';
+                        try { txt = (f.contentDocument && f.contentDocument.body ? f.contentDocument.body.innerText : '').slice(0, 1500); } catch(e) { txt = 'XORIGIN:' + String(e); }
+                        out.push({src: src.slice(0,120), txt});
+                    }
+                    return out;
+                }""")
+            except Exception as e:
+                iframe_info = [{"error": str(e)[:80]}]
             db_bytes = await extract_xchat_opfs_db(page, str(my_user_id), context=context, force=True)
             opfs_newest = None
             if db_bytes and db_bytes[:15] == b"SQLite format 3":
@@ -931,7 +944,7 @@ async def debug_conv_dom(auth_token: str, dm_pin: Optional[str], my_user_id: str
             except Exception:
                 pin_present = None
             return {"final_url": final_url, "inbox_url": inbox_url, "inbox_txt": inbox_txt,
-                    "dom_msgs": dom_msgs, "opfs_newest": opfs_newest,
+                    "dom_msgs": dom_msgs, "iframe_info": iframe_info, "opfs_newest": opfs_newest,
                     "body_txt": body_txt, "pin_present": pin_present}
         finally:
             cached = getattr(context, "_xchat_opfs_page", None)

@@ -475,6 +475,9 @@ XCHAT_PROFILE_DIR: str = os.environ.get(
 XCHAT_PERSISTENT_MAX: int = int(os.environ.get("XCHAT_PERSISTENT_MAX", "3"))
 
 
+XCHAT_HEADLESS = os.environ.get("XCHAT_HEADLESS", "1") != "0"
+
+
 def _xchat_profile_dir(auth_token: str) -> Path:
     """Subdir profil per akun — hash TANPA salt agar stabil antar restart
     (token_key memakai salt per-proses yang berubah tiap restart)."""
@@ -598,7 +601,7 @@ class XChatContextPool:
             try:
                 ctx = await driver.chromium.launch_persistent_context(
                     str(profile_dir),
-                    headless=True,
+                    headless=XCHAT_HEADLESS,
                     channel="chromium",
                     user_agent=prof["user_agent"],
                     viewport={"width": 1366, "height": 768} if is_win else {"width": 1440, "height": 900},

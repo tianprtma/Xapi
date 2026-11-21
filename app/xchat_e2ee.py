@@ -878,9 +878,17 @@ async def debug_conv_dom(auth_token: str, dm_pin: Optional[str], my_user_id: str
         except Exception:
             pass
         try:
+            await page.goto("https://x.com/i/chat", wait_until="domcontentloaded", timeout=30000)
+            await _ensure_pin_unlocked(page, dm_pin)
+            await asyncio.sleep(8)
+            inbox_url = page.url
+            try:
+                inbox_txt = await page.evaluate("() => (document.body.innerText || '').slice(0, 300)")
+            except Exception:
+                inbox_txt = ""
             await page.goto(f"https://x.com/i/chat/{conv_dash}", wait_until="domcontentloaded", timeout=30000)
             await _ensure_pin_unlocked(page, dm_pin)
-            await asyncio.sleep(10)
+            await asyncio.sleep(12)
             final_url = page.url
             dom_js = """() => {
                 const arts = [];
@@ -922,7 +930,8 @@ async def debug_conv_dom(auth_token: str, dm_pin: Optional[str], my_user_id: str
                 pin_present = await page.evaluate("() => !!document.querySelector('input[inputmode=\"numeric\"], input[type=\"password\"], [data-testid=\"pin\"]')")
             except Exception:
                 pin_present = None
-            return {"final_url": final_url, "dom_msgs": dom_msgs, "opfs_newest": opfs_newest,
+            return {"final_url": final_url, "inbox_url": inbox_url, "inbox_txt": inbox_txt,
+                    "dom_msgs": dom_msgs, "opfs_newest": opfs_newest,
                     "body_txt": body_txt, "pin_present": pin_present}
         finally:
             cached = getattr(context, "_xchat_opfs_page", None)

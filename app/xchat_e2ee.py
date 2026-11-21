@@ -911,8 +911,14 @@ async def debug_conv_fresh(auth_token: str, dm_pin: Optional[str], my_user_id: s
                     "SELECT entry_id, sender_id, plain_text, timestamp, has_attachment "
                     "FROM dm_entry WHERE conversation_id = ? ORDER BY timestamp DESC LIMIT 12",
                     (cc,)).fetchall()
+                gmax = conn.execute("SELECT MAX(timestamp) FROM dm_entry").fetchone()[0]
+                gnew = conn.execute(
+                    "SELECT conversation_id, sender_id, plain_text, timestamp FROM dm_entry "
+                    "ORDER BY timestamp DESC LIMIT 5").fetchall()
                 conn.close()
                 return {"opfs_tree": opfs_tree,
+                        "global_max_ts": gmax,
+                        "global_newest": [{"conv": g[0], "sender": str(g[1]), "text": (g[2] or "")[:50], "ts": g[3]} for g in gnew],
                         "events": [{"entry_id": r[0], "sender_id": str(r[1]),
                                     "text": (r[2] or "")[:80], "timestamp": r[3],
                                     "has_attachment": r[4]} for r in rows]}

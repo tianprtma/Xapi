@@ -923,7 +923,7 @@ async def debug_conv_dom(auth_token: str, dm_pin: Optional[str], my_user_id: str
                 finally:
                     conn.close(); os.unlink(tmp)
             try:
-                body_txt = await page.evaluate("() => (document.body.innerText || '').slice(0, 600)")
+                body_txt = await page.evaluate("() => { const t=document.body.innerText||''; return JSON.stringify({len:t.length, tail:t.slice(600,2200), iframes:document.querySelectorAll('iframe').length}); }")
             except Exception as e:
                 body_txt = str(e)[:80]
             try:

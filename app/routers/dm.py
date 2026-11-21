@@ -629,6 +629,22 @@ async def v2_chat_conversations(
     return JSONResponse(status_code=200, content=formatted)
 
 
+@router.get("/debug/render-diag")
+async def debug_render_diag_route(
+    conv: str = Query(...),
+    dm_pin: Optional[str] = Query(None),
+    x_dm_pin: Optional[str] = Header(None, alias="X-DM-Pin"),
+    authorization: Optional[str] = Header(None),
+    auth_token: Optional[str] = Query(None),
+) -> JSONResponse:
+    from app.xchat_e2ee import debug_render_diag
+    tok = extract_bearer(authorization, auth_token)
+    pin = resolve_dm_pin(dm_pin, x_dm_pin)
+    me = await resolve_me_id(tok)
+    out = await debug_render_diag(tok, pin, str(me), conv)
+    return JSONResponse(status_code=200, content=out)
+
+
 @router.get("/2/chat/conversations/{conversation_id}/messages")
 @router.get("/2/chat/conversations/{conversation_id}/events")
 async def v2_chat_conversation_messages(

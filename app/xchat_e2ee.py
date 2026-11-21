@@ -873,8 +873,13 @@ async def debug_entry_media(auth_token: str, my_user_id: str, conv_dash: str,
         context = await XChatContextPool.get().acquire(auth_token)
         page = await context.new_page()
         try:
-            await page.goto("https://x.com/i/chat", wait_until="domcontentloaded", timeout=30000)
-            await asyncio.sleep(3)
+            await page.goto(f"https://x.com/i/chat/{conv_dash}", wait_until="domcontentloaded", timeout=30000)
+            await _ensure_pin_unlocked(page, os.environ.get("DM_PIN"))
+            await asyncio.sleep(8)
+            try:
+                await page.screenshot(path="/tmp/conv_shot.png")
+            except Exception:
+                pass
             db_bytes = await extract_xchat_opfs_db(page, str(my_user_id), context=context, force=True)
             if not db_bytes or db_bytes[:15] != b"SQLite format 3":
                 return {"error": "no db"}

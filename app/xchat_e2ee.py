@@ -896,11 +896,17 @@ async def debug_entry_media(auth_token: str, my_user_id: str, conv_dash: str,
                 atts = conn.execute(
                     "SELECT attachment_id, local_path, attachment_type, file_size FROM dm_local_attachment WHERE message_id = ?",
                     (entry_id,)).fetchall()
+                cc = conv_dash.replace("-", ":")
+                ckeys = [{"tag": t, "hex": b.hex() if isinstance(b, (bytes, bytearray)) else str(b)}
+                         for t, b in conn.execute(
+                             "SELECT tag, bytes FROM dm_key_material WHERE tag LIKE ?",
+                             ("ckey-" + cc + "-%",))]
                 conn.close()
                 return {"has_attachment": row[1] if row else None,
                         "attachment_types": row[2] if row else None,
                         "strings": [s.decode() for s in strings][:60],
-                        "local_attachments": [{"id": a[0], "path": a[1], "type": a[2], "size": a[3]} for a in atts]}
+                        "local_attachments": [{"id": a[0], "path": a[1], "type": a[2], "size": a[3]} for a in atts],
+                        "ckeys": ckeys}
             finally:
                 conn.close(); os.unlink(tmp)
         finally:

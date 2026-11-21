@@ -602,7 +602,6 @@ class XChatContextPool:
                 ctx = await driver.chromium.launch_persistent_context(
                     str(profile_dir),
                     headless=XCHAT_HEADLESS,
-                    channel="chromium",
                     user_agent=prof["user_agent"],
                     viewport={"width": 1366, "height": 768} if is_win else {"width": 1440, "height": 900},
                     locale="en-US",

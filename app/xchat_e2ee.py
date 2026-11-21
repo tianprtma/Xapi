@@ -863,6 +863,48 @@ async def extract_xchat_opfs_db(
     return data
 
 
+async def debug_entry_media(auth_token: str, my_user_id: str, conv_dash: str,
+                            entry_id: str) -> dict[str, Any]:
+    """DIAGNOSTIK sementara: contents strings + baris dm_local_attachment entry."""
+    import sqlite3
+    import tempfile
+    playwright_search.PLAYWRIGHT_ENABLED = True
+    async with PlaywrightPool.get().semaphore:
+        context = await XChatContextPool.get().acquire(auth_token)
+        page = await context.new_page()
+        try:
+            await page.goto("https://x.com/i/chat", wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(3)
+            db_bytes = await extract_xchat_opfs_db(page, str(my_user_id), context=context, force=True)
+            if not db_bytes or db_bytes[:15] != b"SQLite format 3":
+                return {"error": "no db"}
+            with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
+                tf.write(db_bytes); tmp = tf.name
+            try:
+                conn = sqlite3.connect(tmp)
+                row = conn.execute("SELECT contents, has_attachment, attachment_types FROM dm_entry WHERE entry_id = ?",
+                                   (entry_id,)).fetchone()
+                contents = row[0] if row else b""
+                if isinstance(contents, str):
+                    contents = contents.encode()
+                strings = re.findall(rb"[\x20-\x7e]{4,}", contents or b"")
+                atts = conn.execute(
+                    "SELECT attachment_id, local_path, attachment_type, file_size FROM dm_local_attachment WHERE message_id = ?",
+                    (entry_id,)).fetchall()
+                conn.close()
+                return {"has_attachment": row[1] if row else None,
+                        "attachment_types": row[2] if row else None,
+                        "strings": [s.decode() for s in strings][:60],
+                        "local_attachments": [{"id": a[0], "path": a[1], "type": a[2], "size": a[3]} for a in atts]}
+            finally:
+                conn.close(); os.unlink(tmp)
+        finally:
+            cached = getattr(context, "_xchat_opfs_page", None)
+            if page is not cached:
+                await page.close()
+            await XChatContextPool.get().release(auth_token, context)
+
+
 def query_dm_entries(
     conn: Any, conv_id_colon: str, limit: int = 50
 ) -> list[dict[str, Any]]:

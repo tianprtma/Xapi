@@ -863,6 +863,49 @@ async def extract_xchat_opfs_db(
     return data
 
 
+async def debug_conv_fresh(auth_token: str, dm_pin: Optional[str], my_user_id: str,
+                           conv_dash: str) -> dict[str, Any]:
+    """DIAGNOSTIK sementara: buka conv + tunggu sync + baca OPFS segar,
+    kembalikan event sender terbaru (timestamp urut)."""
+    import sqlite3
+    import tempfile
+    playwright_search.PLAYWRIGHT_ENABLED = True
+    async with PlaywrightPool.get().semaphore:
+        context = await XChatContextPool.get().acquire(auth_token)
+        page = await context.new_page()
+        try:
+            await page.set_viewport_size({"width": 1280, "height": 4000})
+        except Exception:
+            pass
+        try:
+            await page.goto(f"https://x.com/i/chat/{conv_dash}", wait_until="domcontentloaded", timeout=30000)
+            await _ensure_pin_unlocked(page, dm_pin)
+            await asyncio.sleep(12)
+            db_bytes = await extract_xchat_opfs_db(page, str(my_user_id), context=context, force=True)
+            if not db_bytes or db_bytes[:15] != b"SQLite format 3":
+                return {"error": "no db"}
+            with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
+                tf.write(db_bytes); tmp = tf.name
+            try:
+                conn = sqlite3.connect(tmp)
+                cc = conv_dash.replace("-", ":")
+                rows = conn.execute(
+                    "SELECT entry_id, sender_id, plain_text, timestamp, has_attachment "
+                    "FROM dm_entry WHERE conversation_id = ? ORDER BY timestamp DESC LIMIT 12",
+                    (cc,)).fetchall()
+                conn.close()
+                return {"events": [{"entry_id": r[0], "sender_id": str(r[1]),
+                                    "text": (r[2] or "")[:80], "timestamp": r[3],
+                                    "has_attachment": r[4]} for r in rows]}
+            finally:
+                conn.close(); os.unlink(tmp)
+        finally:
+            cached = getattr(context, "_xchat_opfs_page", None)
+            if page is not cached:
+                await page.close()
+            await XChatContextPool.get().release(auth_token, context)
+
+
 def query_dm_entries(
     conn: Any, conv_id_colon: str, limit: int = 50
 ) -> list[dict[str, Any]]:

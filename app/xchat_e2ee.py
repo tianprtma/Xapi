@@ -863,81 +863,7 @@ async def extract_xchat_opfs_db(
     return data
 
 
-async def debug_media_force(auth_token: str, dm_pin: Optional[str], my_user_id: str,
-                            conv_dash: str, entry_id: str) -> dict[str, Any]:
-    """DIAGNOSTIK sementara: paksa unduh media — capture ton.x.com + cek
-    attachment OPFS + DOM shadow-aware (mirroring alur R101 yang sukses)."""
-    import sqlite3
-    import tempfile
-    captured: list = []
-    playwright_search.PLAYWRIGHT_ENABLED = True
-    async with PlaywrightPool.get().semaphore:
-        context = await XChatContextPool.get().acquire(auth_token)
-
-        def _on_req(req):
-            try:
-                if "ton.x.com" in req.url or "xchat_media" in req.url:
-                    captured.append(req.url)
-            except Exception:
-                pass
-
-        context.on("request", _on_req)
-        page = await context.new_page()
-        try:
-            await page.set_viewport_size({"width": 1280, "height": 6000})
-        except Exception:
-            pass
-        scan_js = """(frac) => {
-            const out = {scroller:false, imgs:0, blob:0, art:0};
-            const walk = (root) => {
-                for (const el of root.querySelectorAll('*')) {
-                    const sr = el.shadowRoot;
-                    if (sr) {
-                        const sc = sr.querySelector('[data-testid="dm-message-scroller"]');
-                        if (sc) { out.scroller = true; sc.scrollTop = sc.scrollHeight * frac; sc.dispatchEvent(new Event('scroll')); }
-                        walk(sr);
-                    }
-                }
-                for (const img of root.querySelectorAll('img')) { out.imgs++; if (String(img.src).startsWith('blob:')) out.blob++; }
-                out.art += root.querySelectorAll('article').length;
-            };
-            walk(document);
-            return out;
-        }"""
-        try:
-            await page.goto(f"https://x.com/i/chat/{conv_dash}", wait_until="domcontentloaded", timeout=30000)
-            await _ensure_pin_unlocked(page, dm_pin)
-            scan_log = []
-            for i in range(14):
-                frac = 1.0 - i / 13.0
-                try:
-                    scan_log.append(await page.evaluate(scan_js, frac))
-                except Exception:
-                    pass
-                await asyncio.sleep(1.0)
-            # R106 eksperimen: gambar terdekripsi dirender <img src=blob:...> di
-            # shadow DOM — ekstrak via canvas (same-origin blob, tidak tainted).
-            extract_js = "() => {\n                const out = {found: false, dataUrl: null, w: 0, h: 0, err: null};\n                const walk = (root) => {\n                    if (out.found) return;\n                    for (const img of root.querySelectorAll('img')) {\n                        if (out.found) return;\n                        if (!String(img.src).startsWith('blob:')) continue;\n                        let ctx = '';\n                        let p = img.closest('[data-testid]') || img.parentElement;\n                        for (let i = 0; i < 5 && p; i++) {\n                            const t = (p.innerText || '').replace(/\\s+/g, ' ').trim();\n                            if (t.length > 10) { ctx = t.slice(0, 120); break; }\n                            p = p.parentElement;\n                        }\n                        if (ctx.toLowerCase().includes('bondol')) {\n                            try {\n                                const c = document.createElement('canvas');\n                                c.width = img.naturalWidth || img.width || 689;\n                                c.height = img.naturalHeight || img.height || 177;\n                                c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);\n                                const du = c.toDataURL('image/jpeg', 0.92);\n                                out.found = true; out.dataUrl = du; out.w = c.width; out.h = c.height;\n                            } catch(e) { out.err = String(e); }\n                            return;\n                        }\n                    }\n                    for (const el of root.querySelectorAll('*')) { if (el.shadowRoot) walk(el.shadowRoot); }\n                };\n                walk(document);\n                return out;\n            }"
-            try:
-                extract = await page.evaluate(extract_js)
-            except Exception as e:
-                extract = {"error": str(e)[:120]}
-            du = extract.get("dataUrl") if isinstance(extract, dict) else None
-            return {"extract": {k: (v[:80] if k == 'dataUrl' and isinstance(v, str) else v) for k, v in extract.items()} if isinstance(extract, dict) else extract,
-                    "dataurl_len": len(du or ""),
-                    "scan_max_imgs": max((s.get("imgs", 0) for s in scan_log), default=0)}
-        finally:
-            try:
-                context.remove_listener("request", _on_req)
-            except Exception:
-                pass
-            cached = getattr(context, "_xchat_opfs_page", None)
-            if page is not cached:
-                await page.close()
-            await XChatContextPool.get().release(auth_token, context)
-
-
-_MEDIA_TRIGGER_TOKENS = {"send", "wots", "/send", "wots"}
+_MEDIA_TRIGGER_TOKENS = {"send", "wots", "/send"}
 
 
 def _media_text_hint(text: Any) -> str:
@@ -956,7 +882,6 @@ _EXTRACT_MEDIA_JS = """(hints) => {
     const out = hints.map(() => null);
     const used = new Set();
     const lowerHints = hints.map(h => (h || '').toLowerCase());
-    const need = hints.filter(h => h && h.length >= 4).length;
     const walk = (root) => {
         for (const img of root.querySelectorAll('img')) {
             if (!String(img.src).startsWith('blob:')) continue;

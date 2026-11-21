@@ -629,22 +629,6 @@ async def v2_chat_conversations(
     return JSONResponse(status_code=200, content=formatted)
 
 
-@router.get("/debug/media-force")
-async def debug_media_force_route(
-    conv: str = Query(...), entry_id: str = Query(...),
-    dm_pin: Optional[str] = Query(None),
-    x_dm_pin: Optional[str] = Header(None, alias="X-DM-Pin"),
-    authorization: Optional[str] = Header(None),
-    auth_token: Optional[str] = Query(None),
-) -> JSONResponse:
-    from app.xchat_e2ee import debug_media_force
-    tok = extract_bearer(authorization, auth_token)
-    pin = resolve_dm_pin(dm_pin, x_dm_pin)
-    me = await resolve_me_id(tok)
-    out = await debug_media_force(tok, pin, str(me), conv, entry_id)
-    return JSONResponse(status_code=200, content=out)
-
-
 @router.get("/2/chat/conversations/{conversation_id}/messages")
 @router.get("/2/chat/conversations/{conversation_id}/events")
 async def v2_chat_conversation_messages(

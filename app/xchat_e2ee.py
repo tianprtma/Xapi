@@ -900,9 +900,25 @@ async def debug_render_diag(auth_token: str, dm_pin: Optional[str], my_user_id: 
                 out.mainHTMLlen = main ? main.innerHTML.length : 0;
                 out.articles = document.querySelectorAll('article').length;
                 out.iframes = Array.from(document.querySelectorAll('iframe')).map(f=>f.src.slice(0,80));
+                out.hasStorage = !!(navigator.storage && navigator.storage.getDirectory);
                 return out;
             }""")
-            return {"info": info,
+            cached = getattr(context, "_xchat_opfs_page", None)
+            cached_info = None
+            if cached is not None and cached is not page:
+                try:
+                    await cached.goto(f"https://x.com/i/chat/{conv_dash}", wait_until="domcontentloaded", timeout=30000)
+                    await _ensure_pin_unlocked(cached, dm_pin)
+                    await asyncio.sleep(12)
+                    cached_info = await cached.evaluate("""() => ({
+                        hasStorage: !!(navigator.storage && navigator.storage.getDirectory),
+                        articles: document.querySelectorAll('article').length,
+                        mainText: (document.querySelector('main') ? document.querySelector('main').innerText : '').slice(0,300),
+                        mainHTMLlen: document.querySelector('main') ? document.querySelector('main').innerHTML.length : 0
+                    })""")
+                except Exception as e:
+                    cached_info = {"error": str(e)[:120]}
+            return {"info": info, "cached_info": cached_info,
                     "console": console_msgs[-25:],
                     "page_errors": page_errors[-15:],
                     "failed_reqs": failed_reqs[-25:]}

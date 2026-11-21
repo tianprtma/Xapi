@@ -863,6 +863,87 @@ async def extract_xchat_opfs_db(
     return data
 
 
+async def debug_media_force(auth_token: str, dm_pin: Optional[str], my_user_id: str,
+                            conv_dash: str, entry_id: str) -> dict[str, Any]:
+    """DIAGNOSTIK sementara: paksa unduh media — capture ton.x.com + cek
+    attachment OPFS + DOM shadow-aware (mirroring alur R101 yang sukses)."""
+    import sqlite3
+    import tempfile
+    captured: list = []
+    playwright_search.PLAYWRIGHT_ENABLED = True
+    async with PlaywrightPool.get().semaphore:
+        context = await XChatContextPool.get().acquire(auth_token)
+
+        def _on_req(req):
+            try:
+                if "ton.x.com" in req.url or "xchat_media" in req.url:
+                    captured.append(req.url)
+            except Exception:
+                pass
+
+        context.on("request", _on_req)
+        page = await context.new_page()
+        try:
+            await page.set_viewport_size({"width": 1280, "height": 6000})
+        except Exception:
+            pass
+        scan_js = """(frac) => {
+            const out = {scroller:false, imgs:0, blob:0, art:0};
+            const walk = (root) => {
+                for (const el of root.querySelectorAll('*')) {
+                    const sr = el.shadowRoot;
+                    if (sr) {
+                        const sc = sr.querySelector('[data-testid="dm-message-scroller"]');
+                        if (sc) { out.scroller = true; sc.scrollTop = sc.scrollHeight * frac; sc.dispatchEvent(new Event('scroll')); }
+                        walk(sr);
+                    }
+                }
+                for (const img of root.querySelectorAll('img')) { out.imgs++; if (String(img.src).startsWith('blob:')) out.blob++; }
+                out.art += root.querySelectorAll('article').length;
+            };
+            walk(document);
+            return out;
+        }"""
+        try:
+            await page.goto(f"https://x.com/i/chat/{conv_dash}", wait_until="domcontentloaded", timeout=30000)
+            await _ensure_pin_unlocked(page, dm_pin)
+            scan_log = []
+            for i in range(14):
+                frac = 1.0 - i / 13.0
+                try:
+                    scan_log.append(await page.evaluate(scan_js, frac))
+                except Exception:
+                    pass
+                await asyncio.sleep(1.0)
+            db_bytes = await extract_xchat_opfs_db(page, str(my_user_id), context=context, force=True)
+            att = None
+            if db_bytes and db_bytes[:15] == b"SQLite format 3":
+                with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
+                    tf.write(db_bytes); tmp = tf.name
+                try:
+                    conn = sqlite3.connect(tmp)
+                    row = conn.execute(
+                        "SELECT attachment_id, local_path, attachment_type, file_size "
+                        "FROM dm_local_attachment WHERE message_id = ?", (entry_id,)).fetchone()
+                    if row:
+                        att = {"id": row[0], "path": row[1], "type": row[2], "size": row[3]}
+                    conn.close()
+                finally:
+                    conn.close(); os.unlink(tmp)
+            return {"captured": captured[:15], "attachment": att,
+                    "scan_last": scan_log[-1] if scan_log else None,
+                    "scan_max_imgs": max((s.get("imgs", 0) for s in scan_log), default=0)}
+        finally:
+            try:
+                context.remove_listener("request", _on_req)
+            except Exception:
+                pass
+            cached = getattr(context, "_xchat_opfs_page", None)
+            if page is not cached:
+                await page.close()
+            await XChatContextPool.get().release(auth_token, context)
+
+
 def query_dm_entries(
     conn: Any, conv_id_colon: str, limit: int = 50
 ) -> list[dict[str, Any]]:

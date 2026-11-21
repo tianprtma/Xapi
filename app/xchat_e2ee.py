@@ -915,22 +915,20 @@ async def debug_media_force(auth_token: str, dm_pin: Optional[str], my_user_id: 
                 except Exception:
                     pass
                 await asyncio.sleep(1.0)
-            db_bytes = await extract_xchat_opfs_db(page, str(my_user_id), context=context, force=True)
-            att = None
-            if db_bytes and db_bytes[:15] == b"SQLite format 3":
-                with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
-                    tf.write(db_bytes); tmp = tf.name
-                try:
-                    conn = sqlite3.connect(tmp)
-                    row = conn.execute(
-                        "SELECT attachment_id, local_path, attachment_type, file_size "
-                        "FROM dm_local_attachment WHERE message_id = ?", (entry_id,)).fetchone()
-                    if row:
-                        att = {"id": row[0], "path": row[1], "type": row[2], "size": row[3]}
-                    conn.close()
-                finally:
-                    conn.close(); os.unlink(tmp)
-            return {"captured": captured[:15], "attachment": att,
+            # R106 eksperimen: gambar terdekripsi dirender <img src=blob:...> di
+            # shadow DOM — ekstrak via canvas (same-origin blob, tidak tainted).
+            extract_js = '() => {\n                const out = {found: false, dataUrl: null, src: null, w: 0, h: 0};\n                const walk = (root) => {\n                    for (const el of root.querySelectorAll(\'*\')) {\n                        const sr = el.shadowRoot;\n                        if (sr) {\n                            const groups = sr.querySelectorAll(\'[data-testid="dmMessageEntry"], [role="group"]\');\n                            for (const g of groups) {\n                                const t = (g.innerText || \'\');\n                                if (t.includes(\'cerim\') || t.includes(\'bondol\')) {\n                                    const img = g.querySelector(\'img\');\n                                    if (img && String(img.src).startsWith(\'blob:\')) {\n                                        out.found = true; out.src = String(img.src).slice(0, 60);\n                                        try {\n                                            const c = document.createElement(\'canvas\');\n                                            c.width = img.naturalWidth || img.width || 800;\n                                            c.height = img.naturalHeight || img.height || 800;\n                                            c.getContext(\'2d\').drawImage(img, 0, 0);\n                                            const du = c.toDataURL(\'image/jpeg\', 0.92);\n                                            out.dataUrl = du.slice(0, 80); out.w = c.width; out.h = c.height;\n                                            out.fullLen = du.length;\n                                            window.__mf_media_dataurl = du;\n                                        } catch(e) { out.err = String(e); }\n                                        return;\n                                    }\n                                }\n                            }\n                            walk(sr);\n                        }\n                    }\n                };\n                walk(document);\n                return out;\n            }'
+            try:
+                extract = await page.evaluate(extract_js)
+            except Exception as e:
+                extract = {"error": str(e)[:120]}
+            du = None
+            try:
+                du = await page.evaluate("() => window.__mf_media_dataurl || null")
+            except Exception:
+                pass
+            return {"captured": captured[:15], "extract": extract,
+                    "dataurl_head": (du or "")[:60], "dataurl_len": len(du or ""),
                     "scan_last": scan_log[-1] if scan_log else None,
                     "scan_max_imgs": max((s.get("imgs", 0) for s in scan_log), default=0)}
         finally:

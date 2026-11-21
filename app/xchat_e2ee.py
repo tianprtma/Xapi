@@ -863,6 +863,65 @@ async def extract_xchat_opfs_db(
     return data
 
 
+async def debug_conv_dom(auth_token: str, dm_pin: Optional[str], my_user_id: str,
+                         conv_dash: str) -> dict[str, Any]:
+    """DIAGNOSTIK sementara: buka conv di browser bot, kembalikan URL akhir +
+    teks pesan DOM terbaru + newest OPFS — membedakan session stale vs OPFS lag."""
+    import sqlite3
+    import tempfile
+    playwright_search.PLAYWRIGHT_ENABLED = True
+    async with PlaywrightPool.get().semaphore:
+        context = await XChatContextPool.get().acquire(auth_token)
+        page = await context.new_page()
+        try:
+            await page.set_viewport_size({"width": 1280, "height": 4000})
+        except Exception:
+            pass
+        try:
+            await page.goto(f"https://x.com/i/chat/{conv_dash}", wait_until="domcontentloaded", timeout=30000)
+            await _ensure_pin_unlocked(page, dm_pin)
+            await asyncio.sleep(10)
+            final_url = page.url
+            dom_js = """() => {
+                const arts = [];
+                const walk = (root) => {
+                    for (const el of root.querySelectorAll('article, [data-testid="messageEntry"], [role="row"]')) {
+                        const t = (el.innerText || '').trim();
+                        if (t) arts.push(t.slice(0, 120));
+                    }
+                    for (const el of root.querySelectorAll('*')) { if (el.shadowRoot) walk(el.shadowRoot); }
+                };
+                walk(document);
+                return arts.slice(-12);
+            }"""
+            try:
+                dom_msgs = await page.evaluate(dom_js)
+            except Exception as e:
+                dom_msgs = [str(e)[:80]]
+            db_bytes = await extract_xchat_opfs_db(page, str(my_user_id), context=context, force=True)
+            opfs_newest = None
+            if db_bytes and db_bytes[:15] == b"SQLite format 3":
+                with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
+                    tf.write(db_bytes); tmp = tf.name
+                try:
+                    conn = sqlite3.connect(tmp)
+                    cc = conv_dash.replace("-", ":")
+                    row = conn.execute(
+                        "SELECT plain_text, timestamp FROM dm_entry WHERE conversation_id = ? "
+                        "ORDER BY timestamp DESC LIMIT 1", (cc,)).fetchone()
+                    if row:
+                        opfs_newest = {"text": (row[0] or "")[:80], "timestamp": row[1]}
+                    conn.close()
+                finally:
+                    conn.close(); os.unlink(tmp)
+            return {"final_url": final_url, "dom_msgs": dom_msgs, "opfs_newest": opfs_newest}
+        finally:
+            cached = getattr(context, "_xchat_opfs_page", None)
+            if page is not cached:
+                await page.close()
+            await XChatContextPool.get().release(auth_token, context)
+
+
 def query_dm_entries(
     conn: Any, conv_id_colon: str, limit: int = 50
 ) -> list[dict[str, Any]]:

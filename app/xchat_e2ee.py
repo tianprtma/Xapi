@@ -917,19 +917,14 @@ async def debug_media_force(auth_token: str, dm_pin: Optional[str], my_user_id: 
                 await asyncio.sleep(1.0)
             # R106 eksperimen: gambar terdekripsi dirender <img src=blob:...> di
             # shadow DOM — ekstrak via canvas (same-origin blob, tidak tainted).
-            extract_js = "() => {\n                const blobImgs = [];\n                const walk = (root) => {\n                    for (const img of root.querySelectorAll('img')) {\n                        if (String(img.src).startsWith('blob:')) {\n                            let ctx = '';\n                            let p = img.closest('[data-testid]') || img.parentElement;\n                            for (let i = 0; i < 4 && p; i++) {\n                                const t = (p.innerText || '').replace(/\\s+/g, ' ').trim();\n                                if (t.length > 10) { ctx = t.slice(0, 90); break; }\n                                p = p.parentElement;\n                            }\n                            blobImgs.push({src: String(img.src).slice(0, 50), w: img.naturalWidth || img.width, h: img.naturalHeight || img.height, ctx});\n                        }\n                    }\n                    for (const el of root.querySelectorAll('*')) { if (el.shadowRoot) walk(el.shadowRoot); }\n                };\n                walk(document);\n                return {n: blobImgs.length, imgs: blobImgs.slice(0, 10)};\n            }"
+            extract_js = "() => {\n                const out = {found: false, dataUrl: null, w: 0, h: 0, err: null};\n                const walk = (root) => {\n                    if (out.found) return;\n                    for (const img of root.querySelectorAll('img')) {\n                        if (out.found) return;\n                        if (!String(img.src).startsWith('blob:')) continue;\n                        let ctx = '';\n                        let p = img.closest('[data-testid]') || img.parentElement;\n                        for (let i = 0; i < 5 && p; i++) {\n                            const t = (p.innerText || '').replace(/\\s+/g, ' ').trim();\n                            if (t.length > 10) { ctx = t.slice(0, 120); break; }\n                            p = p.parentElement;\n                        }\n                        if (ctx.toLowerCase().includes('bondol')) {\n                            try {\n                                const c = document.createElement('canvas');\n                                c.width = img.naturalWidth || img.width || 689;\n                                c.height = img.naturalHeight || img.height || 177;\n                                c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);\n                                const du = c.toDataURL('image/jpeg', 0.92);\n                                out.found = true; out.dataUrl = du; out.w = c.width; out.h = c.height;\n                            } catch(e) { out.err = String(e); }\n                            return;\n                        }\n                    }\n                    for (const el of root.querySelectorAll('*')) { if (el.shadowRoot) walk(el.shadowRoot); }\n                };\n                walk(document);\n                return out;\n            }"
             try:
                 extract = await page.evaluate(extract_js)
             except Exception as e:
                 extract = {"error": str(e)[:120]}
-            du = None
-            try:
-                du = await page.evaluate("() => window.__mf_media_dataurl || null")
-            except Exception:
-                pass
-            return {"captured": captured[:15], "extract": extract,
-                    "dataurl_head": (du or "")[:60], "dataurl_len": len(du or ""),
-                    "scan_last": scan_log[-1] if scan_log else None,
+            du = extract.get("dataUrl") if isinstance(extract, dict) else None
+            return {"extract": {k: (v[:80] if k == 'dataUrl' and isinstance(v, str) else v) for k, v in extract.items()} if isinstance(extract, dict) else extract,
+                    "dataurl_len": len(du or ""),
                     "scan_max_imgs": max((s.get("imgs", 0) for s in scan_log), default=0)}
         finally:
             try:

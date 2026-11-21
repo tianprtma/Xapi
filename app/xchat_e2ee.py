@@ -901,6 +901,10 @@ async def debug_render_diag(auth_token: str, dm_pin: Optional[str], my_user_id: 
                 out.articles = document.querySelectorAll('article').length;
                 out.iframes = Array.from(document.querySelectorAll('iframe')).map(f=>f.src.slice(0,80));
                 out.hasStorage = !!(navigator.storage && navigator.storage.getDirectory);
+                out.mainHTML = main ? main.innerHTML.slice(0, 600) : '';
+                out.bodyClasses = document.body.className;
+                out.reactRoot = (() => { const r = document.getElementById('react-root'); return r ? r.innerHTML.length : -1; })();
+                out.layers = (() => { const l = document.getElementById('layers'); return l ? l.innerHTML.slice(0,300) : 'NO layers'; })();
                 return out;
             }""")
             cached = getattr(context, "_xchat_opfs_page", None)

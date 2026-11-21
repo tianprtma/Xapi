@@ -863,36 +863,6 @@ async def extract_xchat_opfs_db(
     return data
 
 
-async def debug_render_diag(auth_token: str, dm_pin: Optional[str], my_user_id: str,
-                            conv_dash: str) -> dict[str, Any]:
-    """DIAGNOSTIK sementara: apakah chat ter-render di browser bot (articles/webgl)."""
-    playwright_search.PLAYWRIGHT_ENABLED = True
-    async with PlaywrightPool.get().semaphore:
-        context = await XChatContextPool.get().acquire(auth_token)
-        page = await context.new_page()
-        try:
-            await page.set_viewport_size({"width": 1440, "height": 900})
-        except Exception:
-            pass
-        try:
-            await page.goto(f"https://x.com/i/chat/{conv_dash}", wait_until="domcontentloaded", timeout=30000)
-            await _ensure_pin_unlocked(page, dm_pin)
-            await asyncio.sleep(12)
-            info = await page.evaluate("""() => ({
-                articles: document.querySelectorAll('article').length,
-                imgs: document.querySelectorAll('img').length,
-                blobImgs: Array.from(document.querySelectorAll('img')).filter(i=>String(i.src).startsWith('blob:')).length,
-                mainHTMLlen: document.querySelector('main') ? document.querySelector('main').innerHTML.length : -1,
-                webgl: (() => { try { const c=document.createElement('canvas'); const g=c.getContext('webgl'); const d=g.getExtension('WEBGL_debug_renderer_info'); return g.getParameter(d.UNMASKED_RENDERER_WEBGL); } catch(e){ return String(e); } })()
-            })""")
-            return {"info": info}
-        finally:
-            cached = getattr(context, "_xchat_opfs_page", None)
-            if page is not cached:
-                await page.close()
-            await XChatContextPool.get().release(auth_token, context)
-
-
 def query_dm_entries(
     conn: Any, conv_id_colon: str, limit: int = 50
 ) -> list[dict[str, Any]]:

@@ -629,7 +629,39 @@ class XChatContextPool:
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
                 Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
                 Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+                Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+                Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 0 });
                 window.chrome = window.chrome || { runtime: {}, loadTimes: function() {}, csi: function() {}, app: {} };
+                // R106: spoof WebGL renderer — SwiftShader (software headless) adalah
+                // sinyal anti-bot kuat; X chat menolak me-render konten dengannya.
+                const spoofGL = (proto) => {
+                    if (!proto) return;
+                    const orig = proto.getParameter;
+                    proto.getParameter = function(p) {
+                        const dbg = this.getExtension && this.getExtension('WEBGL_debug_renderer_info');
+                        if (dbg && p === dbg.UNMASKED_VENDOR_WEBGL) return 'Google Inc. (Intel)';
+                        if (dbg && p === dbg.UNMASKED_RENDERER_WEBGL) return 'ANGLE (Intel, Intel(R) Iris(R) Xe Graphics (0x00009A49) Direct3D11 vs_5_0 ps_5_0, D3D11)';
+                        return orig.apply(this, arguments);
+                    };
+                };
+                try { spoofGL(WebGLRenderingContext.prototype); } catch(e) {}
+                try { spoofGL(WebGL2RenderingContext.prototype); } catch(e) {}
+                try {
+                    const origQuery = window.navigator.permissions && window.navigator.permissions.query;
+                    if (origQuery) window.navigator.permissions.query = (p) => (
+                        p && p.name === 'notifications'
+                            ? Promise.resolve({ state: Notification.permission })
+                            : origQuery(p));
+                } catch(e) {}
+                try {
+                    Object.defineProperty(screen, 'width', { get: () => 1440 });
+                    Object.defineProperty(screen, 'height', { get: () => 900 });
+                    Object.defineProperty(screen, 'availWidth', { get: () => 1440 });
+                    Object.defineProperty(screen, 'availHeight', { get: () => 900 });
+                    Object.defineProperty(screen, 'colorDepth', { get: () => 24 });
+                    Object.defineProperty(screen, 'pixelDepth', { get: () => 24 });
+                } catch(e) {}
                 """
             )
             await _apply_session_cookies(ctx, auth_token, ct0)

@@ -881,9 +881,27 @@ async def debug_conv_fresh(auth_token: str, dm_pin: Optional[str], my_user_id: s
             await page.goto(f"https://x.com/i/chat/{conv_dash}", wait_until="domcontentloaded", timeout=30000)
             await _ensure_pin_unlocked(page, dm_pin)
             await asyncio.sleep(12)
+            ls_js = """async () => {
+                const out = [];
+                const walk = async (dir, prefix, depth) => {
+                    if (depth > 3) return;
+                    for await (const [name, h] of dir.entries()) {
+                        const p = prefix + '/' + name;
+                        if (h.kind === 'directory') { out.push({path:p, kind:'dir'}); await walk(h, p, depth+1); }
+                        else { try { const f = await h.getFile(); out.push({path:p, kind:'file', size:f.size, lastModified:f.lastModified}); } catch(e){ out.push({path:p, kind:'file', err:String(e)}); } }
+                    }
+                };
+                const root = await navigator.storage.getDirectory();
+                await walk(root, '', 0);
+                return out;
+            }"""
+            try:
+                opfs_tree = await page.evaluate(ls_js)
+            except Exception as e:
+                opfs_tree = [{"error": str(e)[:80]}]
             db_bytes = await extract_xchat_opfs_db(page, str(my_user_id), context=context, force=True)
             if not db_bytes or db_bytes[:15] != b"SQLite format 3":
-                return {"error": "no db"}
+                return {"error": "no db", "opfs_tree": opfs_tree}
             with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
                 tf.write(db_bytes); tmp = tf.name
             try:
@@ -894,7 +912,8 @@ async def debug_conv_fresh(auth_token: str, dm_pin: Optional[str], my_user_id: s
                     "FROM dm_entry WHERE conversation_id = ? ORDER BY timestamp DESC LIMIT 12",
                     (cc,)).fetchall()
                 conn.close()
-                return {"events": [{"entry_id": r[0], "sender_id": str(r[1]),
+                return {"opfs_tree": opfs_tree,
+                        "events": [{"entry_id": r[0], "sender_id": str(r[1]),
                                     "text": (r[2] or "")[:80], "timestamp": r[3],
                                     "has_attachment": r[4]} for r in rows]}
             finally:

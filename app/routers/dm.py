@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import secrets
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from fastapi import APIRouter, Header, HTTPException, Path as PathParam, Query, Request, Response
@@ -430,15 +431,48 @@ async def _enrich_conv_events_with_e2ee(
                 ev["_xchat_media_state"] = "pending"
         return formatted
 
-    # If we had no events at all, use decrypted DOM rows directly; otherwise merge aligned MessageCreate events
+    def _event_epoch_sec(ev_obj: dict[str, Any]) -> Optional[float]:
+        raw_ts = ev_obj.get("created_at")
+        if isinstance(raw_ts, str) and raw_ts.strip():
+            try:
+                dt = datetime.fromisoformat(raw_ts.strip().replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt.timestamp()
+            except Exception:
+                pass
+        eid_s = str(ev_obj.get("id") or "").strip()
+        if eid_s.isdigit() and 15 <= len(eid_s) <= 22:
+            try:
+                ms = (int(eid_s) >> 22) + 1288834974657
+                if ms > 1288834974657:
+                    return ms / 1000.0
+            except Exception:
+                pass
+        return None
+
+    # Pastikan urutan decrypted_events selaras terbaru-dulu dengan `events`
+    # (OPFS project_dm_entries_to_events mengembalikan urutan kronologis).
+    dec_indexed = list(enumerate(decrypted_events))
+    if any(_event_epoch_sec(d) is not None for _, d in dec_indexed):
+        dec_indexed.sort(
+            key=lambda item: (
+                1 if _event_epoch_sec(item[1]) is None else 0,
+                -(item[0]) if _event_epoch_sec(item[1]) is None else _event_epoch_sec(item[1]),
+            ),
+            reverse=True,
+        )
+    dec_newest_first = [d for _, d in dec_indexed]
+
+    # If we had no events at all, use decrypted rows directly (newest-first); otherwise merge aligned MessageCreate events
     if not events:
-        new_events = decrypted_events[:max_results]
+        new_events = dec_newest_first[:max_results]
     else:
         # Match exact event IDs first, including plaintext UUID rows with media
         # pending. Positional fallback is reserved for encrypted placeholders;
         # otherwise a split/outgoing DOM row can shift media onto the wrong DM.
         new_events = []
-        dec_by_id = {str(d.get("id")): d for d in decrypted_events if d.get("id")}
+        dec_by_id = {str(d.get("id")): d for d in dec_newest_first if d.get("id")}
         consumed_dec_ids: set[str] = set()
         msg_idx = 0
         for ev in events:
@@ -454,7 +488,7 @@ async def _enrich_conv_events_with_e2ee(
             d_ev = dec_by_id.get(eid) if eid else None
             if d_ev is None and eid and not eid.isdigit() and not is_encrypted:
                 candidates = [
-                    d for d in decrypted_events
+                    d for d in dec_newest_first
                     if str(d.get("id") or "") not in consumed_dec_ids
                     and not d.get("is_outgoing")
                     and str(d.get("sender_id") or "") == str(ev.get("sender_id") or "")
@@ -462,8 +496,18 @@ async def _enrich_conv_events_with_e2ee(
                 ]
                 if len(candidates) == 1:
                     d_ev = candidates[0]
-            if d_ev is None and is_encrypted and msg_idx < len(decrypted_events):
-                d_ev = decrypted_events[msg_idx]
+            if d_ev is None and is_encrypted and msg_idx < len(dec_newest_first):
+                cand = dec_newest_first[msg_idx]
+                cand_id = str(cand.get("id") or "")
+                ev_ts = _event_epoch_sec(ev)
+                cand_ts = _event_epoch_sec(cand)
+                ts_compatible = (
+                    ev_ts is None
+                    or cand_ts is None
+                    or abs(ev_ts - cand_ts) <= 300.0
+                )
+                if cand_id not in consumed_dec_ids and ts_compatible:
+                    d_ev = cand
             msg_idx += 1
             is_uuid_candidate = bool(eid and not eid.isdigit())
             if d_ev is None:

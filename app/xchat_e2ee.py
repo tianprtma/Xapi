@@ -95,7 +95,7 @@ def cache_e2ee_media(
         _E2EE_MEDIA_CACHE.pop(oldest_key, None)
 
     media_id = hashlib.sha256(
-        (key_hint or secrets.token_hex(8)).encode("utf-8") + raw_bytes[:256]
+        (key_hint or secrets.token_hex(8)).encode("utf-8") + raw_bytes
     ).hexdigest()[:20]
     if kind == "video":
         if mime not in ("video/mp4", "video/quicktime"):
@@ -878,73 +878,222 @@ def _media_text_hint(text: Any) -> str:
     return " ".join(words[:5])
 
 
-_EXTRACT_MEDIA_JS = """(hints) => {
-    const out = hints.map(() => null);
+_EXTRACT_MEDIA_JS = r"""(specs) => {
+    const out = specs.map(() => null);
     const used = new Set();
-    const lowerHints = hints.map(h => (h || '').toLowerCase());
+    const candidates = [];
+
+    const parseTimeMs = (rootEl) => {
+        if (!rootEl) return null;
+        const tEl = rootEl.querySelector('time[datetime]');
+        if (!tEl) return null;
+        const ms = Date.parse(tEl.getAttribute('datetime') || '');
+        return Number.isFinite(ms) ? ms : null;
+    };
+
+    const extractBubbleContext = (img) => {
+        // Prioritaskan batas eksplisit baris pesan agar teks bubble tetangga
+        // tidak pernah bocor ke gambar milik pesan lain.
+        const row = img.closest('[data-dm-message-row]');
+        if (row) {
+            const textNode = row.querySelector('[data-testid^="message-text-"]');
+            const t = ((textNode && textNode.innerText) || row.innerText || '')
+                .replace(/\s+/g, ' ').trim();
+            return { low: t.slice(0, 300).toLowerCase(), dtMs: parseTimeMs(row) };
+        }
+        let ctx = '';
+        let dtMs = null;
+        let p = img.closest('[data-testid]') || img.parentElement;
+        for (let i = 0; i < 6 && p; i++) {
+            const tid = p.getAttribute ? (p.getAttribute('data-testid') || '') : '';
+            if (tid === 'dm-message-scroller') break;
+            if (p.scrollHeight && p.clientHeight && p.scrollHeight > p.clientHeight + 200) break;
+            if (p.querySelectorAll && p.querySelectorAll('[data-testid^="message-text-"]').length > 1) break;
+            if (p.querySelectorAll && p.querySelectorAll('img[src^="blob:"]').length > 4) break;
+            if (dtMs === null) dtMs = parseTimeMs(p);
+            const t = (p.innerText || '').replace(/\s+/g, ' ').trim();
+            if (t.length > 10) { ctx = t.slice(0, 300); break; }
+            p = p.parentElement;
+        }
+        return { low: ctx.toLowerCase(), dtMs };
+    };
+
     const walk = (root) => {
         for (const img of root.querySelectorAll('img')) {
             if (!String(img.src).startsWith('blob:')) continue;
-            let ctx = '';
-            let p = img.closest('[data-testid]') || img.parentElement;
-            for (let i = 0; i < 6 && p; i++) {
-                const t = (p.innerText || '').replace(/\s+/g, ' ').trim();
-                if (t.length > 10) { ctx = t.slice(0, 200); break; }
-                p = p.parentElement;
-            }
-            const low = ctx.toLowerCase();
-            for (let hi = 0; hi < lowerHints.length; hi++) {
-                const h = lowerHints[hi];
-                if (!h || h.length < 4 || out[hi] || used.has(img.src)) continue;
-                if (low.includes(h)) {
-                    try {
-                        const c = document.createElement('canvas');
-                        c.width = img.naturalWidth || img.width || 640;
-                        c.height = img.naturalHeight || img.height || 640;
-                        c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
-                        out[hi] = c.toDataURL('image/jpeg', 0.92);
-                        used.add(img.src);
-                    } catch (e) { out[hi] = null; }
-                    break;
-                }
-            }
+            if (!img.complete || !img.naturalWidth || !img.naturalHeight) continue;
+            const { low, dtMs } = extractBubbleContext(img);
+            candidates.push({ img, src: img.src, low, dtMs });
         }
         for (const el of root.querySelectorAll('*')) { if (el.shadowRoot) walk(el.shadowRoot); }
     };
     walk(document);
+
+    for (let si = 0; si < specs.length; si++) {
+        const spec = specs[si] || {};
+        const h = String(spec.hint || '').toLowerCase();
+        if (!h || h.length < 4) continue;
+        const tsMs = typeof spec.ts_ms === 'number' && Number.isFinite(spec.ts_ms) ? spec.ts_ms : null;
+        const rankFromNewest = typeof spec.rank_from_newest === 'number' ? spec.rank_from_newest : 0;
+
+        const allMatching = candidates.filter((c) => c.low.includes(h));
+        const matching = allMatching.filter((c) => !used.has(c.src));
+        if (matching.length === 0) continue;
+
+        let chosen = null;
+        if (tsMs !== null) {
+            const timed = matching.filter((c) => c.dtMs !== null);
+            if (timed.length > 0) {
+                let best = null;
+                let bestDiff = Infinity;
+                for (const c of timed) {
+                    const diff = Math.abs(c.dtMs - tsMs);
+                    if (diff < bestDiff) {
+                        bestDiff = diff;
+                        best = c;
+                    }
+                }
+                // Tolak gambar dengan selisih timestamp > 5 menit — cegah foto menfess lama terpasang.
+                if (best && bestDiff <= 300000) {
+                    chosen = best;
+                } else {
+                    continue;
+                }
+            }
+        }
+        if (!chosen) {
+            // Tanpa <time datetime>, cocokkan dari BAWAH (terbaru-dulu) memakai
+            // peringkat dari terbaru terhadap `allMatching` (bukan setelah filter
+            // `used`) agar urutan pemrosesan `specs` tidak pernah menggeser indeks.
+            const idx = allMatching.length - 1 - rankFromNewest;
+            if (idx < 0 || idx >= allMatching.length) continue;
+            const cand = allMatching[idx];
+            if (used.has(cand.src)) continue;
+            chosen = cand;
+        }
+        try {
+            const c = document.createElement('canvas');
+            c.width = chosen.img.naturalWidth;
+            c.height = chosen.img.naturalHeight;
+            c.getContext('2d').drawImage(chosen.img, 0, 0, c.width, c.height);
+            out[si] = {
+                dataUrl: c.toDataURL('image/jpeg', 0.92),
+                width: c.width,
+                height: c.height,
+            };
+            used.add(chosen.src);
+        } catch (e) { out[si] = null; }
+    }
     return out;
 }"""
 
 
-async def _extract_rendered_media(page: Any, pending_events: list[dict[str, Any]]) -> int:
+def _event_ts_ms(ev: dict[str, Any]) -> Optional[int]:
+    raw = ev.get("created_at")
+    if not raw or not isinstance(raw, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+    except Exception:
+        return None
+
+
+def _build_rendered_media_specs(
+    pending_events: list[dict[str, Any]],
+    all_events: Optional[list[dict[str, Any]]] = None,
+) -> list[dict[str, Any]]:
+    """Bangun spesifikasi pencocokan DOM per event pending: hint teks, timestamp ms,
+    dan peringkat dari terbaru di antara semua event bermedia ber-hint sama."""
+    pool = all_events if all_events is not None else pending_events
+    media_by_hint: dict[str, list[dict[str, Any]]] = {}
+    for ev in pool:
+        if not (
+            ev.get("_xchat_media_pending")
+            or ev.get("_xapi_attachments")
+            or ev.get("_xchat_media_state") in ("pending", "ready")
+        ):
+            continue
+        h = _media_text_hint(ev.get("text"))
+        if not h:
+            continue
+        media_by_hint.setdefault(h, []).append(ev)
+    # Urutkan tiap kelompok hint terbaru-dulu berdasarkan timestamp (fallback urutan akhir-dulu).
+    rank_map: dict[tuple[str, int], int] = {}
+    for h, grp in media_by_hint.items():
+        indexed = list(enumerate(grp))
+        indexed.sort(
+            key=lambda item: (
+                _event_ts_ms(item[1]) if _event_ts_ms(item[1]) is not None else -1,
+                item[0],
+            ),
+            reverse=True,
+        )
+        for rank, (_, ev_item) in enumerate(indexed):
+            rank_map[(h, id(ev_item))] = rank
+    specs: list[dict[str, Any]] = []
+    for ev in pending_events:
+        h = _media_text_hint(ev.get("text"))
+        specs.append({
+            "hint": h,
+            "ts_ms": _event_ts_ms(ev),
+            "rank_from_newest": rank_map.get((h, id(ev)), 0),
+        })
+    return specs
+
+
+async def _extract_rendered_media(
+    page: Any,
+    pending_events: list[dict[str, Any]],
+    all_events: Optional[list[dict[str, Any]]] = None,
+) -> int:
     """R106: panen gambar E2EE yang SUDAH terdekripsi & ter-render di DOM chat
     (`<img src="blob:...">` di shadow DOM) via canvas — tanpa file OPFS dan
-    tanpa RE kripto. Cocokkan gambar ke tiap event pending lewat hint teks.
+    tanpa RE kripto. Cocokkan gambar ke tiap event pending lewat hint teks,
+    timestamp, dan urutan terbaru-dulu (anti salah-foto menfess lama).
     Return jumlah event yang berhasil dilampirkan media."""
     if not pending_events:
         return 0
-    hints = [_media_text_hint(e.get("text")) for e in pending_events]
+    specs = _build_rendered_media_specs(pending_events, all_events=all_events)
     try:
-        dataurls = await page.evaluate(_EXTRACT_MEDIA_JS, hints)
+        extracted = await page.evaluate(_EXTRACT_MEDIA_JS, specs)
     except Exception as exc:  # noqa: BLE001
         log.debug("R106: canvas-extract evaluate gagal (%s)", exc)
         return 0
-    if not isinstance(dataurls, list):
+    if not isinstance(extracted, list):
         return 0
     attached = 0
-    for ev, hint, du in zip(pending_events, hints, dataurls):
+    for ev, spec, item in zip(pending_events, specs, extracted):
+        if isinstance(item, dict):
+            du = item.get("dataUrl")
+            w = item.get("width")
+            h_px = item.get("height")
+        elif isinstance(item, str):
+            du = item
+            w = None
+            h_px = None
+        else:
+            continue
         if not du or not isinstance(du, str) or not du.startswith("data:image/"):
             continue
         desc = cache_e2ee_media(
             du,
-            key_hint=str(ev.get("id") or hint),
+            key_hint=str(ev.get("id") or spec.get("hint") or ""),
             kind="photo",
+            width=w if isinstance(w, int) and w > 0 else None,
+            height=h_px if isinstance(h_px, int) and h_px > 0 else None,
         )
         if not desc:
             continue
         ev["_xapi_attachments"] = [desc]
+        ev["attachments"] = {
+            "media_keys": [f"3_{desc['media_id']}"]
+        }
         ev.pop("_xchat_media_pending", None)
         ev["_xchat_media_state"] = "ready"
+        ev["_xchat_media_recovered"] = 1
         attached += 1
         log.info(
             "R106: gambar E2EE dipanen dari DOM untuk event %s (%dx%d, proxy %s)",
@@ -1059,11 +1208,14 @@ def _extract_post_links(contents: Any) -> list[str]:
 
 
 def project_dm_entries_to_events(
-    rows: list[dict[str, Any]], conversation_id: str
+    rows: list[dict[str, Any]],
+    conversation_id: str,
+    my_user_id: Optional[str] = None,
 ) -> list[dict[str, Any]]:
     """Baris dm_entry → event format Xapi (kompatibel dengan keluaran
     unlock_and_read_xchat_conversation)."""
     conv_dash = conversation_id.replace(":", "-")
+    my_uid_str = str(my_user_id) if my_user_id else ""
     events: list[dict[str, Any]] = []
     for row in rows:
         entry_id = str(row.get("entry_id") or "")
@@ -1079,14 +1231,15 @@ def project_dm_entries_to_events(
                 datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
                 .strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
             )
+        sender_str = str(row.get("sender_id") or "")
         event: dict[str, Any] = {
             "id": entry_id,
             "event_type": "MessageCreate",
             "dm_conversation_id": conv_dash,
-            "sender_id": str(row.get("sender_id") or ""),
+            "sender_id": sender_str,
             "text": text,
             "created_at": created_at,
-            "is_outgoing": str(row.get("sender_id") or "") == "" and False,
+            "is_outgoing": bool(my_uid_str and sender_str == my_uid_str),
             "_xchat_decrypted": True,
             "_xchat_media_state": "none",
         }
@@ -1110,6 +1263,21 @@ def project_dm_entries_to_events(
         events.append(event)
     events.reverse()  # kronologis
     return events
+
+
+def _is_recent_pending_media(
+    ev: dict[str, Any], *, now_ms: Optional[int] = None, max_age_hours: float = 48.0
+) -> bool:
+    """True bila event masih `_xchat_media_pending` dan cukup baru (<= max_age_hours)
+    atau tidak memiliki timestamp — mencegah percakapan lama dengan puluhan foto
+    historis memicu reload browser 60 detik setiap siklus."""
+    if not ev.get("_xchat_media_pending"):
+        return False
+    ts_ms = _event_ts_ms(ev)
+    if ts_ms is None:
+        return True
+    ref_ms = int(time.time() * 1000) if now_ms is None else now_ms
+    return (ref_ms - ts_ms) <= int(max_age_hours * 3600 * 1000)
 
 
 def _mime_from_opfs_path(path: str, attachment_type: Optional[str] = None) -> str:
@@ -1168,7 +1336,10 @@ async def recover_opfs_media_for_events(
         return
     by_id = {str(r.get("entry_id") or ""): r for r in rows}
     reads = 0
-    for ev in events:
+    # Prioritaskan event TERBARU lebih dulu (`reversed(events)` karena
+    # `project_dm_entries_to_events` kronologis) agar kuota `max_files` tidak
+    # habis untuk foto historis berbulan-bulan lalu dan menelantarkan DM baru.
+    for ev in reversed(events):
         if not ev.get("_xchat_media_pending"):
             continue
         eid = str(ev.get("id") or "")
@@ -1379,7 +1550,7 @@ async def unlock_and_read_xchat_conversation(
                             )
                             if rows:
                                 events = project_dm_entries_to_events(
-                                    rows, norm_conv_id
+                                    rows, norm_conv_id, my_user_id=str(my_user_id)
                                 )
                                 # R90: pulihkan media foto/video dari OPFS
                                 # (dm_local_attachment) untuk event pending.
@@ -1399,7 +1570,7 @@ async def unlock_and_read_xchat_conversation(
                                 # tunggu sebentar, baca ulang db (force, bypass
                                 # cache R95) dan recover lagi — supaya media tayang
                                 # bersama menfess, bukan fallback teks setelah 45m.
-                                if any(e.get("_xchat_media_pending") for e in events):
+                                if any(_is_recent_pending_media(e) for e in events):
                                     # R101: trigger unduh media lebih andal —
                                     # viewport tinggi (pesan terkubur ikut
                                     # ter-render) + scroll bertahap + retry
@@ -1457,18 +1628,20 @@ async def unlock_and_read_xchat_conversation(
                                                 "R99/R101: trigger unduh media %s gagal (%s)",
                                                 norm_conv_id, trig_exc,
                                             )
-                                        still = [e.get("id") for e in events if e.get("_xchat_media_pending")]
+                                        still = [e.get("id") for e in events if _is_recent_pending_media(e)]
                                         log.info("R99/R101: trigger attempt %d selesai — pending tersisa %d", _attempt + 1, len(still))
-                                        if not any(e.get("_xchat_media_pending") for e in events):
+                                        if not still:
                                             break
                                 # R106: panen gambar E2EE yang SUDAH terdekripsi
                                 # & ter-render di DOM (img src=blob:) via canvas —
                                 # menutup kasus media yang tak pernah terunduh
                                 # ke OPFS (unduhan dipicu komponen chat).
-                                still_pending = [e for e in events if e.get("_xchat_media_pending")]
+                                still_pending = [e for e in events if _is_recent_pending_media(e)]
                                 if still_pending:
                                     try:
-                                        n106 = await _extract_rendered_media(page, still_pending)
+                                        n106 = await _extract_rendered_media(
+                                            page, still_pending, all_events=events
+                                        )
                                         if n106:
                                             log.info("R106: %d gambar dipanen untuk %s", n106, norm_conv_id)
                                     except Exception as r106_exc:  # noqa: BLE001

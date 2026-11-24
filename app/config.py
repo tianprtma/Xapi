@@ -378,22 +378,44 @@ def validate_proxy_url(raw: str) -> str:
             parsed_ip = ipaddress.IPv4Address(socket.inet_aton(ip_candidate))
         except OSError:
             parsed_ip = None
-    if parsed_ip is not None and _is_disallowed_proxy_ip(parsed_ip):
-        raise ValueError("alamat IP proxy loopback/link-local/reserved tidak diizinkan")
+    if parsed_ip is not None:
+        if _is_disallowed_proxy_ip(parsed_ip):
+            raise ValueError("alamat IP proxy loopback/link-local/reserved tidak diizinkan")
+        host_fmt = f"[{parsed_ip}]" if isinstance(parsed_ip, ipaddress.IPv6Address) else str(parsed_ip)
+    else:
+        labels = host_clean.split(".")
+        if any(
+            not lbl or len(lbl) > 63 or lbl.startswith("-") or lbl.endswith("-") or ":" in lbl
+            for lbl in labels
+        ):
+            raise ValueError("host proxy tidak valid")
+        host_fmt = host_clean
     userinfo, sep, hostport = parsed.netloc.rpartition("@")
     if sep and "@" in userinfo:
         raise ValueError("userinfo proxy mengandung '@' tak ter-encode (gunakan %40)")
-    if hostport.endswith(":"):
-        raise ValueError("port proxy kosong")
+    # Ekstrak raw port secara ketat (hanya digit ASCII, tolak `+8080` atau `:`)
+    if hostport.startswith("["):
+        _, bracket_sep, port_part = hostport.partition("]")
+        if not bracket_sep:
+            raise ValueError("host IPv6 proxy tidak valid")
+        if port_part and not port_part.startswith(":"):
+            raise ValueError("port proxy tidak valid")
+        has_colon = port_part.startswith(":")
+        raw_port = port_part[1:] if has_colon else ""
+    else:
+        _, colon_sep, raw_port = hostport.rpartition(":")
+        has_colon = bool(colon_sep)
+    if has_colon and (not raw_port or not raw_port.isdigit()):
+        raise ValueError("port proxy tidak valid")
     try:
         port = parsed.port
     except ValueError as exc:
         raise ValueError("port proxy tidak valid") from exc
     if port is not None and not (1 <= port <= 65535):
         raise ValueError("port proxy di luar rentang 1-65535")
-    # Kanonikalisasi skema & host (lowercase, tanpa trailing `/`) agar key
-    # ClientPool/SessionStore/ContextPool tidak terfragmentasi.
-    canon_hostport = hostport.lower()
+    # Kanonikalisasi skema, host/IP, dan integer port (tanpa leading zero / trailing `/`)
+    # agar key ClientPool/SessionStore/ContextPool tidak terfragmentasi.
+    canon_hostport = f"{host_fmt}:{port}" if port is not None else host_fmt
     canon_netloc = f"{userinfo}@{canon_hostport}" if sep else canon_hostport
     return f"{scheme}://{canon_netloc}"
 

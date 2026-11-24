@@ -955,9 +955,16 @@ async def test_pass7_proxy_hardening_redaction_and_scoped_invalidation():
         "http://%31%32%37.0.0.1:8080",
         "http://127.0.0.%31:8080",
         "http://[::ffff:%31%32%37.0.0.1]:8080",
+        "http://31.6.46.27:+8080",
+        "http://-:8080",
+        "http://-a.com:8080",
+        "http://a..b.com:8080",
     ):
         with pytest.raises(ValueError):
             validate_proxy_url(bad)
+
+    assert validate_proxy_url("http://31.6.46.27:012323") == "http://31.6.46.27:12323"
+    assert validate_proxy_url("https://[2606:4700:0:0::1]:00443/") == "https://[2606:4700::1]:443"
 
     redacted = redact_proxy_creds("ProxyError: http://myuser:supersecret@31.6.46.27:12323 failed")
     assert "supersecret" not in redacted

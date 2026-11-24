@@ -1949,8 +1949,8 @@ async def unlock_and_read_xchat_conversation(
                         // Skip completely empty divider/date rows, except a row
                         // explicitly exposing X's attachment focus target.
                         const hasAnyImg = imgs.length > 0;
-                        const mediaPending = (hasAttachmentFocus || hasAnyImg) && imageDataUrls.length === 0;
                         const mediaReady = imageDataUrls.length > 0 || videoDataUrls.length > 0;
+                        const mediaPending = (hasAttachmentFocus || hasAnyImg) && !mediaReady;
                         const mediaState = mediaReady ? 'ready' :
                             (videoPending || mediaPending ? 'pending' : (hasContentFocus && text ? 'none' : 'unknown'));
                         if (!text && imageDataUrls.length === 0 && statusLinks.length === 0
@@ -1981,13 +1981,17 @@ async def unlock_and_read_xchat_conversation(
 
                         // Merge adjacent split rows (:content + :attachment) belonging to the same message
                         const prev = results.length > 0 ? results[results.length - 1] : null;
+                        const prevHasMedia = Boolean(
+                            prev && ((prev.image_data_urls?.length || 0) > 0 || (prev.video_data_urls?.length || 0) > 0)
+                        );
+                        const curHasMedia = (curItem.image_data_urls.length > 0 || curItem.video_data_urls.length > 0);
                         if (
                             prev &&
                             prev.is_outgoing === curItem.is_outgoing &&
                             ((prev._has_content_only && curItem._has_attachment_only) ||
                              (prev._has_attachment_only && curItem._has_content_only) ||
-                             (!prev.text && curItem.text && prev.image_data_urls.length > 0 && curItem.image_data_urls.length === 0) ||
-                             (prev.text && !curItem.text && prev.image_data_urls.length === 0 && curItem.image_data_urls.length > 0))
+                             (!prev.text && curItem.text && prevHasMedia && !curHasMedia) ||
+                             (prev.text && !curItem.text && !prevHasMedia && curHasMedia))
                         ) {
                             prev.text = prev.text || curItem.text;
                             prev.created_at = prev.created_at || curItem.created_at;
@@ -2000,7 +2004,9 @@ async def unlock_and_read_xchat_conversation(
                             prev.video_height = prev.video_height || curItem.video_height;
                             prev.video_thumbnail_data_urls = [...(prev.video_thumbnail_data_urls || []), ...(curItem.video_thumbnail_data_urls || [])].slice(0, 1);
                             prev.video_pending = prev.video_pending || curItem.video_pending;
-                            prev.media_pending = prev.media_pending || curItem.media_pending;
+                            const mergedReady = (prev.image_data_urls.length > 0 || prev.video_data_urls.length > 0);
+                            prev.media_pending = mergedReady ? Boolean(prev.video_pending) : Boolean(prev.media_pending || curItem.media_pending);
+                            prev.media_state = mergedReady ? 'ready' : (prev.media_pending ? 'pending' : prev.media_state);
                             prev._has_attachment_only = false;
                             prev._has_content_only = false;
                             continue;

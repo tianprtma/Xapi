@@ -165,3 +165,14 @@ class TestCacheKey:
         k1 = _key("UserByScreenName", {"screen_name": "x"}, "tok1")
         k2 = _key("UserByScreenName", {"screen_name": "x"}, "tok2")
         assert k1 != k2
+
+
+def test_session_expires_by_max_age_even_when_actively_polled():
+    """Token bot yang aktif terus-menerus tiap 30 detik tetap harus refresh
+    setelah MAX_SESSION_AGE_SECONDS agar cookie __cf_bm tidak hidup selamanya."""
+    from session_cache import MAX_SESSION_AGE_SECONDS, Session
+
+    s = Session(auth_token="tok_active", ct0="ct0_old", cookies={"__cf_bm": "old"})
+    s.created_at = time.time() - (MAX_SESSION_AGE_SECONDS + 5)
+    s.last_used = time.time()  # baru saja dipakai
+    assert s.is_alive() is False

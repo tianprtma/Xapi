@@ -21,7 +21,8 @@ from typing import Any, Optional
 
 from app.config import token_key
 
-TTL_SECONDS = 300  # 5 menit
+TTL_SECONDS = 300  # 5 menit (idle TTL)
+MAX_SESSION_AGE_SECONDS = 1200  # 20 menit (absolute TTL agar __cf_bm/ct0 tidak hidup selamanya)
 MAX_SESSIONS = 5000
 
 
@@ -36,8 +37,9 @@ class Session:
     created_at: float = field(default_factory=time.time)
     last_used: float = field(default_factory=time.time)
 
-    def is_alive(self, ttl: float = TTL_SECONDS) -> bool:
-        return (time.time() - self.last_used) < ttl
+    def is_alive(self, ttl: float = TTL_SECONDS, max_age: float = MAX_SESSION_AGE_SECONDS) -> bool:
+        now = time.time()
+        return (now - self.last_used) < ttl and (now - self.created_at) < max_age
 
     def viewer_alive(self, ttl: float = TTL_SECONDS) -> bool:
         return self.viewer is not None and (time.time() - self.viewer_at) < ttl

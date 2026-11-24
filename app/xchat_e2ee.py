@@ -1114,19 +1114,38 @@ def query_dm_entries(
     conn: Any, conv_id_colon: str, limit: int = 50
 ) -> list[dict[str, Any]]:
     """Query baris dm_entry untuk satu percakapan (id format kolon),
-    terbaru dulu."""
-    rows = conn.execute(
-        """
-        SELECT entry_id, timestamp, sender_id, plain_text,
-               has_attachment, message_status, deleted, event_type,
-               attachment_types, contents
-        FROM dm_entry
-        WHERE conversation_id = ? AND deleted = 0
-        ORDER BY timestamp DESC
-        LIMIT ?
-        """,
-        (conv_id_colon, max(1, int(limit))),
-    ).fetchall()
+    terbaru dulu. Untuk percakapan 1:1 (`a:b`), cocokkan kedua urutan
+    (`a:b` maupun `b:a`) agar urutan ID terbalik tidak mengembalikan 0 baris."""
+    lim = max(1, int(limit))
+    norm_colon = str(conv_id_colon or "").replace("-", ":")
+    parts = norm_colon.split(":")
+    if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit() and parts[0] != parts[1]:
+        swapped = f"{parts[1]}:{parts[0]}"
+        rows = conn.execute(
+            """
+            SELECT entry_id, timestamp, sender_id, plain_text,
+                   has_attachment, message_status, deleted, event_type,
+                   attachment_types, contents
+            FROM dm_entry
+            WHERE conversation_id IN (?, ?) AND deleted = 0
+            ORDER BY timestamp DESC
+            LIMIT ?
+            """,
+            (norm_colon, swapped, lim),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT entry_id, timestamp, sender_id, plain_text,
+                   has_attachment, message_status, deleted, event_type,
+                   attachment_types, contents
+            FROM dm_entry
+            WHERE conversation_id = ? AND deleted = 0
+            ORDER BY timestamp DESC
+            LIMIT ?
+            """,
+            (norm_colon, lim),
+        ).fetchall()
     cols = ["entry_id", "timestamp", "sender_id", "plain_text",
             "has_attachment", "message_status", "deleted", "event_type",
             "attachment_types", "contents"]
@@ -1208,10 +1227,18 @@ def query_inbox_rows(
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
     for cid, ts, preview, sender in convs:
-        if not cid or ":" not in cid or cid in seen:
+        if not cid or ":" not in cid:
+            continue
+        parts = cid.split(":")
+        canon = (
+            f"{min(parts, key=lambda p: (len(p), p))}:{max(parts, key=lambda p: (len(p), p))}"
+            if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit()
+            else cid
+        )
+        if canon in seen:
             continue
         dash_id = cid.replace(":", "-")
-        seen.add(cid)
+        seen.add(canon)
         out.append({
             "id": dash_id,
             "conv_href": f"/i/chat/{dash_id}",
@@ -1976,7 +2003,7 @@ async def unlock_and_read_xchat_conversation(
                             media_pending: mediaPending || videoPending,
                             media_state: mediaState,
                             _has_attachment_only: hasAttachmentFocus && !hasContentFocus && !text,
-                            _has_content_only: hasContentFocus && !hasAttachmentFocus && imageDataUrls.length === 0,
+                            _has_content_only: hasContentFocus && !hasAttachmentFocus && imageDataUrls.length === 0 && videoDataUrls.length === 0,
                         };
 
                         // Merge adjacent split rows (:content + :attachment) belonging to the same message

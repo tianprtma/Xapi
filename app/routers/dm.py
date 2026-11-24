@@ -326,24 +326,54 @@ def _format_dm_conversations_smart(
     events = formatted.get("data") or []
     users = includes.get("users") or []
 
+    def _canon_ck(raw_cid: Optional[str]) -> str:
+        norm = str(raw_cid or "").replace(":", "-")
+        parts = norm.split("-")
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            a, b = sorted(parts, key=lambda p: (len(p), p))
+            return f"{a}-{b}"
+        return norm
+
     latest_by_conv: dict[str, dict[str, Any]] = {}
     for ev in events:
         cid = ev.get("dm_conversation_id")
-        if not cid:
+        ck = _canon_ck(cid)
+        if not ck:
             continue
-        existing = latest_by_conv.get(cid)
+        existing = latest_by_conv.get(ck)
         if not existing:
-            latest_by_conv[cid] = ev
+            latest_by_conv[ck] = ev
         elif existing.get("event_type") != "MessageCreate" and ev.get("event_type") == "MessageCreate":
-            latest_by_conv[cid] = ev
+            latest_by_conv[ck] = ev
 
     conv_list: list[dict[str, Any]] = []
+    seen_cks: set[str] = set()
     for c in convs:
         c_copy = dict(c)
         cid = c_copy.get("id")
-        if cid and cid in latest_by_conv:
-            c_copy["last_message_event"] = latest_by_conv[cid]
+        ck = _canon_ck(cid)
+        if ck:
+            if ck in seen_cks:
+                continue
+            seen_cks.add(ck)
+            if ck in latest_by_conv:
+                c_copy["last_message_event"] = latest_by_conv[ck]
         conv_list.append(c_copy)
+    for ck, ev in latest_by_conv.items():
+        if ck in seen_cks:
+            continue
+        seen_cks.add(ck)
+        raw_cid = str(ev.get("dm_conversation_id") or ck).replace(":", "-")
+        parts = raw_cid.split("-") if "-" in raw_cid else []
+        p_ids = list(ev.get("participant_ids") or ([p for p in parts if p.isdigit()] if len(parts) == 2 else []))
+        conv_list.append(
+            {
+                "id": raw_cid,
+                "type": "Group" if len(p_ids) > 2 else "OneToOne",
+                "participant_ids": p_ids,
+                "last_message_event": ev,
+            }
+        )
 
     # Sort conversations newest-first by created_at (ISO 8601 UTC) then Snowflake id
     def _conv_sort_key(c_obj: dict[str, Any]) -> tuple[str, int]:
@@ -548,9 +578,10 @@ async def _enrich_conv_events_with_e2ee(
             merged.pop("encrypted_text", None)
             new_events.append(merged)
             consumed_dec_ids.add(str(d_ev.get("id") or ""))
-        # Append only decrypted DOM rows not already represented by an exact
-        # GraphQL event. These may be older virtualized messages absent in page.
-        extras = [d for d in decrypted_events if str(d.get("id") or "") not in consumed_dec_ids]
+        # Append only decrypted rows not already represented by an exact
+        # GraphQL event, taking NEWEST-first (`dec_newest_first`) so recent
+        # OPFS messages are never truncated behind older history.
+        extras = [d for d in dec_newest_first if str(d.get("id") or "") not in consumed_dec_ids]
         if extras and len(new_events) < max_results:
             new_events.extend(extras[: max_results - len(new_events)])
 

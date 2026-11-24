@@ -801,11 +801,10 @@ def _dm_ts_to_iso(ts: Any) -> Optional[str]:
         # "10:00:00Z" > "10:00:00.500Z" secara string (Z 0x5A > . 0x2E)
         # padahal kronologisnya .000 < .500.
         try:
-            from datetime import datetime
+            from datetime import datetime, timezone
 
-            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-            ms = int(dt.timestamp() * 1000)
-            return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{ms % 1000:03d}Z"
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(timezone.utc)
+            return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
         except ValueError:
             return ts
     try:
@@ -1610,6 +1609,8 @@ def _merge_dm_event_obj(existing_ev: dict[str, Any], new_ev: dict[str, Any]) -> 
         if k in ("_xapi_attachments", "attachments", "referenced_tweets", "entities"):
             if v and not merged.get(k):
                 merged[k] = v
+            elif isinstance(v, list) and isinstance(merged.get(k), list) and len(v) > len(merged[k]):
+                merged[k] = v
             continue
         if merged.get(k) in (None, "", [], {}):
             merged[k] = v
@@ -1663,6 +1664,14 @@ def format_dm_events(
     next_token: Optional[str] = None
     prev_token: Optional[str] = None
 
+    def _canon_dm_cid(raw_cid: Optional[str]) -> str:
+        norm = str(raw_cid or "").replace(":", "-")
+        parts = norm.split("-")
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            a, b = sorted(parts, key=lambda p: (len(p), p))
+            return f"{a}-{b}"
+        return norm
+
     if is_gql:
         target_data = gql_data if gql_data is not None else payload
         gql_events, gql_users, gql_convs, next_token, prev_token = _extract_gql_dm_conversations_and_events(target_data)
@@ -1677,7 +1686,14 @@ def format_dm_events(
                 idx_ev = seen_ids[eid]
                 events[idx_ev] = _merge_dm_event_obj(events[idx_ev], ev)
         users_map.update(gql_users)
-        convs_map.update(gql_convs)
+        for g_cid, g_conv in gql_convs.items():
+            ck = _canon_dm_cid(g_cid)
+            prev_c = convs_map.get(ck) or {}
+            merged_p = list(dict.fromkeys((prev_c.get("participant_ids") or []) + (g_conv.get("participant_ids") or [])))
+            merged_c = {**prev_c, **{k: v for k, v in g_conv.items() if v is not None}}
+            if merged_p:
+                merged_c["participant_ids"] = merged_p
+            convs_map[ck] = merged_c
 
     # Also support REST 1.1 DM sections (either standalone or merged with GraphQL)
     sections = [
@@ -1761,9 +1777,10 @@ def format_dm_events(
         if not isinstance(c, dict):
             continue
         norm_cid = str(c.get("conversation_id") or cid).replace(":", "-")
+        ck = _canon_dm_cid(norm_cid)
         parts = c.get("participants") or []
         rest_part_ids = [str(p.get("user_id")) for p in parts if isinstance(p, dict) and p.get("user_id")]
-        existing_conv = convs_map.get(norm_cid) or {}
+        existing_conv = convs_map.get(ck) or {}
         merged_parts = list(dict.fromkeys((existing_conv.get("participant_ids") or []) + rest_part_ids))
         ctype = "Group" if c.get("type") == "GROUP_DM" or existing_conv.get("type") == "Group" else "OneToOne"
         if ctype == "OneToOne" and "-" in norm_cid:
@@ -1771,7 +1788,7 @@ def format_dm_events(
                 if p_uid.isdigit() and p_uid not in merged_parts:
                     merged_parts.append(p_uid)
         merged_conv = {
-            "id": norm_cid,
+            "id": existing_conv.get("id") or norm_cid,
             "type": ctype,
             "participant_ids": merged_parts,
             "name": c.get("name") or existing_conv.get("name"),
@@ -1779,20 +1796,21 @@ def format_dm_events(
             "muted": c.get("muted") if c.get("muted") is not None else existing_conv.get("muted"),
             "last_read_event_id": c.get("last_read_event_id") or existing_conv.get("last_read_event_id"),
         }
-        convs_map[norm_cid] = {k: v for k, v in merged_conv.items() if v is not None}
+        convs_map[ck] = {k: v for k, v in merged_conv.items() if v is not None}
 
     # Populate participant_ids on events from conversation map & collect includes.media
     for ev in events:
         cid = ev.get("dm_conversation_id")
+        ck = _canon_dm_cid(cid) if cid else ""
         if cid and "participant_ids" not in ev:
-            if cid in convs_map and convs_map[cid].get("participant_ids"):
-                ev["participant_ids"] = convs_map[cid]["participant_ids"]
+            if ck in convs_map and convs_map[ck].get("participant_ids"):
+                ev["participant_ids"] = convs_map[ck]["participant_ids"]
             elif "-" in cid and all(p.isdigit() for p in cid.split("-")):
                 ev["participant_ids"] = cid.split("-")
         # Bendera kepercayaan percakapan — bot butuh ini untuk tahu DM mana yang
         # masih di Message Requests (trusted=False) dan perlu di-approve.
         if cid and "trusted" not in ev:
-            t = convs_map.get(cid, {}).get("trusted")
+            t = convs_map.get(ck, {}).get("trusted")
             if t is not None:
                 ev["trusted"] = t
         for att in ev.get("_xapi_attachments") or []:

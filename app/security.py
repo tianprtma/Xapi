@@ -117,20 +117,27 @@ class BodySizeLimitMiddleware:
 
         async def wrapped_receive() -> Message:
             nonlocal received, too_large
+            if too_large:
+                return {"type": "http.request", "body": b"", "more_body": False}
             msg = await receive()
             if msg["type"] == "http.request":
                 body = msg.get("body", b"") or b""
                 received += len(body)
                 if received > cap:
                     too_large = True
+                    return {"type": "http.request", "body": b"", "more_body": False}
             return msg
 
         response_started = False
+        sent_too_large = False
 
         async def wrapped_send(msg: Message) -> None:
-            nonlocal response_started
+            nonlocal response_started, sent_too_large
+            if sent_too_large:
+                return
             if too_large and not response_started:
                 response_started = True
+                sent_too_large = True
                 await _send_too_large(send, cap)
                 return
             if msg["type"] == "http.response.start":

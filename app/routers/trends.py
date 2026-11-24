@@ -84,7 +84,7 @@ async def _trends_impl(
     if result.get("status") == "ok":
         try:
             payload = result["data"]
-            trends = payload[0].get("trends", []) if isinstance(payload, list) else []
+            trends = payload[0].get("trends", []) if isinstance(payload, list) and payload else []
             return JSONResponse(
                 status_code=200,
                 content={
@@ -94,7 +94,7 @@ async def _trends_impl(
                     ],
                     "meta": {
                         "woeid": woeid,
-                        "as_of": payload[0].get("as_of") if isinstance(payload, list) else None,
+                        "as_of": payload[0].get("as_of") if isinstance(payload, list) and payload else None,
                     },
                 },
             )

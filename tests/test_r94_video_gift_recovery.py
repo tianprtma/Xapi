@@ -71,8 +71,10 @@ async def test_gif_recovery_mime(monkeypatch):
     await xee.recover_opfs_media_for_events(conn, None, None, rows, events)
 
     att = events[0]["_xapi_attachments"][0]
+    assert att["kind"] == "animated_gif"
     assert att["mime"] == "image/gif"
     assert att["byte_size"] == len(GIF)
+    assert events[0]["attachments"]["media_keys"] == [f"16_{att['media_id']}"]
 
 
 @pytest.mark.asyncio

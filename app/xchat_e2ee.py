@@ -85,7 +85,8 @@ def cache_e2ee_media(
     if not raw_bytes:
         return None
 
-    kind = "video" if kind in ("video", "animated_gif") else "photo"
+    if kind not in ("video", "animated_gif"):
+        kind = "photo"
     now = time.time()
     expired = [k for k, (_, _, ts) in _E2EE_MEDIA_CACHE.items() if now - ts > _E2EE_MEDIA_TTL]
     for k in expired:
@@ -97,7 +98,12 @@ def cache_e2ee_media(
     media_id = hashlib.sha256(
         (key_hint or secrets.token_hex(8)).encode("utf-8") + raw_bytes
     ).hexdigest()[:20]
-    if kind == "video":
+    if kind == "animated_gif":
+        if mime not in ("image/gif", "video/mp4", "video/quicktime"):
+            return None
+        ext = "gif" if mime == "image/gif" else ("mp4" if mime == "video/mp4" else "mov")
+        resource_prefix = "gif"
+    elif kind == "video":
         if mime not in ("video/mp4", "video/quicktime"):
             return None
         ext = "mp4" if mime == "video/mp4" else "mov"
@@ -1405,7 +1411,13 @@ async def recover_opfs_media_for_events(
             if not raw:
                 continue
             mime = _mime_from_opfs_path(lp, la.get("attachment_type"))
-            kind = "video" if mime.startswith("video") else "photo"
+            att_t = str(la.get("attachment_type") or "").lower()
+            if mime == "image/gif" or att_t.startswith(("mediaanimatedgif", "mediagif")):
+                kind = "animated_gif"
+            elif mime.startswith("video"):
+                kind = "video"
+            else:
+                kind = "photo"
             data_url = f"data:{mime};base64," + base64.b64encode(raw).decode("ascii")
             cached = cache_e2ee_media(
                 data_url,
@@ -1418,7 +1430,7 @@ async def recover_opfs_media_for_events(
             ev["_xapi_attachments"] = atts
             ev["attachments"] = {
                 "media_keys": [
-                    f"{'7' if a.get('kind') == 'video' else '3'}_{a['media_id']}"
+                    f"{'16' if a.get('kind') == 'animated_gif' else ('7' if a.get('kind') == 'video' else '3')}_{a['media_id']}"
                     for a in atts
                 ]
             }
@@ -1684,7 +1696,7 @@ async def unlock_and_read_xchat_conversation(
                                     "R87: OPFS sqlite memulihkan %d event percakapan %s",
                                     len(events), norm_conv_id,
                                 )
-                                return events[:max_results]
+                                return events[-max_results:] if max_results > 0 else events
                             log.debug(
                                 "R87: OPFS sqlite kosong untuk %s — lanjut jalur DOM",
                                 norm_conv_id,

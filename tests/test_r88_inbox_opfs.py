@@ -305,3 +305,41 @@ async def test_v2_dm_conversations_opfs_new_convs_not_truncated_by_stale_graphql
     assert len(ids) == 3
     assert ids[0] == "100-901"
     assert ids[1] == "100-902"
+
+
+def test_format_dm_conversations_synthesizes_missing_convs_and_matches_reversed_cid():
+    """format_dm_conversations tidak boleh menjatuhkan percakapan yang hanya ada
+    di events (tanpa map conversations) dan tetap mencocokkan ID terbalik a-b/b-a."""
+    from formatter import format_dm_conversations
+
+    payload = {
+        "data": {
+            "get_inbox_page": {
+                "conversations": [
+                    {"conversation_id": "200:100"}
+                ],
+                "messages": [
+                    {
+                        "id": "2000000000000000101",
+                        "conversation_id": "100:200",
+                        "sender_id": "200",
+                        "text": "wots pasangan terbalik",
+                        "created_at_ms": "1763892000000",
+                    },
+                    {
+                        "id": "2000000000000000102",
+                        "conversation_id": "100:300",
+                        "sender_id": "300",
+                        "text": "wots conv tanpa map",
+                        "created_at_ms": "1763892060000",
+                    },
+                ],
+            }
+        }
+    }
+    res = format_dm_conversations(payload)
+    by_id = {c["id"]: c for c in res["data"]}
+    assert "100-300" in by_id
+    assert by_id["100-300"]["last_message_event"]["text"] == "wots conv tanpa map"
+    assert "200-100" in by_id
+    assert by_id["200-100"]["last_message_event"]["text"] == "wots pasangan terbalik"

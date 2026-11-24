@@ -1864,20 +1864,53 @@ def format_dm_conversations(payload: dict[str, Any], max_results: Optional[int] 
     events = formatted.get("data") or []
     users = includes.get("users") or []
 
+    def _canon_conv_key(raw_cid: Optional[str]) -> str:
+        norm = str(raw_cid or "").replace(":", "-")
+        parts = norm.split("-")
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            a, b = sorted(parts, key=lambda p: (len(p), p))
+            return f"{a}-{b}"
+        return norm
+
     # Attach latest message preview to each conversation if available
     latest_by_conv: dict[str, dict[str, Any]] = {}
     for ev in events:
         cid = ev.get("dm_conversation_id")
-        if cid and cid not in latest_by_conv:
-            latest_by_conv[cid] = ev
+        ck = _canon_conv_key(cid)
+        if ck and ck not in latest_by_conv:
+            latest_by_conv[ck] = ev
 
     conv_list: list[dict[str, Any]] = []
+    seen_conv_keys: set[str] = set()
     for c in convs:
         c_copy = dict(c)
         cid = c_copy.get("id")
-        if cid and cid in latest_by_conv:
-            c_copy["last_message_event"] = latest_by_conv[cid]
+        ck = _canon_conv_key(cid)
+        if ck:
+            if ck in seen_conv_keys:
+                continue
+            seen_conv_keys.add(ck)
+            if ck in latest_by_conv:
+                c_copy["last_message_event"] = latest_by_conv[ck]
         conv_list.append(c_copy)
+
+    # Sintesis percakapan dari events yang belum ada di `includes.conversations`
+    # (mis. respons GraphQL flat `messages`/`entries` tanpa map `conversations`).
+    for ck, ev in latest_by_conv.items():
+        if ck in seen_conv_keys:
+            continue
+        seen_conv_keys.add(ck)
+        raw_cid = str(ev.get("dm_conversation_id") or ck).replace(":", "-")
+        parts = raw_cid.split("-") if "-" in raw_cid else []
+        p_ids = list(ev.get("participant_ids") or ([p for p in parts if p.isdigit()] if len(parts) == 2 else []))
+        conv_list.append(
+            {
+                "id": raw_cid,
+                "type": "Group" if len(p_ids) > 2 else "OneToOne",
+                "participant_ids": p_ids,
+                "last_message_event": ev,
+            }
+        )
 
     # Sort conversations newest-first by created_at (ISO 8601 UTC) then Snowflake id
     def _conv_sort_key(c_obj: dict[str, Any]) -> tuple[str, int]:

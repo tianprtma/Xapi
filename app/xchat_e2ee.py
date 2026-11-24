@@ -692,7 +692,11 @@ async def unlock_and_read_xchat_inbox(
 
             return list(collected.values())[:max_results]
         except Exception as exc:
-            log.warning("unlock_and_read_xchat_inbox error: %s", exc)
+            from .config import redact_proxy_creds
+            err_s = redact_proxy_creds(str(exc))
+            if any(t in err_s for t in ("ERR_PROXY", "ERR_SOCKS", "ERR_TUNNEL")):
+                await XChatContextPool.get().invalidate(auth_token)
+            log.warning("unlock_and_read_xchat_inbox error: %s", err_s)
             return []
         finally:
             if page is not None:
@@ -2081,7 +2085,11 @@ async def unlock_and_read_xchat_conversation(
                 rows_data or [], norm_conv_id, max_results=max_results
             )
         except Exception as exc:
-            log.warning("unlock_and_read_xchat_conversation(%s) failed: %s", norm_conv_id, exc)
+            from .config import redact_proxy_creds
+            err_s = redact_proxy_creds(str(exc))
+            if any(t in err_s for t in ("ERR_PROXY", "ERR_SOCKS", "ERR_TUNNEL")):
+                await XChatContextPool.get().invalidate(auth_token)
+            log.warning("unlock_and_read_xchat_conversation(%s) failed: %s", norm_conv_id, err_s)
             return []
         finally:
             if page is not None:
@@ -2255,8 +2263,12 @@ async def send_xchat_dm_via_browser(
                 },
             }
         except Exception as exc:
-            log.warning("send_xchat_dm_via_browser(%s) failed: %s", norm_conv_id, exc)
-            return {"status": "error", "error": str(exc)}
+            from .config import redact_proxy_creds
+            err_s = redact_proxy_creds(str(exc))
+            if any(t in err_s for t in ("ERR_PROXY", "ERR_SOCKS", "ERR_TUNNEL")):
+                await XChatContextPool.get().invalidate(auth_token)
+            log.warning("send_xchat_dm_via_browser(%s) failed: %s", norm_conv_id, err_s)
+            return {"status": "error", "error": err_s}
         finally:
             if page is not None:
                 try:

@@ -1086,3 +1086,93 @@ async def test_pass11_pseudo_octal_64bit_ipv4_and_browser_proxy_error():
     assert res["http_status"] == 502
     assert "sec" not in res["error"]
     inv_mock.assert_awaited_once_with(tok, all_proxies=False)
+
+
+# ── 30. Pass 14: warm_session proxy 407/403/402 never misclassified as 401 InvalidTokenError & RFC9110 407->502 mapping ──
+
+@pytest.mark.asyncio
+async def test_pass14_warm_session_proxy_407_403_not_401_and_407_mapped_to_502():
+    from contextlib import asynccontextmanager
+    from app.auth import WarmNetworkError, warm_session
+    from app.clients import _rest_call_once, media_upload
+
+    tok = "f" * 40
+    # 1. Proxy returning HTTP 407 on GET /home -> WarmNetworkError(502), NOT InvalidTokenError(401)!
+    client_407 = MagicMock()
+    client_407.cookies = MagicMock(jar=[])
+    client_407.cookies.jar = MagicMock(__iter__=lambda self: iter([]), clear=MagicMock())
+    client_407.get = AsyncMock(return_value=MagicMock(status_code=407, text="Proxy Auth Required"))
+    inv_cp = AsyncMock()
+    with (
+        patch("app.auth.SessionStore.get", return_value=MagicMock(lookup=AsyncMock(return_value=None))),
+        patch("app.auth.ClientPool.get", return_value=MagicMock(invalidate=inv_cp)),
+    ):
+        with pytest.raises(WarmNetworkError) as exc_407:
+            await warm_session(client_407, tok)
+    assert exc_407.value.http_status == 502
+    inv_cp.assert_awaited_once_with(tok, all_proxies=False)
+
+    # 2. Cloudflare returning HTTP 403 on GET /home -> WarmNetworkError(403), NOT InvalidTokenError(401)!
+    client_403 = MagicMock()
+    client_403.cookies = MagicMock()
+    client_403.cookies.jar = MagicMock(__iter__=lambda self: iter([]), clear=MagicMock())
+    client_403.get = AsyncMock(return_value=MagicMock(status_code=403, text="Just a moment..."))
+    with (
+        patch("app.auth.SessionStore.get", return_value=MagicMock(lookup=AsyncMock(return_value=None))),
+        patch("app.auth.ClientPool.get", return_value=MagicMock(invalidate=AsyncMock())),
+    ):
+        with pytest.raises(WarmNetworkError) as exc_403:
+            await warm_session(client_403, tok)
+    assert exc_403.value.http_status == 403
+
+    # 3. _rest_call_once maps upstream proxy HTTP 407 to 502 and evicts active proxy socket
+    sess_407 = MagicMock()
+    sess_407.request = AsyncMock(return_value=MagicMock(status_code=407, text="Proxy Auth Required"))
+    @asynccontextmanager
+    async def _fake_pool(_t):
+        yield sess_407
+    inv_rest = AsyncMock()
+    with (
+        patch("app.clients.pooled_client", _fake_pool),
+        patch("app.clients.warm_session", AsyncMock(return_value=("ct0v", {}))),
+        patch("app.clients.ClientPool.get", return_value=MagicMock(invalidate=inv_rest)),
+    ):
+        r407 = await _rest_call_once("blocks/create.json", tok)
+    assert r407["status"] == "error"
+    assert r407["http_status"] == 502
+    inv_rest.assert_awaited_once_with(tok, all_proxies=False)
+
+    # 4. media_upload falls back to direct warm+upload when proxy warm returns WarmNetworkError(403/502)
+    from app.config import reset_request_proxy, set_request_proxy
+    t_ctx = set_request_proxy("http://31.6.46.27:12323")
+    try:
+        warm_calls = []
+        async def _fake_warm(sess, _t):
+            tag = getattr(sess, "tag", "proxy")
+            warm_calls.append(tag)
+            if tag == "proxy":
+                raise WarmNetworkError("CF 403 on proxy", http_status=403)
+            return ("ct0_direct", {"twid": "u%3D1"})
+        class _TagSess:
+            def __init__(self, tag):
+                self.tag = tag
+                self.cookies = MagicMock(jar=[])
+                self.timeout = 20.0
+            async def close(self):
+                pass
+        @asynccontextmanager
+        async def _proxy_pool(_t):
+            yield _TagSess("proxy")
+        with (
+            patch("app.clients.MEDIA_PROXY_EXEMPT", True),
+            patch("app.clients.pooled_client", _proxy_pool),
+            patch("app.clients.warm_session", side_effect=_fake_warm),
+            patch("app.clients.ClientPool.get", return_value=MagicMock(invalidate=AsyncMock())),
+            patch("app.clients._direct_session", side_effect=lambda *a, **kw: _TagSess("direct")),
+            patch("app.clients._upload_chunks", AsyncMock(return_value={"status": "ok", "http_status": 200, "data": {"media_id_string": "99"}})),
+        ):
+            up = await media_upload(tok, b"img", "image/jpeg")
+    finally:
+        reset_request_proxy(t_ctx)
+    assert up["status"] == "ok"
+    assert warm_calls == ["proxy", "direct"]

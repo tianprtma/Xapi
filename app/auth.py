@@ -174,8 +174,8 @@ async def warm_session(
 
     def _transient_warm_status(resp: Any) -> Optional[int]:
         st = getattr(resp, "status_code", None)
-        if isinstance(st, int) and (st >= 500 or st == 429):
-            return st
+        if isinstance(st, int) and (st >= 500 or st in (408, 429)):
+            return 502 if st == 408 else st
         return None
 
     home_resp: Any = None
@@ -186,6 +186,8 @@ async def warm_session(
             home_resp = await client.get(HOMEPAGE_URL)
             bad_st = _transient_warm_status(home_resp)
             if bad_st is not None:
+                if bad_st != 429:
+                    await ClientPool.get().invalidate(auth_token, all_proxies=False)
                 raise WarmNetworkError(
                     f"GET {HOMEPAGE_URL} returned HTTP {bad_st} twice",
                     http_status=bad_st,
@@ -200,6 +202,8 @@ async def warm_session(
             home_resp = await client.get(HOMEPAGE_URL)
             bad_st = _transient_warm_status(home_resp)
             if bad_st is not None:
+                if bad_st != 429:
+                    await ClientPool.get().invalidate(auth_token, all_proxies=False)
                 raise WarmNetworkError(
                     f"GET {HOMEPAGE_URL} returned HTTP {bad_st} on retry",
                     http_status=bad_st,
@@ -211,6 +215,18 @@ async def warm_session(
             raise WarmNetworkError(
                 redact_proxy_creds(f"GET {HOMEPAGE_URL} failed twice: {type(exc).__name__}: {exc}")
             ) from exc
+
+    # Jika proxy/WAF menolak GET /home (mis. 407 Proxy Auth, 402 kuota proxy habis,
+    # 403 challenge Cloudflare pada IP proxy), JANGAN salah klasifikasikan ketiadaan
+    # cookie `twid` sebagai 401 InvalidTokenError (yang mengkarantina token sehat!).
+    final_home_st = getattr(home_resp, "status_code", None)
+    if isinstance(final_home_st, int) and final_home_st >= 400 and final_home_st != 401:
+        await ClientPool.get().invalidate(auth_token, all_proxies=False)
+        mapped_st = 403 if final_home_st == 403 else 502
+        raise WarmNetworkError(
+            f"GET {HOMEPAGE_URL} rejected by proxy/upstream (HTTP {final_home_st})",
+            http_status=mapped_st,
+        )
 
     # X kasih ct0 server-issued di domain .x.com (leading dot). Placeholder lokal
     # nyantol di domain="" atau "x.com" tanpa leading dot. Strategy: prefer ct0
@@ -359,7 +375,12 @@ async def login_with_auth_token(auth_token: str) -> dict[str, Any]:
                 "user": None,
             }
         else:
-            err_st = viewer_resp.status_code if viewer_resp.status_code >= 400 else 502
+            raw_v_st = viewer_resp.status_code
+            if raw_v_st in (402, 407):
+                await ClientPool.get().invalidate(auth_token, all_proxies=False)
+                err_st = 502
+            else:
+                err_st = raw_v_st if raw_v_st >= 400 else 502
             return {
                 "status": "error",
                 "http_status": err_st,

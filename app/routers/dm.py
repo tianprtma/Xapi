@@ -1385,6 +1385,9 @@ async def v2_dm_media_proxy(
                 all_p = resp.status_code == 401
                 await SessionStore.get().invalidate(tok, all_proxies=all_p)
                 await ClientPool.get().invalidate(tok, all_proxies=all_p)
+            elif resp.status_code in (402, 407):
+                from ..client_pool import ClientPool
+                await ClientPool.get().invalidate(tok, all_proxies=False)
             return JSONResponse(
                 status_code=resp.status_code if resp.status_code in (401, 403, 404, 429) else 502,
                 content=format_error("Media Fetch Error", f"Upstream ton.x.com returned {resp.status_code}", "upstream_error", resp.status_code),

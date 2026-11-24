@@ -175,7 +175,11 @@ def write_finalize(
             ),
         )
     raw_st = result.get("http_status")
-    err_status = raw_st if isinstance(raw_st, int) and raw_st >= 400 else 502
+    err_status = (
+        502
+        if (not isinstance(raw_st, int) or raw_st < 400 or raw_st in (402, 407))
+        else raw_st
+    )
     return JSONResponse(
         status_code=err_status,
         content=build_error(

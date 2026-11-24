@@ -163,9 +163,12 @@ async def _graphql_call_once(
                 all_p = resp.status_code == 401
                 await SessionStore.get().invalidate(auth_token, all_proxies=all_p)
                 await ClientPool.get().invalidate(auth_token, all_proxies=all_p)
+            elif resp.status_code in (402, 407):
+                await ClientPool.get().invalidate(auth_token, all_proxies=False)
+            out_st = 502 if resp.status_code in (402, 407) or resp.status_code < 400 else resp.status_code
             return {
                 "status": "error",
-                "http_status": resp.status_code if resp.status_code >= 400 else 502,
+                "http_status": out_st,
                 "error": resp.text[:1000],
                 "data": None,
             }
@@ -271,9 +274,11 @@ async def _rest_call_once(
                 all_p = resp.status_code == 401
                 await SessionStore.get().invalidate(auth_token, all_proxies=all_p)
                 await ClientPool.get().invalidate(auth_token, all_proxies=all_p)
+            elif resp.status_code in (402, 407):
+                await ClientPool.get().invalidate(auth_token, all_proxies=False)
             return {
                 "status": "error",
-                "http_status": resp.status_code,
+                "http_status": 502 if resp.status_code in (402, 407) else resp.status_code,
                 "error": resp.text[:1000],
                 "data": None,
             }
@@ -393,9 +398,11 @@ async def _dm_call_once(
                 all_p = resp.status_code == 401
                 await SessionStore.get().invalidate(auth_token, all_proxies=all_p)
                 await ClientPool.get().invalidate(auth_token, all_proxies=all_p)
+            elif resp.status_code in (402, 407):
+                await ClientPool.get().invalidate(auth_token, all_proxies=False)
             return {
                 "status": "error",
-                "http_status": resp.status_code,
+                "http_status": 502 if resp.status_code in (402, 407) else resp.status_code,
                 "error": payload,
                 "data": None,
             }
@@ -555,6 +562,7 @@ async def media_upload(
         try:
             direct_res = await _upload_chunks(
                 direct, base_headers, file_bytes, media_type, media_category, max_poll_seconds=timeout)
+            direct_res.pop("_proxy_err", None)
             if (
                 direct_res.get("status") == "ok"
                 or direct_res.get("http_status") not in (401, 403, 429, 500, 502, 503, 504)
@@ -597,10 +605,13 @@ async def media_upload(
         try:
             up_res = await _upload_chunks(
                 client, base_headers, file_bytes, media_type, media_category, max_poll_seconds=timeout)
-            if up_res.get("status") != "ok" and up_res.get("http_status") in (401, 403):
-                all_p = up_res.get("http_status") == 401
-                await SessionStore.get().invalidate(auth_token, all_proxies=all_p)
-                await ClientPool.get().invalidate(auth_token, all_proxies=all_p)
+            if up_res.get("status") != "ok":
+                if up_res.get("http_status") in (401, 403):
+                    all_p = up_res.get("http_status") == 401
+                    await SessionStore.get().invalidate(auth_token, all_proxies=all_p)
+                    await ClientPool.get().invalidate(auth_token, all_proxies=all_p)
+                elif up_res.pop("_proxy_err", False):
+                    await ClientPool.get().invalidate(auth_token, all_proxies=False)
             return up_res
         except Exception as exc:  # noqa: BLE001
             await ClientPool.get().invalidate(auth_token, all_proxies=False)
@@ -755,13 +766,16 @@ def _invalid_token_response(e: InvalidTokenError, auth_token: str) -> dict[str, 
 
 def _upload_error(resp: Any, stage: str, *, media_id: Optional[str] = None) -> dict[str, Any]:
     raw_st = getattr(resp, "status_code", None)
+    norm_st = 502 if (not isinstance(raw_st, int) or raw_st < 400 or raw_st in (402, 407)) else raw_st
     err: dict[str, Any] = {
         "status": "error",
-        "http_status": raw_st if isinstance(raw_st, int) and raw_st >= 400 else 502,
+        "http_status": norm_st,
         "error": resp.text[:1000],
         "stage": stage,
         "data": None,
     }
     if media_id:
         err["media_id"] = media_id
+    if isinstance(raw_st, int) and raw_st in (402, 407):
+        err["_proxy_err"] = True
     return err

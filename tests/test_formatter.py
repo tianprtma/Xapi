@@ -163,3 +163,57 @@ class TestFormatError:
         assert result["errors"][0]["detail"] == "test detail"
         assert result["errors"][0]["type"] == "test_type"
         assert result["errors"][0]["status"] == 400
+
+
+
+def test_format_tweet_collection_extracts_cursor_from_timeline_replace_entry():
+    """Halaman ke-2+ SearchTimeline/Timeline mengirim cursor Bottom melalui
+    instruksi `TimelineReplaceEntry` — harus tetap terekstrak ke meta.next_token."""
+    gql = {
+        "data": {
+            "search_by_raw_query": {
+                "search_timeline": {
+                    "timeline": {
+                        "instructions": [
+                            {
+                                "type": "TimelineAddEntries",
+                                "entries": [
+                                    {
+                                        "content": {
+                                            "itemContent": {
+                                                "itemType": "TimelineTweet",
+                                                "tweet_results": {
+                                                    "result": {
+                                                        "rest_id": "1900000000000000001",
+                                                        "legacy": {
+                                                            "id_str": "1900000000000000001",
+                                                            "full_text": "!report tweet ini",
+                                                            "user_id_str": "42",
+                                                        },
+                                                    }
+                                                },
+                                            }
+                                        }
+                                    }
+                                ],
+                            },
+                            {
+                                "type": "TimelineReplaceEntry",
+                                "entry_id_to_replace": "cursor-bottom-0",
+                                "entry": {
+                                    "content": {
+                                        "entryType": "TimelineTimelineCursor",
+                                        "cursorType": "Bottom",
+                                        "value": "DAABCgABGpage3cursor",
+                                    }
+                                },
+                            },
+                        ]
+                    }
+                }
+            }
+        }
+    }
+    res = format_tweet_collection(gql)
+    assert len(res["data"]) == 1
+    assert res["meta"]["next_token"] == "DAABCgABGpage3cursor"

@@ -345,7 +345,7 @@ def _walk_timeline_entries(payload: dict[str, Any]) -> tuple[list[dict], Optiona
     for ins in instructions:
         if ins.get("type") == "TimelineAddEntries":
             entries.extend(ins.get("entries", []))
-        elif ins.get("type") == "TimelinePinEntry":
+        elif ins.get("type") in ("TimelinePinEntry", "TimelineReplaceEntry"):
             if ins.get("entry"):
                 entries.append(ins["entry"])
 

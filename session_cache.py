@@ -110,6 +110,9 @@ class SessionStore:
         key = token_key(auth_token)
         async with self._lock:
             sess = self._cache.get(key)
+            if sess and not sess.is_alive(ttl):
+                self._cache.pop(key, None)
+                return None
             if sess and sess.viewer_alive(ttl):
                 sess.last_used = time.time()
                 self._cache.move_to_end(key)
@@ -124,7 +127,7 @@ class SessionStore:
     async def stats(self) -> dict[str, int]:
         async with self._lock:
             alive = sum(1 for s in self._cache.values() if s.is_alive())
-            viewers = sum(1 for s in self._cache.values() if s.viewer_alive())
+            viewers = sum(1 for s in self._cache.values() if s.is_alive() and s.viewer_alive())
             return {
                 "total": len(self._cache),
                 "alive": alive,

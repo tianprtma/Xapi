@@ -398,3 +398,68 @@ async def test_admin_stats_calls_sync_xchat_stats_without_await():
         res = await admin_stats(x_admin_token="secret-admin")
     assert "xchat_context_pool" in res
     assert isinstance(res["xchat_context_pool"], dict)
+
+
+# 17. TIDProvider._refresh browser path acquires PlaywrightPool semaphore
+@pytest.mark.asyncio
+async def test_tid_provider_browser_fetch_uses_playwright_semaphore():
+    from tid_provider import TIDProvider
+
+    sem_events: list[str] = []
+
+    class _FakeSem:
+        async def __aenter__(self):
+            sem_events.append("enter")
+            return self
+
+        async def __aexit__(self, *exc):
+            sem_events.append("exit")
+
+    fake_resp = AsyncMock()
+    fake_resp.text = AsyncMock(return_value="<html><body>ok</body></html>")
+    fake_page = AsyncMock()
+    fake_page.goto = AsyncMock(return_value=fake_resp)
+    fake_page.close = AsyncMock()
+    fake_ctx = AsyncMock()
+    fake_ctx.new_page = AsyncMock(return_value=fake_page)
+
+    fake_ctx_pool = MagicMock()
+    fake_ctx_pool.acquire = AsyncMock(side_effect=lambda _t: (sem_events.append("acquire"), fake_ctx)[1])
+    fake_ctx_pool.release = AsyncMock(side_effect=lambda _t, _c: sem_events.append("release"))
+
+    fake_pw_pool = MagicMock()
+    fake_pw_pool.semaphore = _FakeSem()
+
+    tp = TIDProvider()
+    with (
+        patch("playwright_search.PLAYWRIGHT_ENABLED", True),
+        patch("playwright_search.PlaywrightPool.get", return_value=fake_pw_pool),
+        patch("playwright_search.ContextPool.get", return_value=fake_ctx_pool),
+        patch("tid_provider.get_ondemand_file_url", return_value=None),
+        patch("tid_provider._BoundedSession.get", side_effect=RuntimeError("stop after browser")),
+    ):
+        with pytest.raises(RuntimeError):
+            await tp._refresh(auth_token="a" * 40)
+
+    assert sem_events == ["enter", "acquire", "release", "exit"]
+
+
+# 18. SessionStore.lookup_viewer evicts and returns None when session exceeds MAX_SESSION_AGE_SECONDS
+@pytest.mark.asyncio
+async def test_session_store_lookup_viewer_respects_session_max_age():
+    import time
+    from session_cache import MAX_SESSION_AGE_SECONDS, SessionStore
+
+    store = SessionStore()
+    tok = "b" * 40
+    sess = await store.store(tok, "ct0val", {"auth_token": tok})
+    await store.store_viewer(tok, {"id": "123", "username": "alice"})
+    assert await store.lookup_viewer(tok) == {"id": "123", "username": "alice"}
+
+    # Age session past MAX_SESSION_AGE_SECONDS while keeping viewer_at fresh
+    sess.created_at = time.time() - (MAX_SESSION_AGE_SECONDS + 10)
+    sess.viewer_at = time.time()
+    assert await store.lookup_viewer(tok) is None
+    st = await store.stats()
+    assert st["total"] == 0
+    assert st["viewer_cached"] == 0

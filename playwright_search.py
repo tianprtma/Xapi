@@ -300,22 +300,26 @@ class PlaywrightPool:
 
 
 async def _new_context(browser: Browser, auth_token: str) -> BrowserContext:
-    from app.config import gen_ct0, profile_for_token
+    from app.config import gen_ct0, playwright_proxy_for_token, profile_for_token
 
     prof = profile_for_token(auth_token)
     ua = prof["user_agent"]
     is_win = "Windows" in prof["sec_ch_ua_platform"]
-    context = await browser.new_context(
-        user_agent=ua,
-        viewport={"width": 1366, "height": 768} if is_win else {"width": 1440, "height": 900},
-        locale="en-US",
-        timezone_id="America/New_York",
-        extra_http_headers={
+    ctx_kwargs: dict[str, Any] = {
+        "user_agent": ua,
+        "viewport": {"width": 1366, "height": 768} if is_win else {"width": 1440, "height": 900},
+        "locale": "en-US",
+        "timezone_id": "America/New_York",
+        "extra_http_headers": {
             "sec-ch-ua": prof["sec_ch_ua"],
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": prof["sec_ch_ua_platform"],
         },
-    )
+    }
+    pw_proxy = playwright_proxy_for_token(auth_token)
+    if pw_proxy:
+        ctx_kwargs["proxy"] = pw_proxy
+    context = await browser.new_context(**ctx_kwargs)
     try:
         # Stealth init script: sembunyikan indikator headless Chrome / Playwright
         await context.add_init_script(
@@ -402,10 +406,21 @@ class ContextPool:
             cls._instance = cls()
         return cls._instance
 
+    @staticmethod
+    def _ctx_key(auth_token: str) -> str:
+        from app.config import proxy_for_token
+
+        proxy = proxy_for_token(auth_token)
+        if not proxy:
+            return auth_token
+        phash = hashlib.sha256(proxy.encode("utf-8")).hexdigest()[:12]
+        return f"{auth_token}:p:{phash}"
+
     async def acquire(self, auth_token: str) -> BrowserContext:
         import time as _t
+        ctx_key = self._ctx_key(auth_token)
         async with self._lock:
-            entry = self._ctxs.get(auth_token)
+            entry = self._ctxs.get(ctx_key)
             if entry:
                 ctx, _ = entry
                 # health check: verify browser is still connected (ctx.pages alone
@@ -415,11 +430,11 @@ class ContextPool:
                     br = getattr(ctx, "browser", None)
                     if br is not None and hasattr(br, "is_connected") and not br.is_connected():
                         raise RuntimeError("browser disconnected")
-                    self._ctxs[auth_token] = (ctx, _t.time())
+                    self._ctxs[ctx_key] = (ctx, _t.time())
                     self._ctx_use[id(ctx)] = self._ctx_use.get(id(ctx), 0) + 1
                     return ctx
                 except Exception:  # noqa: BLE001
-                    self._ctxs.pop(auth_token, None)
+                    self._ctxs.pop(ctx_key, None)
                     self._ctx_use.pop(id(ctx), None)
 
             browser = await PlaywrightPool.get().ensure()
@@ -444,7 +459,7 @@ class ContextPool:
                 except Exception:  # noqa: BLE001
                     pass
 
-            self._ctxs[auth_token] = (ctx, _t.time())
+            self._ctxs[ctx_key] = (ctx, _t.time())
             self._ctx_use[id(ctx)] = self._ctx_use.get(id(ctx), 0) + 1
             return ctx
 
@@ -468,21 +483,24 @@ class ContextPool:
                 pass
 
     async def invalidate(self, auth_token: str) -> None:
+        prefix = f"{auth_token}:p:"
         async with self._lock:
-            entry = self._ctxs.pop(auth_token, None)
-            if entry and self._ctx_use.get(id(entry[0]), 0) > 0:
-                # Context sedang dipakai — keluar dari pool (pemanggil baru
-                # dapat context baru), close ditunda sampai holder terakhir
-                # release(). Counter _ctx_use tidak di-reset agar drain
-                # alami saat holder melepas.
-                self._dropped.add(entry[0])
-                return
-            if entry:
-                self._ctx_use.pop(id(entry[0]), None)
-                try:
-                    await entry[0].close()
-                except Exception:  # noqa: BLE001
-                    pass
+            keys = [k for k in self._ctxs if k == auth_token or k.startswith(prefix)]
+            for k in keys:
+                entry = self._ctxs.pop(k, None)
+                if entry and self._ctx_use.get(id(entry[0]), 0) > 0:
+                    # Context sedang dipakai — keluar dari pool (pemanggil baru
+                    # dapat context baru), close ditunda sampai holder terakhir
+                    # release(). Counter _ctx_use tidak di-reset agar drain
+                    # alami saat holder melepas.
+                    self._dropped.add(entry[0])
+                    continue
+                if entry:
+                    self._ctx_use.pop(id(entry[0]), None)
+                    try:
+                        await entry[0].close()
+                    except Exception:  # noqa: BLE001
+                        pass
 
     async def close_all(self) -> None:
         async with self._lock:
@@ -588,6 +606,7 @@ class XChatContextPool:
     def __init__(self) -> None:
         self._ctxs: OrderedDict[str, BrowserContext] = OrderedDict()  # key = hash
         self._ctx_use: dict[int, int] = {}   # id(ctx) -> jumlah holder
+        self._ctx_proxy: dict[str, Optional[str]] = {}  # key -> proxy URL aktif
         self._dropped: set = set()           # dihapus saat masih dipakai
         self._lock = asyncio.Lock()
 
@@ -598,11 +617,13 @@ class XChatContextPool:
         return cls._instance
 
     async def acquire(self, auth_token: str) -> BrowserContext:
-        from app.config import gen_ct0, profile_for_token
+        from app.config import gen_ct0, playwright_proxy_for_token, profile_for_token, proxy_for_token
 
         key = hashlib.sha256(f"xchat:{auth_token}".encode()).hexdigest()[:16]
         profile_dir = _xchat_profile_dir(auth_token)
         ct0_file = profile_dir / "ct0.txt"
+        desired_proxy = proxy_for_token(auth_token)
+        pw_proxy = playwright_proxy_for_token(auth_token)
 
         async with self._lock:
             # ct0 STABIL per profil — baca/tulis di dalam lock agar concurrent
@@ -617,6 +638,18 @@ class XChatContextPool:
 
             ctx = self._ctxs.get(key)
             if ctx is not None:
+                # Bila proxy berubah untuk akun ini dan context sedang idle,
+                # tutup lalu buka ulang agar Chromium memakai proxy terbaru.
+                if self._ctx_proxy.get(key) != desired_proxy and self._ctx_use.get(id(ctx), 0) == 0:
+                    self._ctxs.pop(key, None)
+                    self._ctx_proxy.pop(key, None)
+                    self._ctx_use.pop(id(ctx), None)
+                    try:
+                        await ctx.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    ctx = None
+            if ctx is not None:
                 # health check: context yang sudah mati melempar di .pages / add_cookies
                 try:
                     _ = ctx.pages
@@ -626,6 +659,7 @@ class XChatContextPool:
                     return ctx
                 except Exception:  # noqa: BLE001
                     self._ctxs.pop(key, None)
+                    self._ctx_proxy.pop(key, None)
                     if self._ctx_use.get(id(ctx), 0) > 0:
                         self._dropped.add(ctx)
                     else:
@@ -640,24 +674,29 @@ class XChatContextPool:
             profile_dir.mkdir(parents=True, exist_ok=True)
 
             driver = await PlaywrightPool.get().driver()
+            launch_kwargs: dict[str, Any] = {
+                "headless": XCHAT_HEADLESS,
+                "user_agent": prof["user_agent"],
+                "viewport": {"width": 1366, "height": 768} if is_win else {"width": 1440, "height": 900},
+                "locale": "en-US",
+                "timezone_id": "America/New_York",
+                "extra_http_headers": {
+                    "sec-ch-ua": prof["sec_ch_ua"],
+                    "sec-ch-ua-mobile": "?0",
+                    "sec-ch-ua-platform": prof["sec_ch_ua_platform"],
+                },
+                "args": [
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                ],
+            }
+            if pw_proxy:
+                launch_kwargs["proxy"] = pw_proxy
             try:
                 ctx = await driver.chromium.launch_persistent_context(
                     str(profile_dir),
-                    headless=XCHAT_HEADLESS,
-                    user_agent=prof["user_agent"],
-                    viewport={"width": 1366, "height": 768} if is_win else {"width": 1440, "height": 900},
-                    locale="en-US",
-                    timezone_id="America/New_York",
-                    extra_http_headers={
-                        "sec-ch-ua": prof["sec_ch_ua"],
-                        "sec-ch-ua-mobile": "?0",
-                        "sec-ch-ua-platform": prof["sec_ch_ua_platform"],
-                    },
-                    args=[
-                        "--disable-blink-features=AutomationControlled",
-                        "--no-sandbox",
-                        "--disable-dev-shm-usage",
-                    ],
+                    **launch_kwargs,
                 )
             except Exception as exc:  # noqa: BLE001
                 raise RuntimeError(
@@ -717,6 +756,7 @@ class XChatContextPool:
                 raise
 
             self._ctxs[key] = ctx
+            self._ctx_proxy[key] = desired_proxy
             self._ctx_use[id(ctx)] = self._ctx_use.get(id(ctx), 0) + 1
 
             # Evict LRU idle bila melebihi cap (persistent: aman, state di disk)
@@ -728,6 +768,7 @@ class XChatContextPool:
                 if evict_key is None:
                     break  # semua in-use — biarkan melebihi cap sementara
                 old = self._ctxs.pop(evict_key)
+                self._ctx_proxy.pop(evict_key, None)
                 self._ctx_use.pop(id(old), None)
                 self._dropped.discard(old)
                 try:
@@ -757,6 +798,7 @@ class XChatContextPool:
         key = hashlib.sha256(f"xchat:{auth_token}".encode()).hexdigest()[:16]
         async with self._lock:
             ctx = self._ctxs.pop(key, None)
+            self._ctx_proxy.pop(key, None)
             if ctx and self._ctx_use.get(id(ctx), 0) > 0:
                 self._dropped.add(ctx)
                 return
@@ -772,6 +814,7 @@ class XChatContextPool:
         async with self._lock:
             ctxs = list(self._ctxs.values())
             self._ctxs.clear()
+            self._ctx_proxy.clear()
             self._ctx_use.clear()
             dropped, self._dropped = list(self._dropped), set()
         for ctx in ctxs + dropped:

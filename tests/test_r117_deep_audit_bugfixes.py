@@ -516,3 +516,107 @@ async def test_user_by_id_clamp_mentions_validation_and_code88_429():
         raw=False,
     )
     assert r_429.status_code == 429
+
+
+# 21. Per-request X-Proxy-Url header middleware, SSRF validation, Playwright conversion, and ClientPool isolation
+@pytest.mark.asyncio
+async def test_request_proxy_middleware_and_client_pool_isolation():
+    from app.client_pool import ClientPool
+    from app.config import (
+        playwright_proxy_for_token,
+        proxy_for_token,
+        reset_request_proxy,
+        set_request_proxy,
+        validate_proxy_url,
+    )
+    from app.security import RequestProxyMiddleware
+
+    tok = "c" * 40
+    captured: list[tuple[Optional[str], Optional[dict]]] = []
+
+    async def downstream(scope, receive, send):
+        captured.append((proxy_for_token(tok), playwright_proxy_for_token(tok)))
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok", "more_body": False})
+
+    mw = RequestProxyMiddleware(downstream)
+
+    async def noop(*_a, **_kw):
+        return None
+
+    sent: list[dict] = []
+
+    async def cap_send(msg):
+        sent.append(msg)
+
+    # 1. Valid X-Proxy-Url sets proxy inside request & resets cleanly afterward
+    scope_proxy = {
+        "type": "http",
+        "headers": [(b"x-proxy-url", b"http://usr:s%40cret@proxy.example.com:8080")],
+    }
+    await mw(scope_proxy, noop, cap_send)
+    assert sent[0]["status"] == 200
+    assert captured[0][0] == "http://usr:s%40cret@proxy.example.com:8080"
+    assert captured[0][1] == {
+        "server": "http://proxy.example.com:8080",
+        "username": "usr",
+        "password": "s@cret",
+    }
+    # After request exits, ContextVar is reset (no leakage to direct callers)
+    assert proxy_for_token(tok) is None
+
+    # 2. Direct request (no header) stays direct
+    captured.clear()
+    sent.clear()
+    await mw({"type": "http", "headers": []}, noop, cap_send)
+    assert captured[0] == (None, None)
+
+    # 3. Explicit "direct" bypasses PROXY_LIST
+    with patch("app.config.PROXY_LIST", ("http://global.example.com:3128",)):
+        captured.clear()
+        await mw({"type": "http", "headers": [(b"x-proxy-url", b"direct")]}, noop, cap_send)
+        assert captured[0] == (None, None)
+
+    # 4. SSRF loopback / invalid scheme rejected with 400 (without echoing password)
+    for bad in (b"http://user:topsecret@127.0.0.1:8080", b"http://localhost:3128", b"ftp://proxy.example.com:21"):
+        sent.clear()
+        await mw({"type": "http", "headers": [(b"x-proxy-url", bad)]}, noop, cap_send)
+        assert sent[0]["status"] == 400
+        assert b"topsecret" not in sent[1]["body"]
+
+    # 5. ALLOW_REQUEST_PROXY=0 rejects with 403
+    with patch("app.security.ALLOW_REQUEST_PROXY", False):
+        sent.clear()
+        await mw(scope_proxy, noop, cap_send)
+        assert sent[0]["status"] == 403
+
+    # 6. ClientPool isolates direct vs proxied sessions for same token & invalidates both
+    pool = ClientPool()
+    created_kwargs: list[dict] = []
+
+    class _FakeSess:
+        async def close(self):
+            return None
+
+    def _fake_async_session(**kw):
+        created_kwargs.append(kw)
+        return _FakeSess()
+
+    with patch("app.client_pool.AsyncSession", side_effect=_fake_async_session):
+        s_direct, e_direct = await pool.acquire(tok)
+        await pool.release(e_direct)
+        ctx_tok = set_request_proxy(validate_proxy_url("http://proxy.example.com:8080"))
+        try:
+            s_proxy, e_proxy = await pool.acquire(tok)
+            await pool.release(e_proxy)
+        finally:
+            reset_request_proxy(ctx_tok)
+        assert s_direct is not s_proxy
+        assert "proxies" not in created_kwargs[0]
+        assert created_kwargs[1]["proxies"] == {
+            "http": "http://proxy.example.com:8080",
+            "https": "http://proxy.example.com:8080",
+        }
+        assert len(pool._cache) == 2
+        await pool.invalidate(tok)
+        assert len(pool._cache) == 0

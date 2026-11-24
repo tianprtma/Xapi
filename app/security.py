@@ -19,7 +19,15 @@ from starlette.datastructures import Headers
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from .config import ALLOWED_ORIGINS, ENABLE_RAW, MAX_BODY_SIZE
+from .config import (
+    ALLOW_REQUEST_PROXY,
+    ALLOWED_ORIGINS,
+    ENABLE_RAW,
+    MAX_BODY_SIZE,
+    reset_request_proxy,
+    set_request_proxy,
+    validate_proxy_url,
+)
 
 
 STRICT_CSP: bool = os.environ.get("STRICT_CSP", "0").strip().lower() in ("1", "true", "yes")
@@ -339,6 +347,62 @@ class ContentTypeValidationMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
+class RequestProxyMiddleware:
+    """Pure ASGI middleware: baca header `X-Proxy-Url` per-request ke ContextVar.
+
+    Memungkinkan tiap project klien (menfessllm, jkt48history, dll.) menentukan
+    proxy sendiri dari `.env` masing-masing tanpa mengubah `.env` Xapi.
+    Bila header tidak dikirim → fallback ke `PROXY_LIST` (atau direct jika kosong).
+    Nilai header tidak pernah dicatat ke log atau body error agar kredensial aman.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        headers = Headers(scope=scope)
+        raw_proxy = (headers.get("x-proxy-url") or "").strip()
+        if not raw_proxy:
+            await self.app(scope, receive, send)
+            return
+        if not ALLOW_REQUEST_PROXY:
+            import json as _json
+            from .errors import build_error
+            body = _json.dumps(
+                build_error("VALIDATION_INVALID_PARAM", param="X-Proxy-Url", reason="request proxy disabled")
+            ).encode()
+            await send({
+                "type": "http.response.start",
+                "status": 403,
+                "headers": [(b"content-type", b"application/json")],
+            })
+            await send({"type": "http.response.body", "body": body, "more_body": False})
+            return
+        try:
+            validated = validate_proxy_url(raw_proxy)
+        except ValueError as exc:
+            import json as _json
+            from .errors import build_error
+            body = _json.dumps(
+                build_error("VALIDATION_INVALID_PARAM", param="X-Proxy-Url", reason=str(exc))
+            ).encode()
+            await send({
+                "type": "http.response.start",
+                "status": 400,
+                "headers": [(b"content-type", b"application/json")],
+            })
+            await send({"type": "http.response.body", "body": body, "more_body": False})
+            return
+        tok = set_request_proxy(validated)
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            reset_request_proxy(tok)
+
+
 def install_security_middleware(app: FastAPI) -> None:
     """Wire security middlewares to the app. Call once after FastAPI init.
 
@@ -349,7 +413,9 @@ def install_security_middleware(app: FastAPI) -> None:
         4. QueryParamSanitizerMiddleware (scrub free-text query params)
         5. BodySizeLimitMiddleware    (reject big request early)
         6. RawModeKillSwitchMiddleware
+        7. RequestProxyMiddleware     (per-request X-Proxy-Url ContextVar)
     """
+    app.add_middleware(RequestProxyMiddleware)
     app.add_middleware(RawModeKillSwitchMiddleware)
     app.add_middleware(BodySizeLimitMiddleware)
     from .sanitize import QueryParamSanitizerMiddleware
@@ -364,6 +430,6 @@ def install_security_middleware(app: FastAPI) -> None:
             allow_origins=list(ALLOWED_ORIGINS),
             allow_credentials=False,
             allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-            allow_headers=["Authorization", "Content-Type", "X-Admin-Token"],
+            allow_headers=["Authorization", "Content-Type", "X-Admin-Token", "X-Proxy-Url"],
             max_age=600,
         )

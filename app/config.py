@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import contextvars
+import hashlib
+import ipaddress
 import json
 import os
 import random
 import secrets
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Optional
+from urllib.parse import unquote, urlparse
 
 # ──────────────────────────── GraphQL metadata ────────────────────────────
 
@@ -299,17 +303,102 @@ PROXY_LIST: tuple[str, ...] = tuple(
     p.strip() for p in _proxy_raw.split(",") if p.strip()
 ) if _proxy_raw else tuple()
 
+# Izinkan klien mengirim header `X-Proxy-Url` per-request agar tiap project
+# (menfessllm, jkt48history, dll.) mengatur proxy sendiri di `.env` masing-masing.
+# 0 = tolak header `X-Proxy-Url` (rekomendasi jika Xapi diekspos ke publik).
+ALLOW_REQUEST_PROXY: bool = os.environ.get("ALLOW_REQUEST_PROXY", "1").strip().lower() not in ("0", "false", "no")
+
+_DIRECT_PROXY_SENTINEL = "__direct__"
+_ALLOWED_PROXY_SCHEMES = frozenset({"http", "https", "socks5", "socks5h"})
+_REQUEST_PROXY_VAR: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "xapi_request_proxy", default=None
+)
+
+
+def validate_proxy_url(raw: str) -> str:
+    """Validasi URL proxy dari header `X-Proxy-Url` (tolak skema asing / loopback SSRF)."""
+    val = (raw or "").strip()
+    if not val:
+        raise ValueError("proxy URL kosong")
+    if any(ch in val for ch in ("\r", "\n", "\x00", " ", "\t")):
+        raise ValueError("proxy URL mengandung karakter terlarang")
+    if val.lower() in ("direct", "none"):
+        return _DIRECT_PROXY_SENTINEL
+    parsed = urlparse(val)
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in _ALLOWED_PROXY_SCHEMES:
+        raise ValueError("skema proxy harus http, https, socks5, atau socks5h")
+    host = (parsed.hostname or "").strip().lower()
+    if not host:
+        raise ValueError("host proxy tidak valid")
+    if host in ("localhost", "localhost.localdomain") or host.endswith(".localhost"):
+        raise ValueError("host proxy loopback tidak diizinkan")
+    try:
+        ip = ipaddress.ip_address(host)
+        if ip.is_loopback or ip.is_link_local or ip.is_unspecified or ip.is_multicast:
+            raise ValueError("alamat IP proxy loopback/link-local tidak diizinkan")
+    except ValueError as exc:
+        if "tidak diizinkan" in str(exc):
+            raise
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("port proxy tidak valid") from exc
+    if port is not None and not (1 <= port <= 65535):
+        raise ValueError("port proxy di luar rentang 1-65535")
+    return val
+
+
+def get_request_proxy() -> Optional[str]:
+    return _REQUEST_PROXY_VAR.get()
+
+
+def set_request_proxy(proxy_url: Optional[str]) -> contextvars.Token:
+    return _REQUEST_PROXY_VAR.set(proxy_url)
+
+
+def reset_request_proxy(tok: contextvars.Token) -> None:
+    _REQUEST_PROXY_VAR.reset(tok)
+
 
 def proxy_for_token(auth_token: str) -> str | None:
-    """Proxy deterministik per token — akun yang sama selalu lewat IP sama.
-
-    Pairing stabil bahkan setelah restart (hash token -> index PROXY_LIST).
+    """Resolve proxy aktif: override header `X-Proxy-Url` per-request menang,
+    lalu fallback ke `PROXY_LIST` deterministik per `auth_token`. None = direct.
     """
+    req_proxy = _REQUEST_PROXY_VAR.get()
+    if req_proxy == _DIRECT_PROXY_SENTINEL:
+        return None
+    if req_proxy:
+        return req_proxy
     if not PROXY_LIST:
         return None
-    import hashlib
     idx = int(hashlib.sha256(auth_token.encode()).hexdigest(), 16) % len(PROXY_LIST)
     return PROXY_LIST[idx]
+
+
+def playwright_proxy_for_token(auth_token: str) -> Optional[dict[str, str]]:
+    """Konversi `proxy_for_token(auth_token)` ke dict konfigurasi proxy Playwright."""
+    proxy_url = proxy_for_token(auth_token)
+    if not proxy_url:
+        return None
+    parsed = urlparse(proxy_url)
+    scheme = (parsed.scheme or "http").lower()
+    if scheme == "socks5h":
+        scheme = "socks5"
+    host = parsed.hostname or ""
+    if not host:
+        return None
+    if ":" in host and not host.startswith("["):
+        host_fmt = f"[{host}]"
+    else:
+        host_fmt = host
+    server = f"{scheme}://{host_fmt}:{parsed.port}" if parsed.port else f"{scheme}://{host_fmt}"
+    cfg: dict[str, str] = {"server": server}
+    if parsed.username is not None:
+        cfg["username"] = unquote(parsed.username)
+    if parsed.password is not None:
+        cfg["password"] = unquote(parsed.password)
+    return cfg
 
 
 def random_proxy() -> str | None:

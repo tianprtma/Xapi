@@ -10,10 +10,11 @@ to `CLIENT_POOL_MAX` to avoid memory blow-up, and expire idle sessions after
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Optional
 
 from curl_cffi.requests import AsyncSession
 
@@ -72,6 +73,14 @@ class ClientPool:
             cls._instance = cls()
         return cls._instance
 
+    @staticmethod
+    def _pool_key(auth_token: str, proxy: Optional[str]) -> str:
+        base = token_key(auth_token)
+        if not proxy:
+            return base
+        phash = hashlib.sha256(proxy.encode("utf-8")).hexdigest()[:12]
+        return f"{base}:p:{phash}"
+
     async def acquire(self, auth_token: str) -> tuple[AsyncSession, _Entry]:
         """Get or create a pooled session.
 
@@ -81,7 +90,8 @@ class ClientPool:
             `release(entry)` setelah selesai. `entry.in_use` sudah
             di-increment di sini di bawah pool lock.
         """
-        key = token_key(auth_token)
+        proxy = proxy_for_token(auth_token)
+        key = self._pool_key(auth_token, proxy)
         async with self._lock:
             now = time.time()
             # Expire stale entries first (skip entries currently in use)
@@ -98,7 +108,6 @@ class ClientPool:
                 # Build new session with deterministic browser profile (TLS + UA + sec-ch-ua) + proxy
                 prof = profile_for_token(auth_token)
                 headers = headers_for_token(auth_token)
-                proxy = proxy_for_token(auth_token)
                 kwargs: dict[str, Any] = dict(
                     cookies={"auth_token": auth_token, "ct0": gen_ct0()},
                     headers=headers,
@@ -141,18 +150,25 @@ class ClientPool:
             await entry.close()
 
     async def invalidate(self, auth_token: str) -> None:
-        """Drop session (e.g., on 401/403) so next request gets fresh TLS.
+        """Drop all pooled sessions for `auth_token` (direct & proxied variants).
 
-        If the session is currently in use, it is removed from the pool (so no
+        If a session is currently in use, it is removed from the pool (so no
         new caller can acquire it) and close() is deferred to release().
         """
-        key = token_key(auth_token)
+        base = token_key(auth_token)
+        prefix = f"{base}:p:"
+        to_close: list[_Entry] = []
         async with self._lock:
-            entry = self._cache.pop(key, None)
-            if entry and entry.in_use > 0:
-                entry.dropped = True  # holder terakhir menutup via release()
-                entry = None
-        if entry:
+            matching_keys = [k for k in self._cache if k == base or k.startswith(prefix)]
+            for k in matching_keys:
+                entry = self._cache.pop(k, None)
+                if not entry:
+                    continue
+                if entry.in_use > 0:
+                    entry.dropped = True  # holder terakhir menutup via release()
+                else:
+                    to_close.append(entry)
+        for entry in to_close:
             await entry.close()
 
     async def close_all(self) -> None:

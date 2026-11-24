@@ -280,15 +280,25 @@ async def login_with_auth_token(auth_token: str) -> dict[str, Any]:
                 "user": None,
             }
 
-        viewer_resp = await client.get(
-            VIEWER_URL,
-            headers=api_headers(ct0, auth_token),
-            params={
-                "variables": json.dumps({"withCommunitiesMemberships": True}),
-                "features": json.dumps(VIEWER_FEATURES),
-                "fieldToggles": json.dumps(VIEWER_FIELD_TOGGLES),
-            },
-        )
+        try:
+            viewer_resp = await client.get(
+                VIEWER_URL,
+                headers=api_headers(ct0, auth_token),
+                params={
+                    "variables": json.dumps({"withCommunitiesMemberships": True}),
+                    "features": json.dumps(VIEWER_FEATURES),
+                    "fieldToggles": json.dumps(VIEWER_FIELD_TOGGLES),
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "status": "error",
+                "http_status": 502,
+                "error": f"viewer request failed: {type(exc).__name__}: {exc}",
+                "cookies": {},
+                "tokens": {"bearer": WEB_BEARER, "ct0": ct0, "auth_token": auth_token},
+                "user": None,
+            }
 
         jar = {c.name: c.value for c in client.cookies.jar}
         ct0 = jar.get("ct0", ct0)

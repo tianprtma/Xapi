@@ -230,7 +230,7 @@ async def _rest_call_once(
         except WarmNetworkError as e:
             return {
                 "status": "error",
-                "http_status": 502,
+                "http_status": getattr(e, "http_status", 502),
                 "error": f"warm-up failed: {e.message}",
                 "data": None,
             }
@@ -338,7 +338,7 @@ async def _dm_call_once(
         except WarmNetworkError as e:
             return {
                 "status": "error",
-                "http_status": 502,
+                "http_status": getattr(e, "http_status", 502),
                 "error": f"warm-up failed: {e.message}",
                 "data": None,
             }
@@ -577,6 +577,13 @@ async def media_upload(
         try:
             return await _upload_chunks(
                 client, base_headers, file_bytes, media_type, media_category, max_poll_seconds=timeout)
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "status": "error",
+                "http_status": 502,
+                "error": f"upload failed: {type(exc).__name__}: {exc}",
+                "data": None,
+            }
         finally:
             client.timeout = old_timeout
 

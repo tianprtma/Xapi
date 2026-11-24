@@ -330,18 +330,20 @@ def validate_proxy_url(raw: str) -> str:
     if scheme not in _ALLOWED_PROXY_SCHEMES:
         raise ValueError("skema proxy harus http, https, socks5, atau socks5h")
     host = (parsed.hostname or "").strip().lower()
-    if not host:
+    host_clean = host.rstrip(".")
+    if not host_clean:
         raise ValueError("host proxy tidak valid")
-    if host in ("localhost", "localhost.localdomain") or host.endswith(".localhost"):
+    if host_clean in ("localhost", "localhost.localdomain") or host_clean.endswith(".localhost"):
         raise ValueError("host proxy loopback tidak diizinkan")
+    ip_candidate = host_clean.split("%", 1)[0]
     parsed_ip = None
     try:
-        parsed_ip = ipaddress.ip_address(host)
+        parsed_ip = ipaddress.ip_address(ip_candidate)
     except ValueError:
         # Tangkap format IPv4 non-kanonik (integer `2130706433`, hex `0x7f000001`,
         # oktal `0177.0.0.1`, shorthand `127.1`) yang diterima libcurl/OS.
         try:
-            parsed_ip = ipaddress.IPv4Address(socket.inet_aton(host))
+            parsed_ip = ipaddress.IPv4Address(socket.inet_aton(ip_candidate))
         except OSError:
             parsed_ip = None
     if parsed_ip is not None:

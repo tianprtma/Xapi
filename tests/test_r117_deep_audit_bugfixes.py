@@ -738,3 +738,75 @@ async def test_media_upload_direct_403_fallback_and_dm_media_proxy_errors():
     ):
         r502 = await v2_dm_media_proxy("123", "456", "img.jpg", authorization="Bearer " + tok, auth_token=None)
     assert r502.status_code == 502
+
+
+# ── 25. Pass 5: validate_proxy_url trailing-dot & IPv6 zone-ID SSRF guards ──
+
+def test_validate_proxy_url_blocks_trailing_dot_and_ipv6_zone_ssrf():
+    from app.config import validate_proxy_url
+
+    for bad in (
+        "http://localhost.:8080",
+        "http://sub.localhost.:8080",
+        "http://127.0.0.1.:8080",
+        "http://[::1%25lo0]:8080",
+        "http://[fe80::1%25eth0]:8080",
+        "http://...:8080",
+    ):
+        with pytest.raises(ValueError):
+            validate_proxy_url(bad)
+
+
+# ── 26. Pass 5: WarmNetworkError 429 preservation & 502 error handling ──
+
+@pytest.mark.asyncio
+async def test_pass5_network_error_and_warm_429_preservation():
+    from contextlib import asynccontextmanager
+    from app.auth import WarmNetworkError, login_with_auth_token
+    from app.clients import _dm_call_once, _rest_call_once, media_upload
+    from session_cache import SessionStore
+
+    tok = "a" * 40
+    await SessionStore.get().invalidate(tok)
+
+    class _ErrClient:
+        cookies = MagicMock(jar=[])
+        timeout = 20.0
+        async def get(self, *a, **kw):
+            raise ConnectionResetError("proxy reset")
+        async def close(self):
+            pass
+
+    @asynccontextmanager
+    async def _fake_pooled(_t):
+        yield _ErrClient()
+
+    # login_with_auth_token catches viewer GET network errors -> 502 (not 500)
+    with (
+        patch("app.auth.pooled_client", _fake_pooled),
+        patch("app.auth.warm_session", AsyncMock(return_value=("ct0val", {}))),
+    ):
+        login_res = await login_with_auth_token(tok)
+    assert login_res["status"] == "error"
+    assert login_res["http_status"] == 502
+
+    # _rest_call_once & _dm_call_once preserve WarmNetworkError(http_status=429)
+    with (
+        patch("app.clients.pooled_client", _fake_pooled),
+        patch("app.clients.warm_session", AsyncMock(side_effect=WarmNetworkError("rate limited", http_status=429))),
+    ):
+        r_rest = await _rest_call_once("blocks/create.json", tok)
+        r_dm = await _dm_call_once("inbox_initial_state.json", tok)
+    assert r_rest["http_status"] == 429
+    assert r_dm["http_status"] == 429
+
+    # media_upload catches pooled _upload_chunks network error -> 502 (not 500)
+    with (
+        patch("app.clients.MEDIA_PROXY_EXEMPT", False),
+        patch("app.clients.pooled_client", _fake_pooled),
+        patch("app.clients.warm_session", AsyncMock(return_value=("ct0val", {}))),
+        patch("app.clients._upload_chunks", AsyncMock(side_effect=TimeoutError("proxy timeout"))),
+    ):
+        up_res = await media_upload(tok, b"abc", "image/jpeg")
+    assert up_res["status"] == "error"
+    assert up_res["http_status"] == 502

@@ -145,13 +145,15 @@ async def v2media_upload(
             status_code=401,
             content=format_error("Unauthorized", str(result.get("error"))[:500], "unauthorized", 401),
         )
+    raw_st = result.get("http_status")
+    err_status = raw_st if isinstance(raw_st, int) and raw_st >= 400 else 502
     return JSONResponse(
-        status_code=result.get("http_status") or 502,
+        status_code=err_status,
         content=format_error(
             "Upload Failed",
             str(result.get("error"))[:1000],
             "upload_error",
-            result.get("http_status") or 502,
+            err_status,
         ),
     )
 

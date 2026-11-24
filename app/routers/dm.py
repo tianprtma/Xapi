@@ -481,11 +481,13 @@ async def _enrich_conv_events_with_e2ee(
 
     # Pastikan urutan decrypted_events selaras terbaru-dulu dengan `events`
     # (OPFS project_dm_entries_to_events mengembalikan urutan kronologis).
+    # Event tanpa timestamp (`None`) ditaruh di BELAKANG (0 < 1 pada reverse=True)
+    # dengan mempertahankan urutan asli `0, 1, 2...` (`-idx` descending).
     dec_indexed = list(enumerate(decrypted_events))
     if any(_event_epoch_sec(d) is not None for _, d in dec_indexed):
         dec_indexed.sort(
             key=lambda item: (
-                1 if _event_epoch_sec(item[1]) is None else 0,
+                0 if _event_epoch_sec(item[1]) is None else 1,
                 -(item[0]) if _event_epoch_sec(item[1]) is None else _event_epoch_sec(item[1]),
             ),
             reverse=True,
@@ -497,11 +499,22 @@ async def _enrich_conv_events_with_e2ee(
         new_events = dec_newest_first[:max_results]
     else:
         # Match exact event IDs first, including plaintext UUID rows with media
-        # pending. Positional fallback is reserved for encrypted placeholders;
-        # otherwise a split/outgoing DOM row can shift media onto the wrong DM.
+        # pending. Pre-reserve exact ID indices so fuzzy Pass A/B can never
+        # steal a decrypted row owned by another exact-ID event, and track
+        # consumption by index so empty IDs never collide.
         new_events = []
-        dec_by_id = {str(d.get("id")): d for d in dec_newest_first if d.get("id")}
-        consumed_dec_ids: set[str] = set()
+        dec_idx_by_id: dict[str, int] = {}
+        for idx_d, d in enumerate(dec_newest_first):
+            did = str(d.get("id") or "")
+            if did and did not in dec_idx_by_id:
+                dec_idx_by_id[did] = idx_d
+        exact_reserved_indices: set[int] = set()
+        for ev_scan in events:
+            if ev_scan.get("event_type") in (None, "MessageCreate"):
+                scan_eid = str(ev_scan.get("id") or "")
+                if scan_eid and scan_eid in dec_idx_by_id:
+                    exact_reserved_indices.add(dec_idx_by_id[scan_eid])
+        consumed_dec_indices: set[int] = set()
         msg_idx = 0
         for ev in events:
             is_msg = ev.get("event_type") in (None, "MessageCreate")
@@ -513,18 +526,23 @@ async def _enrich_conv_events_with_e2ee(
                 ev.get("_xchat_encrypted")
                 or (ev.get("text") or "").strip() == "[XChat E2EE Encrypted Message]"
             )
-            d_ev = dec_by_id.get(eid) if eid else None
-            if d_ev is None and eid and not eid.isdigit() and not is_encrypted:
+            matched_idx: Optional[int] = None
+            if eid and eid in dec_idx_by_id:
+                cand_i = dec_idx_by_id[eid]
+                if cand_i not in consumed_dec_indices:
+                    matched_idx = cand_i
+            if matched_idx is None and eid and not eid.isdigit() and not is_encrypted:
                 candidates = [
-                    d for d in dec_newest_first
-                    if str(d.get("id") or "") not in consumed_dec_ids
+                    idx_d for idx_d, d in enumerate(dec_newest_first)
+                    if idx_d not in consumed_dec_indices
+                    and idx_d not in exact_reserved_indices
                     and not d.get("is_outgoing")
                     and str(d.get("sender_id") or "") == str(ev.get("sender_id") or "")
                     and (d.get("text") or "").strip() == (ev.get("text") or "").strip()
                 ]
                 if len(candidates) == 1:
-                    d_ev = candidates[0]
-            if d_ev is None and is_encrypted:
+                    matched_idx = candidates[0]
+            if matched_idx is None and is_encrypted:
                 ev_sender = str(ev.get("sender_id") or "")
                 ev_ts = _event_epoch_sec(ev)
 
@@ -540,35 +558,39 @@ async def _enrich_conv_events_with_e2ee(
                 # yang cocok agar pesan baru/balasan bot di OPFS tidak menggeser
                 # atau menimpa menfess terenkripsi pengirim lain.
                 if ev_ts is not None:
-                    best_cand = None
-                    best_diff = None
-                    for cand in dec_newest_first:
-                        cand_id = str(cand.get("id") or "")
-                        if cand_id in consumed_dec_ids or not _sender_ok(cand):
+                    best_idx: Optional[int] = None
+                    best_diff: Optional[float] = None
+                    for idx_d, cand in enumerate(dec_newest_first):
+                        if idx_d in consumed_dec_indices or idx_d in exact_reserved_indices or not _sender_ok(cand):
                             continue
                         cand_ts = _event_epoch_sec(cand)
                         if cand_ts is None:
                             continue
                         diff = abs(ev_ts - cand_ts)
                         if diff <= 300.0 and (best_diff is None or diff < best_diff):
-                            best_cand = cand
+                            best_idx = idx_d
                             best_diff = diff
-                    if best_cand is not None:
-                        d_ev = best_cand
+                    if best_idx is not None:
+                        matched_idx = best_idx
 
                 # Pass B: fallback posisional (untuk baris DOM tanpa timestamp)
                 # dengan tetap menjaga kecocokan sender_id dan batas selisih 300s.
-                if d_ev is None and msg_idx < len(dec_newest_first):
+                if matched_idx is None and msg_idx < len(dec_newest_first):
                     cand = dec_newest_first[msg_idx]
-                    cand_id = str(cand.get("id") or "")
                     cand_ts = _event_epoch_sec(cand)
                     ts_compatible = (
                         ev_ts is None
                         or cand_ts is None
                         or abs(ev_ts - cand_ts) <= 300.0
                     )
-                    if cand_id not in consumed_dec_ids and ts_compatible and _sender_ok(cand):
-                        d_ev = cand
+                    if (
+                        msg_idx not in consumed_dec_indices
+                        and msg_idx not in exact_reserved_indices
+                        and ts_compatible
+                        and _sender_ok(cand)
+                    ):
+                        matched_idx = msg_idx
+            d_ev = dec_newest_first[matched_idx] if matched_idx is not None else None
             msg_idx += 1
             is_uuid_candidate = bool(eid and not eid.isdigit())
             if d_ev is None:
@@ -610,11 +632,12 @@ async def _enrich_conv_events_with_e2ee(
             merged.pop("_xchat_encrypted", None)
             merged.pop("encrypted_text", None)
             new_events.append(merged)
-            consumed_dec_ids.add(str(d_ev.get("id") or ""))
+            if matched_idx is not None:
+                consumed_dec_indices.add(matched_idx)
         # Append only decrypted rows not already represented by an exact
         # GraphQL event, taking NEWEST-first (`dec_newest_first`) so recent
         # OPFS messages are never truncated behind older history.
-        extras = [d for d in dec_newest_first if str(d.get("id") or "") not in consumed_dec_ids]
+        extras = [d for idx_d, d in enumerate(dec_newest_first) if idx_d not in consumed_dec_indices]
         if extras and len(new_events) < max_results:
             new_events.extend(extras[: max_results - len(new_events)])
 
@@ -845,7 +868,15 @@ async def v2_chat_requests(
 
     # Also query REST 1.1 untrusted & untrusted_low_quality timelines so plaintext requests are included
     # max_id WAJIB hadir (nilai None diterima) — tanpa key ini X menolak 400.
-    params: dict[str, Any] = {"max_id": pagination_token}
+    rest_max_id: Optional[str] = pagination_token
+    if isinstance(rest_max_id, str) and rest_max_id.strip().startswith("{"):
+        try:
+            parsed_tok = json.loads(rest_max_id)
+            if isinstance(parsed_tok, dict) and parsed_tok.get("cursor_id") is not None:
+                rest_max_id = str(parsed_tok["cursor_id"])
+        except ValueError:
+            pass
+    params: dict[str, Any] = {"max_id": rest_max_id}
     rest_res = await dm_call("dm/inbox_timeline/untrusted.json", tok, params=params)
     if rest_res.get("status") == "ok" and include_low_quality and not pagination_token:
         lq_res = await dm_call("dm/inbox_timeline/untrusted_low_quality.json", tok, params={"max_id": None})
@@ -980,7 +1011,7 @@ async def v2_dm_events(
             # paham bagian cursor_id-nya.
             params["cursor"] = pagination_token.split("|", 1)[0]
         rest_res = await dm_call("dm/user_updates.json", tok, params=params)
-        if rest_res.get("status") == "ok" and include_requests:
+        if rest_res.get("status") == "ok" and include_requests and not pagination_token:
             rest_data = dict(rest_res.get("data") or {})
             base_inbox = dict(rest_data.get("inbox_initial_state") or {})
             base_entries = list(base_inbox.get("entries") or [])

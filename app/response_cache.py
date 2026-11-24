@@ -115,8 +115,14 @@ class ResponseCache:
             return
         # Do not cache GraphQL responses that returned top-level errors without valid data
         raw_data = payload.get("data")
-        if isinstance(raw_data, dict) and raw_data.get("errors") and not raw_data.get("data"):
-            return
+        if isinstance(raw_data, dict) and raw_data.get("errors"):
+            inner_data = raw_data.get("data")
+            has_real_data = (
+                isinstance(inner_data, dict)
+                and any(v not in ({}, [], None) for v in inner_data.values())
+            ) or (not isinstance(inner_data, dict) and bool(inner_data))
+            if not has_real_data:
+                return
         key = _key(operation, variables, auth_token)
         async with self._lock:
             self._cache[key] = (time.time(), payload)

@@ -70,19 +70,21 @@ def sanitize_search_query(value: Optional[str]) -> str:
     return value
 
 
-def sanitize_url_param(value: Optional[str]) -> Optional[str]:
-    """URL-decode and sanitize a path/query parameter.
+def sanitize_url_param(value: Optional[str], *, decode: bool = True) -> Optional[str]:
+    """URL-decode (optional) and sanitize a path/query parameter.
 
     Strips null bytes, control characters, and length-limited.
     Returns None if input is empty after sanitization.
     """
     if value is None:
         return None
-    # URL-decode
-    try:
-        decoded = urllib.parse.unquote(value, errors="strict")
-    except (ValueError, UnicodeDecodeError):
-        return None
+    if decode:
+        try:
+            decoded = urllib.parse.unquote(value, errors="strict")
+        except (ValueError, UnicodeDecodeError):
+            return None
+    else:
+        decoded = value
     # Strip null bytes + control chars (except whitespace)
     cleaned = decoded.replace("\x00", "")
     cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", cleaned)
@@ -151,13 +153,28 @@ class QueryParamSanitizerMiddleware:
             values = parsed[name]
             cleaned = []
             for v in values:
-                sv = sanitize_url_param(v)
+                # parse_qs already URL-decoded `v` — do NOT double-unquote it,
+                # otherwise valid literals like `%2520`, `%25ff`, `%252B` get
+                # corrupted or dropped.
+                sv = sanitize_url_param(v, decode=False)
                 if sv is not None:
                     if sv != v:
                         mutated = True
                     cleaned.append(sv)
+                elif v != "":
+                    # Originally non-empty value reduced to empty (all control chars/whitespace)
+                    import json as _json
+                    from app.errors import build_error as _build_error
+                    body = _json.dumps(_build_error("VALIDATION_INVALID_PARAM", param=name, reason="empty after sanitization")).encode()
+                    await send({
+                        "type": "http.response.start",
+                        "status": 400,
+                        "headers": [(b"content-type", b"application/json")],
+                    })
+                    await send({"type": "http.response.body", "body": body, "more_body": False})
+                    return
                 else:
-                    mutated = True  # value became empty → drop this occurrence
+                    mutated = True  # originally empty value → drop this occurrence
             if cleaned:
                 parsed[name] = cleaned
             else:

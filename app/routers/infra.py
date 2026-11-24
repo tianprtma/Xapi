@@ -84,12 +84,18 @@ async def login(
     tok = extract_bearer(authorization, auth_token)
     try:
         result = await login_with_auth_token(tok)
-    except httpx.HTTPError:
+    except Exception:  # noqa: BLE001
         return JSONResponse(
             status_code=502,
             content={"status": "error", "error": "Upstream request failed"},
         )
-    code = 200 if result["status"] == "valid" else 401
+    if result["status"] == "valid":
+        code = 200
+    elif result["status"] == "error":
+        raw_st = result.get("http_status")
+        code = raw_st if isinstance(raw_st, int) and raw_st >= 400 else 502
+    else:
+        code = 401
     # Strip sensitive cookies jar — only return user profile + minimal tokens
     safe = {
         "status": result["status"],
@@ -141,7 +147,7 @@ async def admin_stats(
         "tid_provider": await TIDProvider.get().stats(),
         "client_pool": await ClientPool.get().stats(),
         "response_cache": await ResponseCache.get().stats(),
-        "xchat_context_pool": await __import__("playwright_search", fromlist=["XChatContextPool"]).XChatContextPool.get().stats(),
+        "xchat_context_pool": __import__("playwright_search", fromlist=["XChatContextPool"]).XChatContextPool.get().stats(),
         "rate_limiter": rl_stats,
         "routes": {
             "v2_total": len(routes_summary["implemented"]) + len(routes_summary["stub_501"]),

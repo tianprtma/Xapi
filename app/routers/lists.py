@@ -84,8 +84,8 @@ class UpdateListBody(BaseModel):
 
 
 class ListMemberBody(BaseModel):
-    list_id: str
-    user_id: str
+    list_id: Optional[str] = None
+    user_id: str = Field(..., pattern=r"^\d+$")
 
 
 class ListFollowBody(BaseModel):

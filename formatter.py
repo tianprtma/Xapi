@@ -795,15 +795,20 @@ def _dm_ts_to_iso(ts: Any) -> Optional[str]:
     """REST 1.1 / GraphQL DM timestamp (ms epoch string/int or ISO string) → ISO 8601."""
     if not ts:
         return None
-    if isinstance(ts, str) and "T" in ts and ts.endswith("Z"):
-        # Normalisasi ISO → format milidetik seragam. Sort leksikografis di
-        # format_dm_events hanya benar kalau semua created_at satu format:
-        # "10:00:00Z" > "10:00:00.500Z" secara string (Z 0x5A > . 0x2E)
-        # padahal kronologisnya .000 < .500.
+    if isinstance(ts, str) and "T" in ts:
+        # Normalisasi ISO (termasuk Z, +00:00, +07:00, pecahan 1-6 digit, atau naive)
+        # → format milidetik UTC seragam agar sort leksikografis selalu akurat.
         try:
+            import re as _re
             from datetime import datetime, timezone
 
-            dt = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(timezone.utc)
+            iso_s = ts.strip().replace("Z", "+00:00")
+            iso_s = _re.sub(r"\.(\d{1,6})(?=[+-]|$)", lambda m: "." + m.group(1).ljust(6, "0"), iso_s)
+            dt = datetime.fromisoformat(iso_s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            else:
+                dt = dt.astimezone(timezone.utc)
             return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
         except ValueError:
             return ts
@@ -814,7 +819,7 @@ def _dm_ts_to_iso(ts: Any) -> Optional[str]:
         # Handle seconds vs milliseconds epoch
         if ms < 10_000_000_000:
             ms *= 1000
-        dt = datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+        dt = datetime.fromtimestamp(ms // 1000, tz=timezone.utc)
         return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{ms % 1000:03d}Z"
     except (ValueError, TypeError):
         return str(ts)
@@ -1512,7 +1517,8 @@ def _extract_gql_dm_conversations_and_events(
         if container.get("__typename") == "XChatGetMessageRequestsPageResponse":
             rc = container.get("cursor")
             if (
-                isinstance(rc, dict)
+                not next_token
+                and isinstance(rc, dict)
                 and rc.get("__typename") == "XChatGetMessageRequestsPageContinueCursor"
                 and rc.get("cursor_id")
             ):
@@ -1895,7 +1901,12 @@ def format_dm_conversations(payload: dict[str, Any], max_results: Optional[int] 
     for ev in events:
         cid = ev.get("dm_conversation_id")
         ck = _canon_conv_key(cid)
-        if ck and ck not in latest_by_conv:
+        if not ck:
+            continue
+        existing = latest_by_conv.get(ck)
+        if not existing:
+            latest_by_conv[ck] = ev
+        elif existing.get("event_type") != "MessageCreate" and ev.get("event_type") == "MessageCreate":
             latest_by_conv[ck] = ev
 
     conv_list: list[dict[str, Any]] = []

@@ -112,20 +112,23 @@ class BodySizeLimitMiddleware:
             await self.app(scope, receive, send)
             return
 
+        class _BodyTooLargeError(Exception):
+            pass
+
         received = 0
         too_large = False
 
         async def wrapped_receive() -> Message:
             nonlocal received, too_large
             if too_large:
-                return {"type": "http.request", "body": b"", "more_body": False}
+                raise _BodyTooLargeError()
             msg = await receive()
             if msg["type"] == "http.request":
                 body = msg.get("body", b"") or b""
                 received += len(body)
                 if received > cap:
                     too_large = True
-                    return {"type": "http.request", "body": b"", "more_body": False}
+                    raise _BodyTooLargeError()
             return msg
 
         response_started = False
@@ -144,7 +147,13 @@ class BodySizeLimitMiddleware:
                 response_started = True
             await send(msg)
 
-        await self.app(scope, wrapped_receive, wrapped_send)
+        try:
+            await self.app(scope, wrapped_receive, wrapped_send)
+        except _BodyTooLargeError:
+            if not response_started and not sent_too_large:
+                response_started = True
+                sent_too_large = True
+                await _send_too_large(send, cap)
 
 
 def _too_large(max_bytes: int) -> JSONResponse:
@@ -270,7 +279,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
             if bucket.tokens < 1.0:
                 deficit = max(0.0, 1.0 - bucket.tokens)
-                retry_after = max(5, int(deficit / self._rate))
+                retry_after = max(5, int(deficit / self._rate)) if self._rate > 0 else 60
                 from .errors import build_error
                 return JSONResponse(
                     status_code=429,

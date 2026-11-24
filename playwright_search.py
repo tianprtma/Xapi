@@ -109,6 +109,10 @@ class _InFlightCoalescer:
             # Waiter path: block until executor finishes, then read from flight
             await flight.event.wait()
             if flight.exc is not None:
+                if isinstance(flight.exc, asyncio.CancelledError):
+                    # Owner was cancelled (e.g. client disconnect) — take over execution
+                    # rather than cascading CancelledError into an innocent waiter.
+                    return await self.run(key, fn)
                 raise flight.exc
             if flight.result is None:
                 raise RuntimeError(f"coalesced call for {key} failed upstream")
@@ -143,12 +147,18 @@ def _fetch_key(auth_token: str, navigate_url: str, match_path: str | list[str], 
     return f"fetch:{token_key(auth_token)}:{navigate_url}:{mp}:{cs}"
 
 
-def _click_key(auth_token: str, navigate_url: str, click_selector: str, match_response_substr: str | list[str] | None = None) -> str:
+def _click_key(
+    auth_token: str,
+    navigate_url: str,
+    click_selector: str,
+    match_response_substr: str | list[str] | None = None,
+    confirm_selector: str | None = None,
+) -> str:
     from app.config import token_key
     mr = ""
     if match_response_substr:
         mr = match_response_substr if isinstance(match_response_substr, str) else "|".join(sorted(match_response_substr))
-    return f"click:{token_key(auth_token)}:{navigate_url}:{click_selector}:{mr}"
+    return f"click:{token_key(auth_token)}:{navigate_url}:{click_selector}:{confirm_selector or ''}:{mr}"
 
 
 class PlaywrightPool:
@@ -196,6 +206,12 @@ class PlaywrightPool:
             if self._browser is not None and self._browser.is_connected():
                 return self._browser
             if self._browser is not None:
+                # Clear pooled contexts bound to the dead/restarting browser
+                # so ContextPool.acquire() never hands back orphaned contexts.
+                if ContextPool._instance is not None:
+                    ContextPool._instance._ctxs.clear()
+                    ContextPool._instance._ctx_use.clear()
+                    ContextPool._instance._dropped.clear()
                 try:
                     await self._browser.close()
                 except Exception:  # noqa: BLE001
@@ -264,6 +280,12 @@ class PlaywrightPool:
     async def close(self) -> None:
         async with self._lock:
             if self._browser is not None:
+                # Clear pooled contexts bound to the dead/restarting browser
+                # so ContextPool.acquire() never hands back orphaned contexts.
+                if ContextPool._instance is not None:
+                    ContextPool._instance._ctxs.clear()
+                    ContextPool._instance._ctx_use.clear()
+                    ContextPool._instance._dropped.clear()
                 try:
                     await self._browser.close()
                 except Exception:  # noqa: BLE001
@@ -294,57 +316,64 @@ async def _new_context(browser: Browser, auth_token: str) -> BrowserContext:
             "sec-ch-ua-platform": prof["sec_ch_ua_platform"],
         },
     )
-    # Stealth init script: sembunyikan indikator headless Chrome / Playwright
-    await context.add_init_script(
-        """
-        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-        window.chrome = window.chrome || { runtime: {}, loadTimes: function() {}, csi: function() {}, app: {} };
-        """
-    )
-    # ct0 — X CSRF token, needed by ton.twitter.com alongside auth_token
-    _ct0 = gen_ct0()
-    await context.add_cookies(
-        [
-            {
-                "name": "auth_token",
-                "value": auth_token,
-                "domain": ".x.com",
-                "path": "/",
-                "httpOnly": True,
-                "secure": True,
-                "sameSite": "None",
-            },
-            {
-                "name": "auth_token",
-                "value": auth_token,
-                "domain": ".twitter.com",
-                "path": "/",
-                "httpOnly": True,
-                "secure": True,
-                "sameSite": "None",
-            },
-            {
-                "name": "ct0",
-                "value": _ct0,
-                "domain": ".x.com",
-                "path": "/",
-                "httpOnly": False,
-                "secure": True,
-                "sameSite": "Lax",
-            },
-            {
-                "name": "ct0",
-                "value": _ct0,
-                "domain": ".twitter.com",
-                "path": "/",
-                "httpOnly": False,
-                "secure": True,
-                "sameSite": "None",
-            },
-        ]
-    )
+    try:
+        # Stealth init script: sembunyikan indikator headless Chrome / Playwright
+        await context.add_init_script(
+            """
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+            window.chrome = window.chrome || { runtime: {}, loadTimes: function() {}, csi: function() {}, app: {} };
+            """
+        )
+        # ct0 — X CSRF token, needed by ton.twitter.com alongside auth_token
+        _ct0 = gen_ct0()
+        await context.add_cookies(
+            [
+                {
+                    "name": "auth_token",
+                    "value": auth_token,
+                    "domain": ".x.com",
+                    "path": "/",
+                    "httpOnly": True,
+                    "secure": True,
+                    "sameSite": "None",
+                },
+                {
+                    "name": "auth_token",
+                    "value": auth_token,
+                    "domain": ".twitter.com",
+                    "path": "/",
+                    "httpOnly": True,
+                    "secure": True,
+                    "sameSite": "None",
+                },
+                {
+                    "name": "ct0",
+                    "value": _ct0,
+                    "domain": ".x.com",
+                    "path": "/",
+                    "httpOnly": False,
+                    "secure": True,
+                    "sameSite": "Lax",
+                },
+                {
+                    "name": "ct0",
+                    "value": _ct0,
+                    "domain": ".twitter.com",
+                    "path": "/",
+                    "httpOnly": False,
+                    "secure": True,
+                    "sameSite": "None",
+                },
+            ]
+        )
+    except BaseException:
+        try:
+            await context.close()
+        except Exception:  # noqa: BLE001
+            pass
+        raise
     return context
 
 
@@ -379,9 +408,13 @@ class ContextPool:
             entry = self._ctxs.get(auth_token)
             if entry:
                 ctx, _ = entry
-                # health check: closed contexts have empty pages collection raise
+                # health check: verify browser is still connected (ctx.pages alone
+                # returns [] on a closed context/browser without raising).
                 try:
                     _ = ctx.pages
+                    br = getattr(ctx, "browser", None)
+                    if br is not None and hasattr(br, "is_connected") and not br.is_connected():
+                        raise RuntimeError("browser disconnected")
                     self._ctxs[auth_token] = (ctx, _t.time())
                     self._ctx_use[id(ctx)] = self._ctx_use.get(id(ctx), 0) + 1
                     return ctx
@@ -392,7 +425,7 @@ class ContextPool:
             browser = await PlaywrightPool.get().ensure()
             ctx = await _new_context(browser, auth_token)
 
-            if len(self._ctxs) >= self.MAX:
+            while len(self._ctxs) >= self.MAX:
                 # Evict context idle terlama — skip yang sedang dipakai;
                 # pool boleh melebihi MAX sementara daripada menutup context
                 # yang sedang dipakai coroutine lain.
@@ -400,15 +433,16 @@ class ContextPool:
                     (k, ts) for k, (c, ts) in self._ctxs.items()
                     if self._ctx_use.get(id(c), 0) == 0
                 ]
-                if candidates:
-                    oldest = min(candidates, key=lambda kv: kv[1])[0]
-                    old_ctx, _ = self._ctxs.pop(oldest)
-                    self._ctx_use.pop(id(old_ctx), None)
-                    self._dropped.discard(old_ctx)
-                    try:
-                        await old_ctx.close()
-                    except Exception:  # noqa: BLE001
-                        pass
+                if not candidates:
+                    break
+                oldest = min(candidates, key=lambda kv: kv[1])[0]
+                old_ctx, _ = self._ctxs.pop(oldest)
+                self._ctx_use.pop(id(old_ctx), None)
+                self._dropped.discard(old_ctx)
+                try:
+                    await old_ctx.close()
+                except Exception:  # noqa: BLE001
+                    pass
 
             self._ctxs[auth_token] = (ctx, _t.time())
             self._ctx_use[id(ctx)] = self._ctx_use.get(id(ctx), 0) + 1
@@ -567,22 +601,23 @@ class XChatContextPool:
         from app.config import gen_ct0, profile_for_token
 
         key = hashlib.sha256(f"xchat:{auth_token}".encode()).hexdigest()[:16]
-        # ct0 STABIL per profil — X mengikat sesi unlock E2EE ke identitas
-        # session (ct0); menggantinya tiap acquire memicu gate PIN ulang.
         profile_dir = _xchat_profile_dir(auth_token)
         ct0_file = profile_dir / "ct0.txt"
-        ct0 = None
-        if ct0_file.is_file():
-            ct0 = ct0_file.read_text().strip() or None
-        if not ct0:
-            ct0 = gen_ct0()
-            profile_dir.mkdir(parents=True, exist_ok=True)
-            ct0_file.write_text(ct0)
 
         async with self._lock:
+            # ct0 STABIL per profil — baca/tulis di dalam lock agar concurrent
+            # first-time acquire tidak menulis ct0 yang saling bentrok.
+            ct0 = None
+            if ct0_file.is_file():
+                ct0 = ct0_file.read_text().strip() or None
+            if not ct0:
+                ct0 = gen_ct0()
+                profile_dir.mkdir(parents=True, exist_ok=True)
+                ct0_file.write_text(ct0)
+
             ctx = self._ctxs.get(key)
             if ctx is not None:
-                # health check: context yang sudah mati melempar di .pages
+                # health check: context yang sudah mati melempar di .pages / add_cookies
                 try:
                     _ = ctx.pages
                     await _apply_session_cookies(ctx, auth_token, ct0)
@@ -630,47 +665,56 @@ class XChatContextPool:
                     f"profil terkunci oleh proses lain (server & fetch_dm_pin.py "
                     f"bareng?) atau Chromium gagal launch: {type(exc).__name__}: {exc}"
                 ) from exc
-            await ctx.add_init_script(
-                """
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-                Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
-                Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
-                Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 0 });
-                window.chrome = window.chrome || { runtime: {}, loadTimes: function() {}, csi: function() {}, app: {} };
-                // R106: spoof WebGL renderer — SwiftShader (software headless) adalah
-                // sinyal anti-bot kuat; X chat menolak me-render konten dengannya.
-                const spoofGL = (proto) => {
-                    if (!proto) return;
-                    const orig = proto.getParameter;
-                    proto.getParameter = function(p) {
-                        const dbg = this.getExtension && this.getExtension('WEBGL_debug_renderer_info');
-                        if (dbg && p === dbg.UNMASKED_VENDOR_WEBGL) return 'Google Inc. (Intel)';
-                        if (dbg && p === dbg.UNMASKED_RENDERER_WEBGL) return 'ANGLE (Intel, Intel(R) Iris(R) Xe Graphics (0x00009A49) Direct3D11 vs_5_0 ps_5_0, D3D11)';
-                        return orig.apply(this, arguments);
+            try:
+                await ctx.add_init_script(
+                    """
+                    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+                    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                    Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+                    Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+                    Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 0 });
+                    window.chrome = window.chrome || { runtime: {}, loadTimes: function() {}, csi: function() {}, app: {} };
+                    // R106: spoof WebGL renderer — SwiftShader (software headless) adalah
+                    // sinyal anti-bot kuat; X chat menolak me-render konten dengannya.
+                    const spoofGL = (proto) => {
+                        if (!proto) return;
+                        const orig = proto.getParameter;
+                        proto.getParameter = function(p) {
+                            const dbg = this.getExtension && this.getExtension('WEBGL_debug_renderer_info');
+                            if (dbg && p === dbg.UNMASKED_VENDOR_WEBGL) return 'Google Inc. (Intel)';
+                            if (dbg && p === dbg.UNMASKED_RENDERER_WEBGL) return 'ANGLE (Intel, Intel(R) Iris(R) Xe Graphics (0x00009A49) Direct3D11 vs_5_0 ps_5_0, D3D11)';
+                            return orig.apply(this, arguments);
+                        };
                     };
-                };
-                try { spoofGL(WebGLRenderingContext.prototype); } catch(e) {}
-                try { spoofGL(WebGL2RenderingContext.prototype); } catch(e) {}
-                try {
-                    const origQuery = window.navigator.permissions && window.navigator.permissions.query;
-                    if (origQuery) window.navigator.permissions.query = (p) => (
-                        p && p.name === 'notifications'
-                            ? Promise.resolve({ state: Notification.permission })
-                            : origQuery(p));
-                } catch(e) {}
-                try {
-                    Object.defineProperty(screen, 'width', { get: () => 1440 });
-                    Object.defineProperty(screen, 'height', { get: () => 900 });
-                    Object.defineProperty(screen, 'availWidth', { get: () => 1440 });
-                    Object.defineProperty(screen, 'availHeight', { get: () => 900 });
-                    Object.defineProperty(screen, 'colorDepth', { get: () => 24 });
-                    Object.defineProperty(screen, 'pixelDepth', { get: () => 24 });
-                } catch(e) {}
-                """
-            )
-            await _apply_session_cookies(ctx, auth_token, ct0)
+                    try { spoofGL(WebGLRenderingContext.prototype); } catch(e) {}
+                    try { spoofGL(WebGL2RenderingContext.prototype); } catch(e) {}
+                    try {
+                        const origQuery = window.navigator.permissions && window.navigator.permissions.query;
+                        if (origQuery) window.navigator.permissions.query = (p) => (
+                            p && p.name === 'notifications'
+                                ? Promise.resolve({ state: Notification.permission })
+                                : origQuery(p));
+                    } catch(e) {}
+                    try {
+                        Object.defineProperty(screen, 'width', { get: () => 1440 });
+                        Object.defineProperty(screen, 'height', { get: () => 900 });
+                        Object.defineProperty(screen, 'availWidth', { get: () => 1440 });
+                        Object.defineProperty(screen, 'availHeight', { get: () => 900 });
+                        Object.defineProperty(screen, 'colorDepth', { get: () => 24 });
+                        Object.defineProperty(screen, 'pixelDepth', { get: () => 24 });
+                    } catch(e) {}
+                    """
+                )
+                await _apply_session_cookies(ctx, auth_token, ct0)
+            except BaseException:
+                # Tutup persistent context bila init gagal/cancel agar proses
+                # Chromium dan SingletonLock tidak bocor permanen.
+                try:
+                    await ctx.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                raise
 
             self._ctxs[key] = ctx
             self._ctx_use[id(ctx)] = self._ctx_use.get(id(ctx), 0) + 1
@@ -761,7 +805,7 @@ async def click_action_via_browser(
     Concurrency: page lifecycle di-batasi `PlaywrightPool.semaphore`.
     Identical concurrent clicks coalesce.
     """
-    key = _click_key(auth_token, navigate_url, click_selector, match_response_substr)
+    key = _click_key(auth_token, navigate_url, click_selector, match_response_substr, confirm_selector)
     return await _coalescer.run(key, lambda: _click_coalesced(
         auth_token, navigate_url, click_selector, confirm_selector,
         match_response_substr, timeout,
@@ -795,32 +839,47 @@ async def _click_action_via_browser_impl(
     page = None
 
     captured: dict[str, Any] = {}
+    captured_ev = asyncio.Event()
     matchers: list[str] = []
     if match_response_substr:
         matchers = [match_response_substr] if isinstance(match_response_substr, str) else list(match_response_substr)
 
     async def _on_response(resp: Response) -> None:
-        if "data" in captured or "raw" in captured:
+        if captured_ev.is_set():
             return
+        try:
+            req = getattr(resp, "request", None)
+            if req is not None and getattr(req, "method", None) == "OPTIONS":
+                return
+        except Exception:  # noqa: BLE001
+            pass
         if matchers and not any(m in resp.url for m in matchers):
             return
         try:
-            captured["data"] = await resp.json()
-            captured["status"] = resp.status
-            captured["url"] = resp.url
-        except Exception:  # noqa: BLE001
-            try:
-                captured["raw"] = (await resp.text())[:1000]
+            body_json = await resp.json()
+            if not captured_ev.is_set():
+                captured["data"] = body_json
                 captured["status"] = resp.status
                 captured["url"] = resp.url
+                captured_ev.set()
+        except Exception:  # noqa: BLE001
+            try:
+                body_txt = (await resp.text())[:1000]
+                if not captured_ev.is_set():
+                    captured["raw"] = body_txt
+                    captured["status"] = resp.status
+                    captured["url"] = resp.url
+                    captured_ev.set()
             except Exception:  # noqa: BLE001
                 pass
 
     try:
         page = await context.new_page()
-        page.on("response", lambda r: asyncio.create_task(_on_response(r)))
         await page.goto(navigate_url, wait_until="domcontentloaded", timeout=int(timeout * 1000))
         await asyncio.sleep(2)
+        # Attach listener right before click so navigation HTML responses are
+        # never prematurely captured when match_response_substr is omitted.
+        page.on("response", lambda r: asyncio.create_task(_on_response(r)))
 
         try:
             await page.click(click_selector, timeout=int(timeout * 1000 / 2))
@@ -834,9 +893,10 @@ async def _click_action_via_browser_impl(
             except Exception:  # noqa: BLE001
                 pass
 
-        deadline = asyncio.get_event_loop().time() + timeout
-        while "data" not in captured and "raw" not in captured and asyncio.get_event_loop().time() < deadline:
-            await asyncio.sleep(0.2)
+        try:
+            await asyncio.wait_for(captured_ev.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            pass
 
         if "data" not in captured and "raw" not in captured:
             return {"status": "error", "error": "no response captured", "data": None}
@@ -1010,19 +1070,29 @@ async def _fetch_via_browser_impl(
     matchers = [match_path] if isinstance(match_path, str) else list(match_path)
 
     async def _on_response(resp: Response) -> None:
-        if "data" in captured:
+        if "data" in captured or "raw" in captured:
             return
+        try:
+            req = getattr(resp, "request", None)
+            if req is not None and getattr(req, "method", None) == "OPTIONS":
+                return
+        except Exception:  # noqa: BLE001
+            pass
         if not any(m in resp.url for m in matchers):
             return
         try:
-            captured["data"] = await resp.json()
-            captured["url"] = resp.url
-            captured["status"] = resp.status
-        except Exception:  # noqa: BLE001
-            try:
-                captured["raw"] = (await resp.text())[:2000]
+            body_json = await resp.json()
+            if "data" not in captured and "raw" not in captured:
+                captured["data"] = body_json
                 captured["url"] = resp.url
                 captured["status"] = resp.status
+        except Exception:  # noqa: BLE001
+            try:
+                body_txt = (await resp.text())[:2000]
+                if "data" not in captured and "raw" not in captured:
+                    captured["raw"] = body_txt
+                    captured["url"] = resp.url
+                    captured["status"] = resp.status
             except Exception:  # noqa: BLE001
                 pass
 
@@ -1038,13 +1108,18 @@ async def _fetch_via_browser_impl(
                 pass
 
         deadline = asyncio.get_event_loop().time() + timeout
-        while "data" not in captured and asyncio.get_event_loop().time() < deadline:
+        while "data" not in captured and "raw" not in captured and asyncio.get_event_loop().time() < deadline:
             await asyncio.sleep(0.2)
 
         if "data" not in captured:
+            err_msg = (
+                f"upstream non-JSON response ({captured.get('status')})"
+                if "raw" in captured
+                else f"timeout: response {match_path} tidak ter-capture"
+            )
             return {
                 "status": "error",
-                "error": f"timeout: response {match_path} tidak ter-capture",
+                "error": err_msg,
                 "captured_url": captured.get("url"),
                 "http_status": captured.get("status"),
                 "raw": captured.get("raw"),
@@ -1120,20 +1195,29 @@ async def _search_via_browser_impl(
         ) or "/i/api/2/search/adaptive.json" in url
 
     async def _on_response(resp: Response) -> None:
-        if "data" in captured:
+        if "data" in captured or "raw" in captured:
             return
+        try:
+            req = getattr(resp, "request", None)
+            if req is not None and getattr(req, "method", None) == "OPTIONS":
+                return
+        except Exception:  # noqa: BLE001
+            pass
         if not _is_search_response(resp):
             return
         try:
             body = await resp.json()
-            captured["data"] = body
-            captured["url"] = resp.url
-            captured["status"] = resp.status
-        except Exception:  # noqa: BLE001
-            try:
-                captured["raw"] = (await resp.text())[:2000]
+            if "data" not in captured and "raw" not in captured:
+                captured["data"] = body
                 captured["url"] = resp.url
                 captured["status"] = resp.status
+        except Exception:  # noqa: BLE001
+            try:
+                body_txt = (await resp.text())[:2000]
+                if "data" not in captured and "raw" not in captured:
+                    captured["raw"] = body_txt
+                    captured["url"] = resp.url
+                    captured["status"] = resp.status
             except Exception:  # noqa: BLE001
                 pass
 
@@ -1148,13 +1232,18 @@ async def _search_via_browser_impl(
 
         # Tunggu response ke-capture
         deadline = asyncio.get_event_loop().time() + timeout
-        while "data" not in captured and asyncio.get_event_loop().time() < deadline:
+        while "data" not in captured and "raw" not in captured and asyncio.get_event_loop().time() < deadline:
             await asyncio.sleep(0.2)
 
         if "data" not in captured:
+            err_msg = (
+                f"upstream non-JSON response ({captured.get('status')})"
+                if "raw" in captured
+                else "timeout: response SearchTimeline/adaptive.json tidak ter-capture"
+            )
             return {
                 "status": "error",
-                "error": "timeout: response SearchTimeline/adaptive.json tidak ter-capture",
+                "error": err_msg,
                 "captured_url": captured.get("url"),
                 "http_status": captured.get("status"),
                 "raw": captured.get("raw"),

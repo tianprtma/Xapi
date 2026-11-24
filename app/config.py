@@ -321,14 +321,14 @@ def random_proxy() -> str | None:
 
 # Upload media (upload.x.com) direct tanpa proxy — hemat kuota proxy
 # (video bisa puluhan MB). 0 = upload ikut jalur proxy.
-MEDIA_PROXY_EXEMPT: bool = os.environ.get("MEDIA_PROXY_EXEMPT", "1").strip() not in ("0", "false", "no")
+MEDIA_PROXY_EXEMPT: bool = os.environ.get("MEDIA_PROXY_EXEMPT", "1").strip().lower() not in ("0", "false", "no")
 
 # Disable `?raw=1` di prod (env ENABLE_RAW=0). Default 1 (enabled).
-ENABLE_RAW: bool = os.environ.get("ENABLE_RAW", "1").strip() not in ("0", "false", "no")
+ENABLE_RAW: bool = os.environ.get("ENABLE_RAW", "1").strip().lower() not in ("0", "false", "no")
 
 # Disable `?auth_token=` query auth (env ALLOW_QUERY_AUTH=0). Default 1 (allowed for dev).
 # Strongly recommend 0 di production — query string ke-log di reverse proxy.
-ALLOW_QUERY_AUTH: bool = os.environ.get("ALLOW_QUERY_AUTH", "1").strip() not in ("0", "false", "no")
+ALLOW_QUERY_AUTH: bool = os.environ.get("ALLOW_QUERY_AUTH", "1").strip().lower() not in ("0", "false", "no")
 
 # Max body size dalam bytes (default 1 MB).
 MAX_BODY_SIZE: int = int(os.environ.get("MAX_BODY_SIZE", str(1 * 1024 * 1024)))

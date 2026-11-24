@@ -795,9 +795,21 @@ async def read_xchat_opfs_file(
 # dan membuat fase fetch watch 3-4 menit. TTL pendek menjaga freshness.
 _OPFS_DB_CACHE_TTL = float(os.environ.get("XCHAT_OPFS_DB_CACHE_TTL_SEC", "20"))
 _OPFS_DB_CACHE: dict[tuple[int, str], tuple[float, bytes]] = {}
+_OPFS_DB_CTX_REFS: dict[tuple[int, str], Any] = {}
 # R99: jeda setelah membuka conv agar client sempat mengunduh media ke OPFS.
 _MEDIA_TRIGGER_WAIT_SEC = float(os.environ.get("XCHAT_MEDIA_TRIGGER_WAIT_SEC", "8"))
 _MEDIA_TRIGGER_ATTEMPTS = int(os.environ.get("XCHAT_MEDIA_TRIGGER_ATTEMPTS", "2"))
+
+
+def _prune_opfs_db_cache(now_mono: float) -> None:
+    if _OPFS_DB_CACHE_TTL <= 0:
+        _OPFS_DB_CACHE.clear()
+        _OPFS_DB_CTX_REFS.clear()
+        return
+    expired = [k for k, (ts, _) in list(_OPFS_DB_CACHE.items()) if (now_mono - ts) >= _OPFS_DB_CACHE_TTL]
+    for k in expired:
+        _OPFS_DB_CACHE.pop(k, None)
+        _OPFS_DB_CTX_REFS.pop(k, None)
 
 
 async def extract_xchat_opfs_db(
@@ -814,11 +826,20 @@ async def extract_xchat_opfs_db(
     R99: force=True melewati cache (baca segar) — dipakai setelah memicu
     unduhan media agar snapshot baru terlihat.
     Kembalikan bytes db, atau None bila file tidak ada."""
+    import weakref as _weakref
+
+    now_mono = time.monotonic()
+    _prune_opfs_db_cache(now_mono)
     cache_key = (id(context), str(viewer_id)) if context is not None else None
     if not force and cache_key is not None and _OPFS_DB_CACHE_TTL > 0:
         hit = _OPFS_DB_CACHE.get(cache_key)
-        if hit is not None and (time.monotonic() - hit[0]) < _OPFS_DB_CACHE_TTL:
+        ref = _OPFS_DB_CTX_REFS.get(cache_key)
+        same_ctx = (ref is None) or (ref() is context)
+        if hit is not None and same_ctx and (now_mono - hit[0]) < _OPFS_DB_CACHE_TTL:
             return hit[1]
+        if hit is not None and not same_ctx:
+            _OPFS_DB_CACHE.pop(cache_key, None)
+            _OPFS_DB_CTX_REFS.pop(cache_key, None)
     target = page
     if context is not None:
         cached = getattr(context, "_xchat_opfs_page", None)
@@ -867,6 +888,13 @@ async def extract_xchat_opfs_db(
         return None
     if cache_key is not None and _OPFS_DB_CACHE_TTL > 0:
         _OPFS_DB_CACHE[cache_key] = (time.monotonic(), data)
+        try:
+            _OPFS_DB_CTX_REFS[cache_key] = _weakref.ref(
+                context,
+                lambda _r, k=cache_key: (_OPFS_DB_CACHE.pop(k, None), _OPFS_DB_CTX_REFS.pop(k, None)),
+            )
+        except TypeError:
+            _OPFS_DB_CTX_REFS.pop(cache_key, None)
     return data
 
 
@@ -1287,9 +1315,14 @@ def project_dm_entries_to_events(
     for row in rows:
         entry_id = str(row.get("entry_id") or "")
         text = (row.get("plain_text") or "").strip()
-        if not entry_id or not text:
+        if not entry_id:
             continue
         if row.get("deleted"):
+            continue
+        post_links = _extract_post_links(row.get("contents"))
+        att_types = str(row.get("attachment_types") or "").lower()
+        has_media_att = bool(row.get("has_attachment") and att_types == "media")
+        if not text and not has_media_att and not post_links:
             continue
         ts_ms = row.get("timestamp")
         created_at = None
@@ -1312,11 +1345,9 @@ def project_dm_entries_to_events(
         }
         # R100: link tweet yang dibagikan (attachment Post) ada di contents,
         # bukan plain_text — ekstrak ke status_links agar ikut terposting.
-        post_links = _extract_post_links(row.get("contents"))
         if post_links:
             event["status_links"] = post_links
-        att_types = str(row.get("attachment_types") or "").lower()
-        if row.get("has_attachment") and att_types == "media":
+        if has_media_att:
             # R90: lampiran media (foto/video) ditandai pending dulu;
             # recover_opfs_media_for_events membaca file terdekripsi dari
             # dm_local_attachment (OPFS) dan mengubahnya jadi ready bila

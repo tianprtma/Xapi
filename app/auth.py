@@ -16,7 +16,7 @@ from fastapi import HTTPException
 
 from session_cache import SessionStore
 
-from .client_pool import pooled_client
+from .client_pool import ClientPool, pooled_client
 from .config import (
     AUTH_TOKEN_PATTERN,
     DEFAULT_HEADERS,
@@ -52,9 +52,10 @@ class WarmNetworkError(Exception):
     meng-invalidate session cache — sifatnya sementara (502), bukan 401.
     """
 
-    def __init__(self, message: str):
+    def __init__(self, message: str, http_status: int = 502):
         super().__init__(message)
         self.message = message
+        self.http_status = http_status
 
 
 # ──────────────────────────── Helpers ────────────────────────────
@@ -161,14 +162,48 @@ async def warm_session(
             client.cookies.set(k, v, domain=".x.com")
         return cached.ct0, cached.cookies
 
+    # Cache miss (after invalidation or 20-min expiry): reset any stale cookies
+    # (especially old `twid` / `.x.com` `ct0`) on a reused pooled client so a
+    # revoked token cannot be re-cached from leftover jar state.
+    if hasattr(client.cookies, "jar") and hasattr(client.cookies.jar, "clear"):
+        client.cookies.jar.clear()
+    client.cookies.set("auth_token", auth_token)
+    client.cookies.set("ct0", gen_ct0())
+
+    def _transient_warm_status(resp: Any) -> Optional[int]:
+        st = getattr(resp, "status_code", None)
+        if isinstance(st, int) and (st >= 500 or st == 429):
+            return st
+        return None
+
+    home_resp: Any = None
     try:
-        await client.get(HOMEPAGE_URL)
+        home_resp = await client.get(HOMEPAGE_URL)
+        bad_st = _transient_warm_status(home_resp)
+        if bad_st is not None:
+            home_resp = await client.get(HOMEPAGE_URL)
+            bad_st = _transient_warm_status(home_resp)
+            if bad_st is not None:
+                raise WarmNetworkError(
+                    f"GET {HOMEPAGE_URL} returned HTTP {bad_st} twice",
+                    http_status=bad_st,
+                )
+    except WarmNetworkError:
+        raise
     except Exception as exc:  # noqa: BLE001
         import logging
         logging.getLogger("xapi.auth").debug("warm_session home_page failed", exc_info=True)
         # Retry sekali — glitch jaringan/proxy satu-off jangan langsung gagal.
         try:
-            await client.get(HOMEPAGE_URL)
+            home_resp = await client.get(HOMEPAGE_URL)
+            bad_st = _transient_warm_status(home_resp)
+            if bad_st is not None:
+                raise WarmNetworkError(
+                    f"GET {HOMEPAGE_URL} returned HTTP {bad_st} on retry",
+                    http_status=bad_st,
+                )
+        except WarmNetworkError:
+            raise
         except Exception:  # noqa: BLE001
             raise WarmNetworkError(
                 f"GET {HOMEPAGE_URL} failed twice: {type(exc).__name__}: {exc}"
@@ -238,7 +273,7 @@ async def login_with_auth_token(auth_token: str) -> dict[str, Any]:
         except WarmNetworkError as e:
             return {
                 "status": "error",
-                "http_status": 502,
+                "http_status": getattr(e, "http_status", 502),
                 "error": f"warm-up failed: {e.message}",
                 "cookies": {},
                 "tokens": {"bearer": WEB_BEARER, "ct0": "", "auth_token": auth_token},
@@ -297,9 +332,22 @@ async def login_with_auth_token(auth_token: str) -> dict[str, Any]:
             except (json.JSONDecodeError, KeyError, AttributeError):
                 pass
         elif viewer_resp.status_code in (401, 403):
+            if hasattr(store, "invalidate"):
+                await store.invalidate(auth_token)
+            await ClientPool.get().invalidate(auth_token)
             return {
                 "status": "invalid",
                 "http_status": viewer_resp.status_code,
+                "error": viewer_resp.text[:500],
+                "cookies": jar,
+                "tokens": {"bearer": WEB_BEARER, "ct0": ct0, "auth_token": auth_token},
+                "user": None,
+            }
+        else:
+            err_st = viewer_resp.status_code if viewer_resp.status_code >= 400 else 502
+            return {
+                "status": "error",
+                "http_status": err_st,
                 "error": viewer_resp.text[:500],
                 "cookies": jar,
                 "tokens": {"bearer": WEB_BEARER, "ct0": ct0, "auth_token": auth_token},

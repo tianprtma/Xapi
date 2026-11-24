@@ -33,6 +33,11 @@ class _JSONFormatter(logging.Formatter):
     Set LOG_LEVEL env var to control (default INFO).
     """
 
+    _BUILTIN_ATTRS = frozenset(logging.LogRecord("", 0, "", 0, "", (), None).__dict__.keys()) | {
+        "message",
+        "asctime",
+    }
+
     def format(self, record: logging.LogRecord) -> str:
         ts = datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat()
         base: dict[str, Any] = {
@@ -41,6 +46,9 @@ class _JSONFormatter(logging.Formatter):
             "logger": record.name,
             "msg": record.getMessage(),
         }
+        for k, v in record.__dict__.items():
+            if k not in self._BUILTIN_ATTRS and not k.startswith("_") and k not in base:
+                base[k] = v
         if record.exc_info and record.exc_info[0]:
             import traceback
             base["exc"] = "".join(traceback.format_exception(*record.exc_info))

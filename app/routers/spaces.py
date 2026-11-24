@@ -84,13 +84,15 @@ async def v2_spaces_lookup(
 ) -> JSONResponse:
     """Fan-out lookup multiple spaces — calls AudioSpaceById per ID."""
     tok = extract_bearer(authorization, auth_token)
-    id_list = [s.strip() for s in ids.split(",") if s.strip()]
+    id_list = [s.strip() for s in ids.split(",") if s.strip()][:100]
     if not id_list:
         return JSONResponse(status_code=400, content=format_error(
             "Bad Request", "ids must contain at least 1 value", "bad_request", 400,
         ))
 
     import asyncio
+    from ..responses import batch_finalize
+
     async def _one(sid: str):
         async with fanout_semaphore():
             return await graphql_call("AudioSpaceById", {
@@ -100,11 +102,37 @@ async def v2_spaces_lookup(
                 "withListeners": True,
             }, tok)
 
-    results = await asyncio.gather(*[_one(s) for s in id_list])
+    results = await asyncio.gather(*[_one(s) for s in id_list], return_exceptions=True)
     if raw:
-        return JSONResponse(status_code=200, content={"results": results})
-    data = [r.get("data") for r in results if r.get("status") == "ok"]
-    return JSONResponse(status_code=200, content={"data": data})
+        return JSONResponse(
+            status_code=200,
+            content={"results": [r if isinstance(r, dict) else {"status": "error", "error": str(r)} for r in results]},
+        )
+    data: list[Any] = []
+    errors: list[dict[str, Any]] = []
+    for sid, r in zip(id_list, results):
+        if isinstance(r, Exception) or not isinstance(r, dict) or r.get("status") != "ok":
+            raw_st = r.get("http_status") if isinstance(r, dict) else None
+            http_st = raw_st if isinstance(raw_st, int) and raw_st >= 400 else 502
+            if isinstance(r, dict) and r.get("status") == "invalid":
+                http_st = 401
+            err_type = (
+                "unauthorized" if http_st == 401
+                else ("rate_limit_exceeded" if http_st == 429 else ("not_found" if http_st == 404 else "upstream_error"))
+            )
+            errors.append({
+                "id": sid,
+                "title": "Unauthorized" if http_st == 401 else ("Too Many Requests" if http_st == 429 else "Space Lookup Failed"),
+                "detail": str(r.get("error") if isinstance(r, dict) else r)[:200],
+                "type": err_type,
+                "status": http_st,
+            })
+            continue
+        data.append(r.get("data"))
+    out: dict[str, Any] = {"data": data, "meta": {"result_count": len(data)}}
+    if errors:
+        out["errors"] = errors
+    return batch_finalize(out)
 
 
 @router.get(

@@ -228,8 +228,10 @@ async def v2_tweets_search_recent(
         }
         fmt = format_tweet_collection if type != "People" else (lambda g: format_tweet_collection(g, item="user"))
         return finalize(result, fmt, raw=bool(raw))
-    # fallback Playwright bila GraphQL gagal (rate limit / challenge)
     fmt = format_tweet_collection if type != "People" else (lambda g: format_tweet_collection(g, item="user"))
+    if gql.get("status") == "invalid" or next_token:
+        return finalize(gql, fmt, raw=bool(raw))
+    # fallback Playwright bila GraphQL gagal (rate limit / challenge)
     try:
         pw = await search_via_browser(auth_token=tok, q=query, search_type=type)
         result = {

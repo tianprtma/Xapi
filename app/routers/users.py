@@ -126,11 +126,20 @@ async def v2_users_bulk(
     data, errors = [], []
     for r in results:
         if r.get("status") != "ok":
+            if r.get("status") == "invalid":
+                errors.append({
+                    "id": r["id"],
+                    "title": "Unauthorized",
+                    "type": "unauthorized",
+                    "status": 401,
+                })
+                continue
             cached = _cached_profile(r["id"])
             if cached is not None:
                 data.append(cached)
                 continue
-            http_st = r.get("http_status") or 502
+            raw_st = r.get("http_status")
+            http_st = raw_st if isinstance(raw_st, int) and raw_st >= 400 else 502
             errors.append({
                 "id": r["id"],
                 "title": "Too Many Requests" if http_st == 429 else "Upstream Lookup Failed",
@@ -157,7 +166,7 @@ async def v2_users_by_usernames(
 ) -> JSONResponse:
     """GET /2/users/by?usernames=a,b — fan-out via UserByScreenName."""
     tok = extract_bearer(authorization, auth_token)
-    name_list = [n.strip().lstrip("@") for n in usernames.split(",") if n.strip()][:100]
+    name_list = [clean for n in usernames.split(",") if (clean := n.strip().lstrip("@"))][:100]
     if not name_list:
         return JSONResponse(status_code=400, content=format_error("Bad Request", "usernames kosong", "bad_request", 400))
 
@@ -223,14 +232,21 @@ async def v2_users_me(
     login = await login_with_auth_token(tok)
     if login["status"] != "valid":
         if raw:
-            return JSONResponse(status_code=401, content=login)
+            return wrap(login)
+        if login["status"] == "error":
+            raw_st = login.get("http_status")
+            err_st = raw_st if isinstance(raw_st, int) and raw_st >= 400 else 502
+            return JSONResponse(
+                status_code=err_st,
+                content=format_error("Upstream Error", login.get("error", ""), "upstream_error", err_st),
+            )
         return JSONResponse(
             status_code=401,
             content=format_error("Unauthorized", login.get("error", ""), "unauthorized", 401),
         )
 
     if raw:
-        return JSONResponse(status_code=200, content=login)
+        return wrap(login)
 
     u = login.get("user") or {}
     return JSONResponse(
@@ -270,6 +286,13 @@ async def v2_reposts_of_me(
     # Resolve current user screen_name
     login = await login_with_auth_token(tok)
     if login["status"] != "valid":
+        if login["status"] == "error":
+            raw_st = login.get("http_status")
+            err_st = raw_st if isinstance(raw_st, int) and raw_st >= 400 else 502
+            return JSONResponse(
+                status_code=err_st,
+                content=format_error("Upstream Error", login.get("error", "upstream failed"), "upstream_error", err_st),
+            )
         return JSONResponse(status_code=401, content=format_error("Unauthorized", "auth_token invalid", "unauthorized", 401))
     handle = (login.get("user") or {}).get("screen_name")
     if not handle:
@@ -319,6 +342,8 @@ async def v2_users_search(
             "error": None,
         }
         return finalize(result, lambda g: format_tweet_collection(g, item="user"), raw=bool(raw))
+    if gql.get("status") == "invalid":
+        return finalize(gql, lambda g: format_tweet_collection(g, item="user"), raw=bool(raw))
     try:
         pw = await search_via_browser(auth_token=tok, q=query, search_type="People")
         result = {
@@ -441,12 +466,15 @@ async def v2_user_by_id(
     result = await graphql_call(
         "UserByRestId", {"userId": user_id, "withSafetyModeUserFields": True}, tok
     )
+    if result.get("status") == "invalid":
+        return finalize(result, format_user, raw=bool(raw))
     if result.get("status") != "ok":
         # Fallback TANPA Playwright (hemat RAM — Chromium besar dan sering
         # terpicu saat rate limit): serve dari cache snapshot profil.
-        cached = _cached_profile(user_id)
-        if cached is not None:
-            return JSONResponse(content={"data": cached})
+        if not raw:
+            cached = _cached_profile(user_id)
+            if cached is not None:
+                return JSONResponse(content={"data": cached})
         # Playwright hanya bila diizinkan eksplisit (PLAYWRIGHT_FALLBACK=1)
         if os.environ.get("PLAYWRIGHT_FALLBACK", "0") == "1":
             pw = await fetch_via_browser(
@@ -558,7 +586,7 @@ async def v2_user_followers(
     if pagination_token:
         variables["cursor"] = pagination_token
     result = await graphql_call("Followers", variables, tok)
-    if result["status"] == "ok":
+    if result["status"] == "ok" or result.get("status") == "invalid" or pagination_token:
         return finalize(result, lambda g: format_tweet_collection(g, item="user"), raw=bool(raw))
     try:
         handle = await resolve_screen_name(user_id, tok)
@@ -821,7 +849,7 @@ async def v2_user_tweets_replies(
     if pagination_token:
         variables["cursor"] = pagination_token
     result = await graphql_call("UserTweetsAndReplies", variables, tok)
-    if result["status"] == "ok":
+    if result["status"] == "ok" or result.get("status") == "invalid" or pagination_token:
         return finalize(result, format_tweet_collection, raw=bool(raw))
     try:
         handle = await resolve_screen_name(user_id, tok)

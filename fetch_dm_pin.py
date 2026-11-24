@@ -184,7 +184,7 @@ async def main() -> int:
 
     # 3) Conversation tertentu
     conv_id = args.conversation.replace(":", "-")
-    if pin:
+    if pin or args.browser:
         events = await unlock_and_read_xchat_conversation(
             tok, pin, conv_id, my_user_id=me, max_results=args.max)
         if out_dir:

@@ -29,7 +29,7 @@ from .auth import (
     make_client,
     warm_session,
 )
-from .client_pool import pooled_client
+from .client_pool import ClientPool, pooled_client
 from .config import (
     CHUNK_SIZE,
     MEDIA_PROXY_EXEMPT,
@@ -114,7 +114,7 @@ async def _graphql_call_once(
         except WarmNetworkError as e:
             return {
                 "status": "error",
-                "http_status": 502,
+                "http_status": getattr(e, "http_status", 502),
                 "error": f"warm-up failed: {e.message}",
                 "data": None,
             }
@@ -134,22 +134,31 @@ async def _graphql_call_once(
         except Exception:  # noqa: BLE001
             pass
 
-        if method == "GET":
-            resp = await client.get(url, headers=headers, params=params)
-        else:
-            resp = await client.post(url, headers=headers, json={
-                "variables": variables,
-                "features": meta.get("features", {}),
-                "fieldToggles": meta.get("fieldToggles", {}),
-                "queryId": meta["queryId"],
-            })
+        try:
+            if method == "GET":
+                resp = await client.get(url, headers=headers, params=params)
+            else:
+                resp = await client.post(url, headers=headers, json={
+                    "variables": variables,
+                    "features": meta.get("features", {}),
+                    "fieldToggles": meta.get("fieldToggles", {}),
+                    "queryId": meta["queryId"],
+                })
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "status": "error",
+                "http_status": 502,
+                "error": f"upstream request failed: {type(exc).__name__}: {exc}",
+                "data": None,
+            }
 
         if resp.status_code != 200:
             if resp.status_code in (401, 403):
                 await SessionStore.get().invalidate(auth_token)
+                await ClientPool.get().invalidate(auth_token)
             return {
                 "status": "error",
-                "http_status": resp.status_code,
+                "http_status": resp.status_code if resp.status_code >= 400 else 502,
                 "error": resp.text[:1000],
                 "data": None,
             }
@@ -159,7 +168,7 @@ async def _graphql_call_once(
         except json.JSONDecodeError:
             return {
                 "status": "error",
-                "http_status": resp.status_code,
+                "http_status": 502,
                 "error": "non-JSON response",
                 "raw": resp.text[:1000],
                 "data": None,
@@ -234,16 +243,25 @@ async def _rest_call_once(
         except Exception:  # noqa: BLE001
             pass
 
-        if json_body is not None:
-            headers["content-type"] = "application/json"
-            resp = await client.request(method, url, headers=headers, json=json_body)
-        else:
-            headers["content-type"] = "application/x-www-form-urlencoded"
-            resp = await client.request(method, url, headers=headers, data=data or {})
+        try:
+            if json_body is not None:
+                headers["content-type"] = "application/json"
+                resp = await client.request(method, url, headers=headers, json=json_body)
+            else:
+                headers["content-type"] = "application/x-www-form-urlencoded"
+                resp = await client.request(method, url, headers=headers, data=data or {})
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "status": "error",
+                "http_status": 502,
+                "error": f"upstream request failed: {type(exc).__name__}: {exc}",
+                "data": None,
+            }
 
         if resp.status_code >= 400:
             if resp.status_code in (401, 403):
                 await SessionStore.get().invalidate(auth_token)
+                await ClientPool.get().invalidate(auth_token)
             return {
                 "status": "error",
                 "http_status": resp.status_code,
@@ -334,18 +352,26 @@ async def _dm_call_once(
         except Exception:  # noqa: BLE001
             pass
 
-        if json_body is not None:
-            headers["content-type"] = "application/json"
-            resp = await client.request(
-                method, url, headers=headers, params=final_params, json=json_body,
-            )
-        elif data is not None:
-            headers["content-type"] = "application/x-www-form-urlencoded"
-            resp = await client.request(
-                method, url, headers=headers, params=final_params, data=data,
-            )
-        else:
-            resp = await client.request(method, url, headers=headers, params=final_params)
+        try:
+            if json_body is not None:
+                headers["content-type"] = "application/json"
+                resp = await client.request(
+                    method, url, headers=headers, params=final_params, json=json_body,
+                )
+            elif data is not None:
+                headers["content-type"] = "application/x-www-form-urlencoded"
+                resp = await client.request(
+                    method, url, headers=headers, params=final_params, data=data,
+                )
+            else:
+                resp = await client.request(method, url, headers=headers, params=final_params)
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "status": "error",
+                "http_status": 502,
+                "error": f"upstream request failed: {type(exc).__name__}: {exc}",
+                "data": None,
+            }
 
         try:
             payload = resp.json()
@@ -355,6 +381,7 @@ async def _dm_call_once(
         if resp.status_code >= 400:
             if resp.status_code in (401, 403):
                 await SessionStore.get().invalidate(auth_token)
+                await ClientPool.get().invalidate(auth_token)
             return {
                 "status": "error",
                 "http_status": resp.status_code,
@@ -512,6 +539,23 @@ async def media_upload(
                 pass
 
     async with pooled_client(auth_token) as client:
+        try:
+            pooled_ct0, _ = await warm_session(client, auth_token)
+            base_headers = {**base_headers, "x-csrf-token": pooled_ct0}
+        except InvalidTokenError as e:
+            return {
+                "status": "invalid",
+                "http_status": e.http_status,
+                "error": e.message,
+                "data": None,
+            }
+        except WarmNetworkError as e:
+            return {
+                "status": "error",
+                "http_status": getattr(e, "http_status", 502),
+                "error": f"warm-up failed: {e.message}",
+                "data": None,
+            }
         old_timeout = getattr(client, "timeout", 20.0)
         client.timeout = timeout
         try:
@@ -660,9 +704,10 @@ def _invalid_token_response(e: InvalidTokenError, auth_token: str) -> dict[str, 
 
 
 def _upload_error(resp: Any, stage: str, *, media_id: Optional[str] = None) -> dict[str, Any]:
+    raw_st = getattr(resp, "status_code", None)
     err: dict[str, Any] = {
         "status": "error",
-        "http_status": resp.status_code,
+        "http_status": raw_st if isinstance(raw_st, int) and raw_st >= 400 else 502,
         "error": resp.text[:1000],
         "stage": stage,
         "data": None,

@@ -171,12 +171,14 @@ def write_finalize(
                 reason=str(result.get("error") or "session invalid")[:200],
             ),
         )
+    raw_st = result.get("http_status")
+    err_status = raw_st if isinstance(raw_st, int) and raw_st >= 400 else 502
     return JSONResponse(
-        status_code=result.get("http_status") or 502,
+        status_code=err_status,
         content=build_error(
             "UPSTREAM_ERROR",
             detail=str(result.get("error") or "")[:1000],
-            http_status=str(result.get("http_status") or "unknown"),
+            http_status=str(raw_st or "unknown"),
             reason=str(result.get("error") or "upstream failure")[:200],
         ),
     )
@@ -187,9 +189,9 @@ def batch_finalize(content: dict[str, Any]) -> JSONResponse:
 
     Per Twitter API v2 spec partial failures stay 200 (errors array in body).
     When *every* item failed (no data, only errors):
-    - If items failed due to upstream rate-limit (429) or upstream 5xx error,
-      surface 429 / 502 so callers (e.g. jkt48history delete sweep) never
-      mistake a rate-limit or network outage for 404 Not Found (deleted tweet).
+    - If items failed due to auth (401/403), rate-limit (429), or upstream 5xx
+      error, surface that status so callers (e.g. delete sweep) never mistake
+      an auth/rate-limit/network outage for 404 Not Found (deleted tweet).
     - Otherwise surface 404 for genuine not-found misses.
     """
     data = content.get("data")
@@ -205,9 +207,13 @@ def batch_finalize(content: dict[str, Any]) -> JSONResponse:
             for e in errors
             if isinstance(e, dict) and isinstance(e.get("type"), str)
         ]
+        if 401 in statuses or "unauthorized" in types:
+            return JSONResponse(status_code=401, content=content)
+        if 403 in statuses or "forbidden" in types:
+            return JSONResponse(status_code=403, content=content)
         if 429 in statuses or "rate_limit_exceeded" in types:
             return JSONResponse(status_code=429, content=content)
-        if statuses and all(s >= 500 for s in statuses):
+        if any(s >= 500 for s in statuses):
             return JSONResponse(status_code=502, content=content)
         return JSONResponse(status_code=404, content=content)
     return JSONResponse(status_code=200, content=content)

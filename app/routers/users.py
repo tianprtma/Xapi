@@ -8,6 +8,7 @@ in main.py via `app.include_router`.
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 from typing import Any, Optional
 
@@ -183,12 +184,22 @@ async def v2_users_by_usernames(
 
     data, errors = [], []
     for n, r in zip(name_list, results):
-        if isinstance(r, Exception) or (isinstance(r, dict) and r.get("status") != "ok"):
-            http_st = r.get("http_status", 502) if isinstance(r, dict) else 502
-            err_type = "rate_limit_exceeded" if http_st == 429 else ("not_found" if http_st == 404 else "upstream_error")
+        if isinstance(r, Exception) or not isinstance(r, dict) or r.get("status") != "ok":
+            raw_st = r.get("http_status") if isinstance(r, dict) else None
+            http_st = raw_st if isinstance(raw_st, int) and raw_st >= 400 else 502
+            if isinstance(r, dict) and r.get("status") == "invalid":
+                http_st = 401
+            err_type = (
+                "unauthorized" if http_st == 401
+                else ("rate_limit_exceeded" if http_st == 429 else ("not_found" if http_st == 404 else "upstream_error"))
+            )
+            title = (
+                "Unauthorized" if http_st == 401
+                else ("Rate Limit Exceeded" if http_st == 429 else "Lookup Failed")
+            )
             errors.append({
                 "username": n,
-                "title": "Rate Limit Exceeded" if http_st == 429 else "Lookup Failed",
+                "title": title,
                 "detail": str(r.get("error") if isinstance(r, dict) else r)[:200],
                 "type": err_type,
                 "status": http_st,
@@ -491,12 +502,14 @@ async def v2_user_by_id(
                 "error": pw.get("error"),
             }
             return finalize(result, format_user, raw=bool(raw))
+        raw_st = result.get("http_status")
+        err_st = raw_st if isinstance(raw_st, int) and raw_st >= 400 else 502
         return JSONResponse(
-            status_code=result.get("http_status") or 502,
+            status_code=err_st,
             content=format_error(
                 "Upstream Error",
                 "UserByRestId gagal dan tidak ada cache profil",
-                "upstream_error", result.get("http_status") or 502),
+                "upstream_error", err_st),
         )
     return finalize(result, format_user, raw=bool(raw))
 
@@ -716,7 +729,12 @@ async def v2_mentions(
     NB: butuh username — auto-resolve via UserByRestId kalau tidak di-pass.
     """
     tok = extract_bearer(authorization, auth_token)
-    handle = username
+    handle = username.strip().lstrip("@") if username else None
+    if handle and not re.fullmatch(r"[A-Za-z0-9_]{1,15}", handle):
+        return JSONResponse(
+            status_code=400,
+            content=format_error("Bad Request", "username tidak valid", "bad_request", 400),
+        )
     if not handle:
         # Resolve via Playwright UserByRestId/UserByScreenName
         handle = await resolve_screen_name(user_id, tok)

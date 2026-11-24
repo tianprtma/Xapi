@@ -121,12 +121,22 @@ async def v2_tweets_bulk(
     refs: dict[str, dict] = {}
     errors: list[dict] = []
     for tid, r in zip(id_list, results):
-        if isinstance(r, Exception) or (isinstance(r, dict) and r.get("status") != "ok"):
-            http_st = (r.get("http_status") if isinstance(r, dict) else None) or 502
-            err_type = "rate_limit_exceeded" if http_st == 429 else "upstream_error"
+        if isinstance(r, Exception) or not isinstance(r, dict) or r.get("status") != "ok":
+            raw_st = r.get("http_status") if isinstance(r, dict) else None
+            http_st = raw_st if isinstance(raw_st, int) and raw_st >= 400 else 502
+            if isinstance(r, dict) and r.get("status") == "invalid":
+                http_st = 401
+            err_type = (
+                "unauthorized" if http_st == 401
+                else ("rate_limit_exceeded" if http_st == 429 else "upstream_error")
+            )
+            title = (
+                "Unauthorized" if http_st == 401
+                else ("Too Many Requests" if http_st == 429 else "Upstream Lookup Failed")
+            )
             errors.append({
                 "id": tid,
-                "title": "Too Many Requests" if http_st == 429 else "Upstream Lookup Failed",
+                "title": title,
                 "detail": str(r.get("error") if isinstance(r, dict) else r)[:200],
                 "type": err_type,
                 "status": http_st,

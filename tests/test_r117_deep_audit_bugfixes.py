@@ -463,3 +463,56 @@ async def test_session_store_lookup_viewer_respects_session_max_age():
     st = await store.stats()
     assert st["total"] == 0
     assert st["viewer_cached"] == 0
+
+
+# 19. Bulk tweet & username lookups propagate 401 on invalid token and 502 on http_status=None/200 errors
+@pytest.mark.asyncio
+async def test_bulk_tweets_and_usernames_normalize_401_and_502():
+    from app.routers.tweets import v2_tweets_bulk
+    from app.routers.users import v2_users_by_usernames
+
+    with (
+        patch("app.routers.tweets.extract_bearer", return_value="a" * 40),
+        patch("app.routers.tweets.graphql_call", AsyncMock(return_value={"status": "invalid", "http_status": 200, "error": "expired"})),
+    ):
+        r1 = await v2_tweets_bulk("12345", authorization="Bearer " + "a" * 40, auth_token=None, raw=0)
+    assert r1.status_code == 401
+
+    with (
+        patch("app.routers.users.extract_bearer", return_value="a" * 40),
+        patch("app.routers.users.graphql_call", AsyncMock(return_value={"status": "error", "http_status": None, "error": "timeout"})),
+    ):
+        r2 = await v2_users_by_usernames("alice", authorization="Bearer " + "a" * 40, auth_token=None, raw=0)
+    assert r2.status_code == 502
+
+    with (
+        patch("app.routers.users.extract_bearer", return_value="a" * 40),
+        patch("app.routers.users.graphql_call", AsyncMock(return_value={"status": "invalid", "http_status": None, "error": "expired"})),
+    ):
+        r3 = await v2_users_by_usernames("alice", authorization="Bearer " + "a" * 40, auth_token=None, raw=0)
+    assert r3.status_code == 401
+
+
+# 20. v2_user_by_id clamps 200-error to 502, v2_mentions validates handle, write_finalize maps code 88 to 429
+@pytest.mark.asyncio
+async def test_user_by_id_clamp_mentions_validation_and_code88_429():
+    from app.responses import write_finalize
+    from app.routers.users import v2_mentions, v2_user_by_id
+
+    with (
+        patch("app.routers.users.extract_bearer", return_value="a" * 40),
+        patch("app.routers.users.graphql_call", AsyncMock(return_value={"status": "error", "http_status": 200, "error": "bad"})),
+        patch("app.routers.users._cached_profile", return_value=None),
+    ):
+        r_uid = await v2_user_by_id("12345", authorization="Bearer " + "a" * 40, auth_token=None, raw=0)
+    assert r_uid.status_code == 502
+
+    with patch("app.routers.users.extract_bearer", return_value="a" * 40):
+        r_bad = await v2_mentions("12345", username="alice OR from:bob", authorization="Bearer " + "a" * 40, auth_token=None, raw=0)
+    assert r_bad.status_code == 400
+
+    r_429 = write_finalize(
+        {"status": "ok", "data": {"errors": [{"code": 88, "message": "Rate limit exceeded"}], "data": {}}},
+        raw=False,
+    )
+    assert r_429.status_code == 429

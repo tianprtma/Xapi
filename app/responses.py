@@ -117,6 +117,9 @@ def _upstream_error_status(error: dict[str, Any]) -> int:
         str(error.get(key) or "")
         for key in ("name", "kind", "message")
     ).lower()
+    # X error codes → HTTP 429
+    if code == "88" or "rate limit" in text or "too many requests" in text:
+        return 429
     # X error codes → HTTP 401
     if code in {"32", "64", "89", "99", "135", "136", "179", "220", "261", "353"}:
         return 401

@@ -8,6 +8,7 @@ in main.py via `app.include_router`.
 from __future__ import annotations
 
 import json
+import re
 import secrets
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -463,7 +464,16 @@ async def _enrich_conv_events_with_e2ee(
         raw_ts = ev_obj.get("created_at")
         if isinstance(raw_ts, str) and raw_ts.strip():
             try:
-                dt = datetime.fromisoformat(raw_ts.strip().replace("Z", "+00:00"))
+                s = raw_ts.strip()
+                if s.endswith(("Z", "z")):
+                    s = s[:-1] + "+00:00"
+                # Python 3.9 fromisoformat hanya menerima 0/3/6 digit pecahan detik.
+                s = re.sub(
+                    r"\.(\d+)(?=(?:[+-]\d{2}:\d{2})?$)",
+                    lambda m: "." + (m.group(1) + "000000")[:6],
+                    s,
+                )
+                dt = datetime.fromisoformat(s)
                 if dt.tzinfo is None:
                     dt = dt.replace(tzinfo=timezone.utc)
                 return dt.timestamp()
@@ -1318,7 +1328,7 @@ async def v2_dm_media_proxy(
     GET /2/dm_conversations/media/{dm_id}/{media_id}/{resource_id} — proxy download binary media DM
     (foto, GIF, video dari `ton.x.com` maupun gambar `blob:` XChat E2EE yang di-cache di memori).
     """
-    from ..auth import api_headers
+    from ..auth import WarmNetworkError, api_headers
     from ..client_pool import pooled_client
 
     if ".." in media_id or ".." in resource_id:
@@ -1326,6 +1336,8 @@ async def v2_dm_media_proxy(
             status_code=400,
             content=format_error("Bad Request", "Invalid media path segment", "bad_request", 400),
         )
+
+    tok = extract_bearer(authorization, auth_token)
 
     if dm_id == "xchat":
         cached = get_cached_e2ee_media(media_id.strip("/"))
@@ -1337,16 +1349,34 @@ async def v2_dm_media_proxy(
         raw_bytes, mime = cached
         return Response(content=raw_bytes, media_type=mime)
 
-    tok = extract_bearer(authorization, auth_token)
     url = f"https://ton.x.com/1.1/ton/data/dm/{dm_id}/{media_id.strip('/')}/{resource_id}"
     async with pooled_client(tok) as client:
-        ct0, cookies = await warm_session(client, tok)
+        try:
+            ct0, cookies = await warm_session(client, tok)
+        except InvalidTokenError as e:
+            return JSONResponse(
+                status_code=401,
+                content=format_error("Unauthorized", e.message, "unauthorized", 401),
+            )
+        except WarmNetworkError as e:
+            st = getattr(e, "http_status", 502)
+            st = st if isinstance(st, int) and st >= 400 else 502
+            return JSONResponse(
+                status_code=st,
+                content=format_error("Upstream Error", f"warm-up failed: {e.message}", "upstream_error", st),
+            )
         for k, v in cookies.items():
             client.cookies.set(k, v, domain=".x.com")
             client.cookies.set(k, v, domain=".twitter.com")
         hdrs = {**api_headers(ct0, tok), "referer": "https://x.com/messages"}
         hdrs.pop("content-type", None)
-        resp = await client.get(url, headers=hdrs)
+        try:
+            resp = await client.get(url, headers=hdrs)
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse(
+                status_code=502,
+                content=format_error("Media Fetch Error", f"Upstream ton.x.com error: {type(exc).__name__}", "upstream_error", 502),
+            )
         if resp.status_code != 200:
             return JSONResponse(
                 status_code=resp.status_code if resp.status_code in (401, 403, 404) else 502,

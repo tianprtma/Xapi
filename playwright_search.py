@@ -135,16 +135,24 @@ class _InFlightCoalescer:
 _coalescer = _InFlightCoalescer()
 
 
+def _proxy_tag(auth_token: str) -> str:
+    from app.config import proxy_for_token
+    p = proxy_for_token(auth_token)
+    if not p:
+        return "direct"
+    return hashlib.sha256(p.encode("utf-8")).hexdigest()[:12]
+
+
 def _search_key(auth_token: str, q: str, search_type: SearchType) -> str:
     from app.config import token_key
-    return f"search:{token_key(auth_token)}:{q}:{search_type}"
+    return f"search:{token_key(auth_token)}:{_proxy_tag(auth_token)}:{q}:{search_type}"
 
 
 def _fetch_key(auth_token: str, navigate_url: str, match_path: str | list[str], click_selector: str | None = None) -> str:
     from app.config import token_key
     cs = click_selector or ""
     mp = match_path if isinstance(match_path, str) else "|".join(sorted(match_path))
-    return f"fetch:{token_key(auth_token)}:{navigate_url}:{mp}:{cs}"
+    return f"fetch:{token_key(auth_token)}:{_proxy_tag(auth_token)}:{navigate_url}:{mp}:{cs}"
 
 
 def _click_key(
@@ -158,7 +166,7 @@ def _click_key(
     mr = ""
     if match_response_substr:
         mr = match_response_substr if isinstance(match_response_substr, str) else "|".join(sorted(match_response_substr))
-    return f"click:{token_key(auth_token)}:{navigate_url}:{click_selector}:{confirm_selector or ''}:{mr}"
+    return f"click:{token_key(auth_token)}:{_proxy_tag(auth_token)}:{navigate_url}:{click_selector}:{confirm_selector or ''}:{mr}"
 
 
 class PlaywrightPool:

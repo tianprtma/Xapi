@@ -620,3 +620,121 @@ async def test_request_proxy_middleware_and_client_pool_isolation():
         assert len(pool._cache) == 2
         await pool.invalidate(tok)
         assert len(pool._cache) == 0
+
+
+# 22. validate_proxy_url rejects IPv4-mapped IPv6 and integer/hex/octal/shorthand loopback IPv4
+def test_validate_proxy_url_blocks_obfuscated_ssrf_hosts():
+    from app.config import validate_proxy_url
+
+    for bad in (
+        "http://[::ffff:127.0.0.1]:8080",
+        "http://[::ffff:169.254.169.254]:80",
+        "http://2130706433:8080",
+        "http://0x7f000001:8080",
+        "http://0177.0.0.1:8080",
+        "http://127.1:8080",
+    ):
+        with pytest.raises(ValueError):
+            validate_proxy_url(bad)
+
+
+# 23. SessionStore & Playwright coalescer keys isolate direct vs proxied requests per token
+@pytest.mark.asyncio
+async def test_session_store_and_coalescer_isolate_proxy_variants():
+    from app.config import reset_request_proxy, set_request_proxy, validate_proxy_url
+    from playwright_search import _search_key
+    from session_cache import SessionStore
+
+    store = SessionStore()
+    tok = "d" * 40
+    await store.store(tok, "ct0_direct", {"auth_token": tok, "__cf_bm": "direct_cf"})
+    key_direct = _search_key(tok, "jkt48", "Latest")
+
+    ctx_tok = set_request_proxy(validate_proxy_url("http://proxy.example.com:8080"))
+    try:
+        # Must NOT see direct IP-bound session under proxied context
+        assert await store.lookup(tok) is None
+        await store.store(tok, "ct0_proxy", {"auth_token": tok, "__cf_bm": "proxy_cf"})
+        key_proxy = _search_key(tok, "jkt48", "Latest")
+        assert (await store.lookup(tok)).cookies["__cf_bm"] == "proxy_cf"
+    finally:
+        reset_request_proxy(ctx_tok)
+
+    assert key_direct != key_proxy
+    assert (await store.lookup(tok)).cookies["__cf_bm"] == "direct_cf"
+    assert len(store._cache) == 2
+    await store.invalidate(tok)
+    assert len(store._cache) == 0
+
+
+# 24. media_upload falls back to proxy on 403/429/5xx direct failure & v2_dm_media_proxy handles auth/warm errors cleanly
+@pytest.mark.asyncio
+async def test_media_upload_direct_403_fallback_and_dm_media_proxy_errors():
+    from fastapi import HTTPException
+    from app.auth import InvalidTokenError, WarmNetworkError
+    from app.clients import media_upload
+    from app.config import reset_request_proxy, set_request_proxy, validate_proxy_url
+    from app.routers.dm import v2_dm_media_proxy
+
+    tok = "e" * 40
+    calls: list[str] = []
+
+    class _FakeSess:
+        def __init__(self, label):
+            self.label = label
+            self.cookies = MagicMock()
+            self.cookies.jar = []
+            self.timeout = 20.0
+
+        async def close(self):
+            return None
+
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def _fake_pooled(_t):
+        yield _FakeSess("proxy")
+
+    async def _fake_upload(client, *_a, **_kw):
+        calls.append(client.label)
+        if client.label == "direct":
+            return {"status": "error", "http_status": 403, "error": "cf mismatch", "stage": "INIT", "data": None}
+        return {"status": "ok", "http_status": 200, "data": {"media_id_string": "999"}}
+
+    ctx_tok = set_request_proxy(validate_proxy_url("http://proxy.example.com:8080"))
+    try:
+        with (
+            patch("app.clients.MEDIA_PROXY_EXEMPT", True),
+            patch("app.clients.pooled_client", _fake_pooled),
+            patch("app.clients.warm_session", AsyncMock(return_value=("ct0", {}))),
+            patch("app.clients._direct_session", return_value=_FakeSess("direct")),
+            patch("app.clients._upload_chunks", side_effect=_fake_upload),
+        ):
+            res = await media_upload(tok, b"jpegbytes", "image/jpeg")
+    finally:
+        reset_request_proxy(ctx_tok)
+
+    assert res["status"] == "ok"
+    assert calls == ["direct", "proxy"]
+
+    # v2_dm_media_proxy requires auth on xchat cached media
+    with pytest.raises(HTTPException) as exc_info:
+        await v2_dm_media_proxy("xchat", "m1", "img.jpg", authorization=None, auth_token=None)
+    assert exc_info.value.status_code == 401
+
+    # v2_dm_media_proxy maps InvalidTokenError -> 401 and WarmNetworkError -> 502 (not 500)
+    with (
+        patch("app.routers.dm.extract_bearer", return_value=tok),
+        patch("app.client_pool.pooled_client", _fake_pooled),
+        patch("app.routers.dm.warm_session", AsyncMock(side_effect=InvalidTokenError(401, "expired", {}, ""))),
+    ):
+        r401 = await v2_dm_media_proxy("123", "456", "img.jpg", authorization="Bearer " + tok, auth_token=None)
+    assert r401.status_code == 401
+
+    with (
+        patch("app.routers.dm.extract_bearer", return_value=tok),
+        patch("app.client_pool.pooled_client", _fake_pooled),
+        patch("app.routers.dm.warm_session", AsyncMock(side_effect=WarmNetworkError("proxy down", http_status=502))),
+    ):
+        r502 = await v2_dm_media_proxy("123", "456", "img.jpg", authorization="Bearer " + tok, auth_token=None)
+    assert r502.status_code == 502

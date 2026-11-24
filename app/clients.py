@@ -41,10 +41,14 @@ from .config import (
     REST_BASE,
     UPLOAD_BASE,
     WEB_BEARER,
+    _DIRECT_PROXY_SENTINEL,
     gen_ct0,
     headers_for_token,
     profile_for_token,
+    proxy_for_token,
     random_user_agent,
+    reset_request_proxy,
+    set_request_proxy,
 )
 from .response_cache import ResponseCache
 from .retry import with_retry
@@ -494,6 +498,7 @@ async def media_upload(
                 "data": None,
             }
         direct0 = _direct_session(auth_token, {}, 30.0)
+        direct_ctx_tok = set_request_proxy(_DIRECT_PROXY_SENTINEL)
         try:
             ct0, _ = await warm_session(direct0, auth_token)
             jar = {c.name: c.value for c in direct0.cookies.jar}
@@ -512,6 +517,7 @@ async def media_upload(
                 "data": None,
             }
         finally:
+            reset_request_proxy(direct_ctx_tok)
             try:
                 await direct0.close()
             except Exception:  # noqa: BLE001
@@ -526,8 +532,18 @@ async def media_upload(
     if MEDIA_PROXY_EXEMPT:
         direct = _direct_session(auth_token, jar, timeout)
         try:
-            return await _upload_chunks(
+            direct_res = await _upload_chunks(
                 direct, base_headers, file_bytes, media_type, media_category, max_poll_seconds=timeout)
+            if (
+                direct_res.get("status") == "ok"
+                or not proxy_for_token(auth_token)
+                or direct_res.get("http_status") not in (403, 429, 500, 502, 503, 504)
+            ):
+                return direct_res
+            logging.getLogger("xapi.upload").warning(
+                "upload direct ditolak upstream (HTTP %s) — fallback ke proxy",
+                direct_res.get("http_status"),
+            )
         except Exception as exc:  # noqa: BLE001
             logging.getLogger("xapi.upload").warning(
                 "upload direct gagal (%s: %s) — fallback ke proxy",

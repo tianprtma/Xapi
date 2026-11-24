@@ -9,6 +9,7 @@ import json
 import os
 import random
 import secrets
+import socket
 from pathlib import Path
 from typing import Any, Literal, Optional
 from urllib.parse import unquote, urlparse
@@ -333,13 +334,21 @@ def validate_proxy_url(raw: str) -> str:
         raise ValueError("host proxy tidak valid")
     if host in ("localhost", "localhost.localdomain") or host.endswith(".localhost"):
         raise ValueError("host proxy loopback tidak diizinkan")
+    parsed_ip = None
     try:
-        ip = ipaddress.ip_address(host)
-        if ip.is_loopback or ip.is_link_local or ip.is_unspecified or ip.is_multicast:
+        parsed_ip = ipaddress.ip_address(host)
+    except ValueError:
+        # Tangkap format IPv4 non-kanonik (integer `2130706433`, hex `0x7f000001`,
+        # oktal `0177.0.0.1`, shorthand `127.1`) yang diterima libcurl/OS.
+        try:
+            parsed_ip = ipaddress.IPv4Address(socket.inet_aton(host))
+        except OSError:
+            parsed_ip = None
+    if parsed_ip is not None:
+        if isinstance(parsed_ip, ipaddress.IPv6Address) and parsed_ip.ipv4_mapped is not None:
+            parsed_ip = parsed_ip.ipv4_mapped
+        if parsed_ip.is_loopback or parsed_ip.is_link_local or parsed_ip.is_unspecified or parsed_ip.is_multicast:
             raise ValueError("alamat IP proxy loopback/link-local tidak diizinkan")
-    except ValueError as exc:
-        if "tidak diizinkan" in str(exc):
-            raise
     try:
         port = parsed.port
     except ValueError as exc:

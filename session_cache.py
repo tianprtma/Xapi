@@ -14,12 +14,13 @@ sessions; lebih dari itu, oldest entries di-evict.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from app.config import token_key
+from app.config import proxy_for_token, token_key
 
 TTL_SECONDS = 300  # 5 menit (idle TTL)
 MAX_SESSION_AGE_SECONDS = 1200  # 20 menit (absolute TTL agar __cf_bm/ct0 tidak hidup selamanya)
@@ -60,8 +61,19 @@ class SessionStore:
             cls._instance = cls()
         return cls._instance
 
+    @staticmethod
+    def _session_key(auth_token: str) -> str:
+        """Key cache per `(auth_token, proxy)` agar cookie Cloudflare `__cf_bm`
+        yang terikat IP tidak saling mencemari antara jalur direct dan proxy."""
+        base = token_key(auth_token)
+        proxy = proxy_for_token(auth_token)
+        if not proxy:
+            return base
+        phash = hashlib.sha256(proxy.encode("utf-8")).hexdigest()[:12]
+        return f"{base}:p:{phash}"
+
     async def lookup(self, auth_token: str, ttl: float = TTL_SECONDS) -> Optional[Session]:
-        key = token_key(auth_token)
+        key = self._session_key(auth_token)
         async with self._lock:
             sess = self._cache.get(key)
             if sess and sess.is_alive(ttl):
@@ -79,7 +91,7 @@ class SessionStore:
         cookies: dict[str, str],
         user_id: Optional[str] = None,
     ) -> Session:
-        key = token_key(auth_token)
+        key = self._session_key(auth_token)
         async with self._lock:
             existing = self._cache.get(key)
             sess = Session(
@@ -98,7 +110,7 @@ class SessionStore:
 
     async def store_viewer(self, auth_token: str, viewer_payload: dict[str, Any]) -> None:
         """Cache viewer/login result untuk /2/users/me fast path."""
-        key = token_key(auth_token)
+        key = self._session_key(auth_token)
         async with self._lock:
             sess = self._cache.get(key)
             if sess:
@@ -107,7 +119,7 @@ class SessionStore:
                 self._cache.move_to_end(key)
 
     async def lookup_viewer(self, auth_token: str, ttl: float = TTL_SECONDS) -> Optional[dict[str, Any]]:
-        key = token_key(auth_token)
+        key = self._session_key(auth_token)
         async with self._lock:
             sess = self._cache.get(key)
             if sess and not sess.is_alive(ttl):
@@ -120,9 +132,11 @@ class SessionStore:
             return None
 
     async def invalidate(self, auth_token: str) -> None:
-        key = token_key(auth_token)
+        base = token_key(auth_token)
+        prefix = f"{base}:p:"
         async with self._lock:
-            self._cache.pop(key, None)
+            for k in [k for k in self._cache if k == base or k.startswith(prefix)]:
+                self._cache.pop(k, None)
 
     async def stats(self) -> dict[str, int]:
         async with self._lock:

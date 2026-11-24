@@ -1572,6 +1572,54 @@ def _dm_media_v2_obj(a: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in out.items() if v is not None}
 
 
+def _merge_dm_event_obj(existing_ev: dict[str, Any], new_ev: dict[str, Any]) -> dict[str, Any]:
+    """Gabungkan dua representasi DM event ber-id sama secara non-destruktif.
+
+    Aturan:
+    - Teks plaintext nyata tidak pernah ditimpa string kosong atau placeholder
+      `[XChat E2EE Encrypted Message]`.
+    - Status plaintext tidak pernah ditimpa kembali menjadi `_xchat_encrypted=True`.
+    - Lampiran (`_xapi_attachments`/`attachments`), `entities`, `referenced_tweets`,
+      `created_at`, `sender_id`, dan flag relasi dipertahankan dari sisi yang lebih lengkap.
+    """
+    _PLACEHOLDER = "[XChat E2EE Encrypted Message]"
+
+    def _has_real_text(ev_d: dict[str, Any]) -> bool:
+        t = str(ev_d.get("text") or "").strip()
+        return bool(t and t != _PLACEHOLDER and not ev_d.get("_xchat_encrypted"))
+
+    ex_plain = _has_real_text(existing_ev)
+    nw_plain = _has_real_text(new_ev)
+
+    merged = dict(existing_ev)
+    for k, v in new_ev.items():
+        if v is None:
+            continue
+        if k == "text":
+            if nw_plain:
+                merged["text"] = v
+            elif not ex_plain and str(v or "").strip() and not str(merged.get("text") or "").strip():
+                merged["text"] = v
+            continue
+        if k in ("_xchat_encrypted", "encrypted_text"):
+            if ex_plain or nw_plain:
+                continue
+            if not merged.get(k):
+                merged[k] = v
+            continue
+        if k in ("_xapi_attachments", "attachments", "referenced_tweets", "entities"):
+            if v and not merged.get(k):
+                merged[k] = v
+            continue
+        if merged.get(k) in (None, "", [], {}):
+            merged[k] = v
+
+    if ex_plain or nw_plain:
+        merged.pop("_xchat_encrypted", None)
+        merged.pop("encrypted_text", None)
+    return merged
+
+
 def format_dm_events(
     payload: dict[str, Any],
     event_types: Optional[str] = None,
@@ -1607,7 +1655,7 @@ def format_dm_events(
     )
 
     events: list[dict[str, Any]] = []
-    seen_ids: set[str] = set()
+    seen_ids: dict[str, int] = {}
     users_map: dict[str, dict[str, Any]] = {}
     convs_map: dict[str, dict[str, Any]] = {}
     media_map: dict[str, dict[str, Any]] = {}
@@ -1620,9 +1668,14 @@ def format_dm_events(
         gql_events, gql_users, gql_convs, next_token, prev_token = _extract_gql_dm_conversations_and_events(target_data)
         for ev in gql_events:
             eid = ev.get("id")
-            if eid and eid not in seen_ids:
-                seen_ids.add(eid)
+            if not eid:
+                continue
+            if eid not in seen_ids:
+                seen_ids[eid] = len(events)
                 events.append(ev)
+            else:
+                idx_ev = seen_ids[eid]
+                events[idx_ev] = _merge_dm_event_obj(events[idx_ev], ev)
         users_map.update(gql_users)
         convs_map.update(gql_convs)
 
@@ -1677,24 +1730,13 @@ def format_dm_events(
             ev_input = {**body, "type": body.get("type") or kind}
             obj = _dm_event_to_obj(ev_input, users=raw_users)
             if obj and obj.get("id"):
-                if obj["id"] not in seen_ids:
-                    seen_ids.add(obj["id"])
+                oid = obj["id"]
+                if oid not in seen_ids:
+                    seen_ids[oid] = len(events)
                     events.append(obj)
                 else:
-                    for idx_ev, existing_ev in enumerate(events):
-                        if existing_ev.get("id") == obj["id"] and (
-                            existing_ev.get("_xchat_encrypted")
-                            or not existing_ev.get("text")
-                            or (obj.get("_xapi_attachments") and not existing_ev.get("_xapi_attachments"))
-                            or (obj.get("referenced_tweets") and not existing_ev.get("referenced_tweets"))
-                            or (obj.get("entities") and not existing_ev.get("entities"))
-                        ):
-                            merged_ev = {**existing_ev, **obj}
-                            if not obj.get("_xchat_encrypted"):
-                                merged_ev.pop("_xchat_encrypted", None)
-                                merged_ev.pop("encrypted_text", None)
-                            events[idx_ev] = merged_ev
-                            break
+                    idx_ev = seen_ids[oid]
+                    events[idx_ev] = _merge_dm_event_obj(events[idx_ev], obj)
             # Extract quoted/shared tweet for includes.tweets if present in attachment
             msg_data = body.get("message_data") or (body.get("message_create") or {}).get("message_data") or {}
             tw_attach = (msg_data.get("attachment") or {}).get("tweet") or {}

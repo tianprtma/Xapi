@@ -560,8 +560,8 @@ async def unlock_and_read_xchat_inbox(
                                     const parsed = Date.parse(normSeg + (normSeg.match(/\\d{4}/) ? '' : ' ' + new Date().getFullYear()));
                                     if (!isNaN(parsed)) {
                                         const ageMs = Date.now() - parsed;
-                                        if (ageMs < 0) return Date.now() - (parsed - 31536000000);
-                                        return ageMs;
+                                        if (ageMs < -86400000) return Date.now() - (parsed - 31536000000);
+                                        return Math.max(0, ageMs);
                                     }
                                 }
                             }
@@ -627,6 +627,7 @@ async def unlock_and_read_xchat_inbox(
                                 preview_text: previewText,
                                 aria_desc: ariaDesc,
                                 age_ms: ageMs,
+                                relative_age_ms: ageMs,
                                 is_unread: isUnread,
                             });
                         }
@@ -1134,27 +1135,69 @@ def query_inbox_rows(
     preview, timestamp jadi umur) lalu buang percakapan yang dm_conversation
     menandai deleted. Keluaran meniru unlock_and_read_xchat_inbox: id minus,
     conv_href, preview_text, relative_age_ms."""
-    convs = conn.execute(
-        """
-        SELECT e.conversation_id AS cid,
-               e.timestamp AS ts,
-               e.plain_text AS preview,
-               e.sender_id AS sender
-        FROM dm_entry e
-        JOIN (
-            SELECT conversation_id, MAX(timestamp) AS max_ts
-            FROM dm_entry
-            WHERE deleted = 0 AND conversation_id IS NOT NULL
-            GROUP BY conversation_id
-        ) latest
-          ON latest.conversation_id = e.conversation_id
-         AND latest.max_ts = e.timestamp
-        WHERE e.deleted = 0
-        ORDER BY e.timestamp DESC
-        LIMIT ?
-        """,
-        (max(1, int(limit)) * 2,),
-    ).fetchall()
+    lim = max(1, int(limit))
+    has_conv_table = False
+    try:
+        has_conv_table = bool(
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='dm_conversation'"
+            ).fetchone()
+        )
+    except Exception:
+        has_conv_table = False
+
+    if has_conv_table:
+        convs = conn.execute(
+            """
+            SELECT e.conversation_id AS cid,
+                   e.timestamp AS ts,
+                   e.plain_text AS preview,
+                   e.sender_id AS sender
+            FROM dm_entry e
+            JOIN (
+                SELECT e2.conversation_id,
+                       MAX(e2.timestamp) AS max_ts
+                FROM dm_entry e2
+                LEFT JOIN dm_conversation c
+                  ON c.conversation_id = e2.conversation_id
+                WHERE e2.deleted = 0
+                  AND e2.conversation_id IS NOT NULL
+                  AND e2.conversation_id LIKE '%:%'
+                  AND (c.deleted IS NULL OR c.deleted = 0)
+                GROUP BY e2.conversation_id
+            ) latest
+              ON latest.conversation_id = e.conversation_id
+             AND latest.max_ts = e.timestamp
+            WHERE e.deleted = 0
+            ORDER BY e.timestamp DESC, e.rowid DESC
+            LIMIT ?
+            """,
+            (max(lim * 4, 200),),
+        ).fetchall()
+    else:
+        convs = conn.execute(
+            """
+            SELECT e.conversation_id AS cid,
+                   e.timestamp AS ts,
+                   e.plain_text AS preview,
+                   e.sender_id AS sender
+            FROM dm_entry e
+            JOIN (
+                SELECT conversation_id, MAX(timestamp) AS max_ts
+                FROM dm_entry
+                WHERE deleted = 0
+                  AND conversation_id IS NOT NULL
+                  AND conversation_id LIKE '%:%'
+                GROUP BY conversation_id
+            ) latest
+              ON latest.conversation_id = e.conversation_id
+             AND latest.max_ts = e.timestamp
+            WHERE e.deleted = 0
+            ORDER BY e.timestamp DESC, e.rowid DESC
+            LIMIT ?
+            """,
+            (max(lim * 4, 200),),
+        ).fetchall()
     now_ms = int(time.time() * 1000)
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -1162,15 +1205,6 @@ def query_inbox_rows(
         if not cid or ":" not in cid or cid in seen:
             continue
         dash_id = cid.replace(":", "-")
-        try:
-            deleted_flag = conn.execute(
-                "SELECT deleted FROM dm_conversation WHERE conversation_id = ?",
-                (cid,),
-            ).fetchone()
-            if deleted_flag and deleted_flag[0]:
-                continue
-        except Exception:
-            pass
         seen.add(cid)
         out.append({
             "id": dash_id,
@@ -1181,7 +1215,7 @@ def query_inbox_rows(
             "last_sender_id": str(sender or ""),
             "last_ts": ts,
         })
-        if len(out) >= max(1, int(limit)):
+        if len(out) >= lim:
             break
     return out
 

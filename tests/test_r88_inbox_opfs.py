@@ -86,3 +86,222 @@ def test_inbox_event_projection_keeps_conv_id_format():
     rows = xee.query_inbox_rows(conn, bot_user_id="1394249284736864258", limit=10)
     for r in rows:
         assert ":" not in r["id"], "id percakapan wajib format minus (pemisah -)"
+
+
+def test_query_inbox_rows_not_starved_by_deleted_or_group_or_ties():
+    """Percakapan 1:1 aktif tidak boleh terpotong LIMIT bila di atasnya ada banyak
+    percakapan terhapus, grup (tanpa ':'), atau tie timestamp yang sama."""
+    conn = sqlite3.connect(":memory:")
+    conn.execute("""
+        CREATE TABLE dm_entry (
+            entry_id TEXT, conversation_id TEXT, sequence_number INTEGER,
+            timestamp INTEGER, entry_type TEXT, contents BLOB,
+            sender_id INTEGER, message_status TEXT, plain_text TEXT,
+            has_attachment INTEGER, affects_sort_order INTEGER,
+            affects_read_state INTEGER, event_type TEXT,
+            attachment_types TEXT, deleted INTEGER
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE dm_conversation (
+            conversation_id TEXT, muted INTEGER, deleted INTEGER, trusted INTEGER
+        )
+    """)
+    now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+    # 15 percakapan terhapus di paling atas (timestamp paling baru)
+    for i in range(15):
+        cid = f"1394249284736864258:{1000 + i}"
+        conn.execute(
+            "INSERT INTO dm_entry VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (f"del-{i}", cid, i, now_ms - i, "message", b"x", 1000 + i, "Sent", "del", 0, 1, 1, None, None, 0),
+        )
+        conn.execute("INSERT INTO dm_conversation VALUES (?,?,?,?)", (cid, 0, 1, 1))
+    # 10 percakapan grup (tanpa ':')
+    for i in range(10):
+        cid = f"group{i}"
+        conn.execute(
+            "INSERT INTO dm_entry VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (f"grp-{i}", cid, i, now_ms - 100 - i, "message", b"x", 2000 + i, "Sent", "grp", 0, 1, 1, None, None, 0),
+        )
+        conn.execute("INSERT INTO dm_conversation VALUES (?,?,?,?)", (cid, 0, 0, 1))
+    # 5 percakapan 1:1 aktif (termasuk tie timestamp di percakapan pertama)
+    for i in range(5):
+        cid = f"1394249284736864258:{3000 + i}"
+        ts = now_ms - 10_000 - i * 1000
+        conn.execute(
+            "INSERT INTO dm_entry VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (f"act-{i}-a", cid, 1, ts, "message", b"x", 3000 + i, "Sent", f"aktif {i}", 0, 1, 1, None, None, 0),
+        )
+        conn.execute(
+            "INSERT INTO dm_entry VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (f"act-{i}-b", cid, 2, ts, "message", b"x", 3000 + i, "Sent", f"aktif {i} tie", 0, 1, 1, None, None, 0),
+        )
+        conn.execute("INSERT INTO dm_conversation VALUES (?,?,?,?)", (cid, 0, 0, 1))
+
+    rows = xee.query_inbox_rows(conn, bot_user_id="1394249284736864258", limit=5)
+    assert len(rows) == 5
+    got_ids = [r["id"] for r in rows]
+    assert got_ids == [f"1394249284736864258-{3000 + i}" for i in range(5)]
+
+
+def test_format_dm_events_merges_gql_and_rest_non_destructively():
+    """Duplikat id antar-sumber GraphQL/REST harus menggabung field tanpa
+    menimpa teks plaintext dengan string kosong atau placeholder E2EE."""
+    from formatter import _merge_dm_event_obj, format_dm_events
+
+    plain_ev = {
+        "id": "2000000000000000001",
+        "event_type": "MessageCreate",
+        "dm_conversation_id": "1-2",
+        "sender_id": "2",
+        "text": "wots ini teks asli",
+        "created_at": "2026-11-23T10:00:00.000Z",
+    }
+    rest_empty_with_entities = {
+        "id": "2000000000000000001",
+        "event_type": "MessageCreate",
+        "dm_conversation_id": "1-2",
+        "sender_id": "2",
+        "text": "",
+        "entities": {"hashtags": [], "mentions": [], "urls": [{"url": "https://t.co/x", "expanded_url": "https://example.com"}]},
+    }
+    merged = _merge_dm_event_obj(plain_ev, rest_empty_with_entities)
+    assert merged["text"] == "wots ini teks asli"
+    assert merged["entities"]["urls"][0]["expanded_url"] == "https://example.com"
+    assert "_xchat_encrypted" not in merged
+
+    # Urutan terbalik: stub terenkripsi duluan, plaintext menyusul -> plaintext menang
+    enc_stub = {
+        "id": "2000000000000000002",
+        "event_type": "MessageCreate",
+        "text": "[XChat E2EE Encrypted Message]",
+        "_xchat_encrypted": True,
+        "encrypted_text": "cipher==",
+    }
+    merged2 = _merge_dm_event_obj(enc_stub, plain_ev)
+    assert merged2["text"] == "wots ini teks asli"
+    assert "_xchat_encrypted" not in merged2
+    assert "encrypted_text" not in merged2
+
+    # End-to-end lewat format_dm_events: GraphQL plaintext + REST entities ber-teks kosong
+    payload = {
+        "data": {
+            "get_inbox_page": {
+                "messages": [
+                    {
+                        "id": "2000000000000000003",
+                        "conversation_id": "1:2",
+                        "sender_id": "2",
+                        "text": "wots jangan terhapus",
+                        "created_at_ms": "1763892000000",
+                    }
+                ]
+            }
+        },
+        "inbox_initial_state": {
+            "entries": [
+                {
+                    "message": {
+                        "id": "2000000000000000003",
+                        "conversation_id": "1-2",
+                        "time": "1763892000000",
+                        "message_data": {
+                            "sender_id": "2",
+                            "text": "",
+                            "entities": {
+                                "urls": [{"url": "https://t.co/a", "expanded_url": "https://example.org"}]
+                            },
+                        },
+                    }
+                }
+            ]
+        },
+    }
+    formatted = format_dm_events(payload)
+    assert len(formatted["data"]) == 1
+    ev = formatted["data"][0]
+    assert ev["text"] == "wots jangan terhapus"
+    assert ev["entities"]["urls"][0]["expanded_url"] == "https://example.org"
+
+
+@pytest.mark.asyncio
+async def test_v2_dm_conversations_opfs_new_convs_not_truncated_by_stale_graphql(monkeypatch):
+    """Percakapan E2EE baru dari OPFS/sidebar TIDAK boleh terpotong [:max_results]
+    ketika GraphQL mengembalikan max_results percakapan lama."""
+    import app.routers.dm as dm_router
+
+    async def fake_graphql_call(*args, **kwargs):
+        return {
+            "status": "ok",
+            "http_status": 200,
+            "data": {
+                "data": {
+                    "get_initial_chat_page": {
+                        "conversations": [
+                            {
+                                "conversation_id": f"100:{200 + i}",
+                                "latest_message": {
+                                    "id": str(1900000000000000000 + i),
+                                    "conversation_id": f"100:{200 + i}",
+                                    "sender_id": str(200 + i),
+                                    "text": f"lama {i}",
+                                    "created_at": f"2026-11-20T0{i}:00:00.000Z",
+                                },
+                            }
+                            for i in range(3)
+                        ]
+                    }
+                }
+            },
+        }
+
+    async def fake_dm_call(*args, **kwargs):
+        return {"status": "error", "http_status": 404, "data": None}
+
+    async def fake_resolve_me_id(tok):
+        return "100"
+
+    now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+
+    async def fake_unlock_inbox(tok, pin, my_user_id=None, max_results=50):
+        return [
+            {
+                "id": "100-901",
+                "conv_href": "/i/chat/100-901",
+                "preview_text": "wots baru banget",
+                "relative_age_ms": 5_000,
+                "last_ts": now_ms - 5_000,
+                "last_sender_id": "901",
+            },
+            {
+                "id": "100-902",
+                "conv_href": "/i/chat/100-902",
+                "preview_text": "wots baru kedua",
+                "relative_age_ms": 30_000,
+                "last_ts": now_ms - 30_000,
+                "last_sender_id": "902",
+            },
+        ]
+
+    monkeypatch.setattr(dm_router, "graphql_call", fake_graphql_call)
+    monkeypatch.setattr(dm_router, "dm_call", fake_dm_call)
+    monkeypatch.setattr(dm_router, "resolve_me_id", fake_resolve_me_id)
+    monkeypatch.setattr(dm_router, "unlock_and_read_xchat_inbox", fake_unlock_inbox)
+    monkeypatch.setattr(dm_router, "resolve_dm_pin", lambda header, query=None: "1234")
+
+    resp = await dm_router.v2_chat_conversations(
+        max_results=3,
+        pagination_token=None,
+        mode="auto",
+        dm_pin=None,
+        x_dm_pin="1234",
+        authorization="Bearer " + "a" * 40,
+        auth_token=None,
+        raw=0,
+    )
+    import json as _json
+    body = _json.loads(resp.body)
+    ids = [c["id"] for c in body["data"]]
+    assert len(ids) == 3
+    assert ids[0] == "100-901"
+    assert ids[1] == "100-902"

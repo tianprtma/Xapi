@@ -629,13 +629,34 @@ async def v2_chat_conversations(
         me = await resolve_me_id(tok)
         inbox_items = await unlock_and_read_xchat_inbox(tok, pin, my_user_id=me, max_results=max_results)
         if inbox_items:
-            by_cid = {item["id"]: item for item in inbox_items if item.get("id")}
+            def _canon_cid(raw_cid: str) -> str:
+                norm = str(raw_cid or "").replace(":", "-")
+                parts = norm.split("-")
+                if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                    a, b = sorted(parts, key=lambda p: (len(p), p))
+                    return f"{a}-{b}"
+                return norm
+
+            by_cid = {}
+            inbox_order: dict[str, int] = {}
+            for idx_item, item in enumerate(inbox_items):
+                raw_id = item.get("id")
+                if not raw_id:
+                    continue
+                ck = _canon_cid(str(raw_id))
+                if ck not in by_cid:
+                    by_cid[ck] = item
+                    inbox_order[ck] = idx_item
+
             merged_convs = []
             seen_cids = set()
             for c in convs:
                 cid = str(c.get("id") or "").replace(":", "-")
-                seen_cids.add(cid)
-                item = by_cid.get(cid)
+                ck = _canon_cid(cid)
+                if ck in seen_cids:
+                    continue
+                seen_cids.add(ck)
+                item = by_cid.get(ck)
                 if item:
                     non_null_item = {k: v for k, v in item.items() if v is not None}
                     # Preserve non-intent profile_href if c already has one
@@ -651,8 +672,9 @@ async def v2_chat_conversations(
                         lme["_xchat_decrypted"] = True
                         c["last_message_event"] = lme
                 merged_convs.append(c)
-            for cid, item in by_cid.items():
-                if cid not in seen_cids:
+            for ck, item in by_cid.items():
+                if ck not in seen_cids:
+                    cid = str(item.get("id") or ck).replace(":", "-")
                     merged_convs.append(
                         {
                             "id": cid,
@@ -667,6 +689,42 @@ async def v2_chat_conversations(
                             },
                         }
                     )
+
+            # Urutkan percakapan terbaru-dulu sebelum [:max_results] agar
+            # percakapan E2EE baru dari OPFS/sidebar TIDAK terpotong oleh
+            # daftar percakapan lama dari GraphQL.
+            import time as _time
+            from datetime import datetime as _dt, timezone as _tz
+
+            now_ms_sort = _time.time() * 1000.0
+
+            def _conv_recency_key(conv: dict[str, Any]) -> tuple[int, float, int]:
+                cid_s = str(conv.get("id") or "").replace(":", "-")
+                ck_s = _canon_cid(cid_s)
+                last_ts = conv.get("last_ts")
+                if isinstance(last_ts, (int, float)) and last_ts > 0:
+                    return (1, float(last_ts), -inbox_order.get(ck_s, 10**9))
+                age_val = conv.get("relative_age_ms")
+                if age_val is None:
+                    age_val = conv.get("age_ms")
+                if isinstance(age_val, (int, float)) and age_val >= 0:
+                    return (1, now_ms_sort - float(age_val), -inbox_order.get(ck_s, 10**9))
+                lme_c = conv.get("last_message_event") or {}
+                ca = lme_c.get("created_at")
+                if isinstance(ca, str) and ca:
+                    try:
+                        ts_s = _dt.fromisoformat(ca.replace("Z", "+00:00"))
+                        if ts_s.tzinfo is None:
+                            ts_s = ts_s.replace(tzinfo=_tz.utc)
+                        return (1, ts_s.timestamp() * 1000.0, -inbox_order.get(ck_s, 10**9))
+                    except ValueError:
+                        pass
+                # Tanpa timestamp: prioritaskan urutan sidebar/OPFS jika ada
+                if ck_s in inbox_order:
+                    return (0, float(-inbox_order[ck_s]), 0)
+                return (-1, 0.0, 0)
+
+            merged_convs.sort(key=_conv_recency_key, reverse=True)
             formatted["data"] = merged_convs[:max_results]
             formatted["meta"] = {**(formatted.get("meta") or {}), "result_count": len(formatted["data"])}
 

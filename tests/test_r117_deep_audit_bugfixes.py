@@ -1199,3 +1199,61 @@ async def test_pass14_warm_session_proxy_407_403_not_401_and_407_mapped_to_502()
     assert v_res["http_status"] == 403
     inv_s_v.assert_awaited_once_with(tok, all_proxies=False)
     inv_c_v.assert_awaited_once_with(tok, all_proxies=False)
+
+
+# ── 31. Pass 18: XChatContextPool SingletonLock race on invalidate-while-in-use & _canon_static_proxy shorthand ──
+
+@pytest.mark.asyncio
+async def test_pass18_xchat_singleton_lock_wait_on_dropped_close_and_static_proxy_canon():
+    from app.config import _canon_static_proxy
+    from playwright_search import XChatContextPool
+
+    assert _canon_static_proxy("31.6.46.27:12323:usr:p@s:s") == "http://usr:p%40s%3As@31.6.46.27:12323"
+    assert _canon_static_proxy("http://127.0.0.1:8080") == ""
+    assert _canon_static_proxy("direct") == ""
+
+    tok = "9" * 40
+    pool = XChatContextPool()
+    events_order = []
+
+    async def _slow_close():
+        events_order.append("close_start")
+        await asyncio.sleep(0.06)
+        events_order.append("close_done")
+
+    old_ctx = MagicMock(pages=[], close=AsyncMock(side_effect=_slow_close))
+    new_ctx = MagicMock(pages=[], add_init_script=AsyncMock(), add_cookies=AsyncMock(), close=AsyncMock())
+
+    import hashlib as _hl
+    key = _hl.sha256(f"xchat:{tok}".encode()).hexdigest()[:16]
+    pool._ctxs[key] = old_ctx
+    pool._ctx_proxy[key] = "http://31.6.46.27:12323"
+    pool._ctx_use[id(old_ctx)] = 1
+
+    # Invalidate while old_ctx is STILL in-use (simulates ERR_PROXY inside xchat_e2ee before finally: release())
+    await pool.invalidate(tok)
+    assert key not in pool._ctxs
+    assert pool._closing_count.get(key) == 1
+
+    async def _launch_new(*a, **kw):
+        events_order.append("launch_new")
+        return new_ctx
+
+    fake_driver = MagicMock()
+    fake_driver.chromium.launch_persistent_context = AsyncMock(side_effect=_launch_new)
+
+    async def _release_holder():
+        await asyncio.sleep(0.02)
+        await pool.release(tok, old_ctx)
+
+    with (
+        patch("playwright_search.PlaywrightPool.get", return_value=MagicMock(driver=AsyncMock(return_value=fake_driver))),
+        patch("playwright_search._apply_session_cookies", AsyncMock()),
+    ):
+        rel_t = asyncio.create_task(_release_holder())
+        acquired = await pool.acquire(tok)
+        await rel_t
+
+    assert acquired is new_ctx
+    # launch_new MUST strictly happen AFTER close_done (never overlapping SingletonLock!)
+    assert events_order == ["close_start", "close_done", "launch_new"]

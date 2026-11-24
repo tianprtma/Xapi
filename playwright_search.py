@@ -619,7 +619,8 @@ class XChatContextPool:
         self._ctxs: OrderedDict[str, BrowserContext] = OrderedDict()  # key = hash
         self._ctx_use: dict[int, int] = {}   # id(ctx) -> jumlah holder
         self._ctx_proxy: dict[str, Optional[str]] = {}  # key -> proxy URL aktif
-        self._idle_events: dict[str, asyncio.Event] = {}  # key -> notif saat context idle
+        self._closing_count: dict[str, int] = {}  # key -> context yg sedang drain/close (anti SingletonLock race)
+        self._idle_events: dict[str, asyncio.Event] = {}  # key -> notif saat context idle/closed
         self._dropped: set = set()           # dihapus saat masih dipakai
         self._lock = asyncio.Lock()
 
@@ -653,7 +654,14 @@ class XChatContextPool:
                     ct0_file.write_text(ct0)
 
                 ctx = self._ctxs.get(key)
-                if ctx is not None and self._ctx_proxy.get(key) != desired_proxy:
+                if self._closing_count.get(key, 0) > 0:
+                    # Context lama untuk profile_dir ini masih proses close() —
+                    # wajib tunggu selesai agar tidak menabrak Chromium SingletonLock.
+                    wait_ev = self._idle_events.get(key)
+                    if wait_ev is None or wait_ev.is_set():
+                        wait_ev = asyncio.Event()
+                        self._idle_events[key] = wait_ev
+                elif ctx is not None and self._ctx_proxy.get(key) != desired_proxy:
                     if self._ctx_use.get(id(ctx), 0) > 0:
                         # Context sedang dipakai dengan proxy berbeda — tunggu
                         # holder selesai agar tidak pernah membocorkan IP salah.
@@ -684,13 +692,19 @@ class XChatContextPool:
                             self._ctx_proxy.pop(key, None)
                             if self._ctx_use.get(id(ctx), 0) > 0:
                                 self._dropped.add(ctx)
+                                self._closing_count[key] = self._closing_count.get(key, 0) + 1
+                                wait_ev = self._idle_events.get(key)
+                                if wait_ev is None or wait_ev.is_set():
+                                    wait_ev = asyncio.Event()
+                                    self._idle_events[key] = wait_ev
                             else:
                                 self._ctx_use.pop(id(ctx), None)
                                 try:
                                     await ctx.close()
                                 except Exception:  # noqa: BLE001
                                     pass
-
+                                ctx = None
+                if wait_ev is None:
                     prof = profile_for_token(auth_token)
                     is_win = "Windows" in prof["sec_ch_ua_platform"]
                     profile_dir.mkdir(parents=True, exist_ok=True)
@@ -822,36 +836,56 @@ class XChatContextPool:
                 self._ctx_use[id(ctx)] = count - 1
                 return
             self._ctx_use.pop(id(ctx), None)
-            ev = self._idle_events.pop(key, None)
-            if ev is not None:
-                ev.set()
             dropped = ctx in self._dropped
             if dropped:
                 self._dropped.discard(ctx)
+            else:
+                ev = self._idle_events.pop(key, None)
+                if ev is not None:
+                    ev.set()
         if dropped:
             try:
                 await ctx.close()
             except Exception:  # noqa: BLE001
                 pass
+            finally:
+                async with self._lock:
+                    rem = max(0, self._closing_count.get(key, 0) - 1)
+                    if rem == 0:
+                        self._closing_count.pop(key, None)
+                        ev = self._idle_events.pop(key, None)
+                        if ev is not None:
+                            ev.set()
+                    else:
+                        self._closing_count[key] = rem
 
     async def invalidate(self, auth_token: str) -> None:
         key = hashlib.sha256(f"xchat:{auth_token}".encode()).hexdigest()[:16]
         async with self._lock:
             ctx = self._ctxs.pop(key, None)
             self._ctx_proxy.pop(key, None)
-            ev = self._idle_events.pop(key, None)
-            if ev is not None:
-                ev.set()
-            if ctx and self._ctx_use.get(id(ctx), 0) > 0:
-                self._dropped.add(ctx)
+            if ctx is None:
                 return
-            if ctx:
-                self._ctx_use.pop(id(ctx), None)
-        if ctx:
-            try:
-                await ctx.close()
-            except Exception:  # noqa: BLE001
-                pass
+            if self._ctx_use.get(id(ctx), 0) > 0:
+                self._dropped.add(ctx)
+                self._closing_count[key] = self._closing_count.get(key, 0) + 1
+                return
+            self._ctx_use.pop(id(ctx), None)
+            self._closing_count[key] = self._closing_count.get(key, 0) + 1
+        try:
+            await ctx.close()
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            async with self._lock:
+                rem = max(0, self._closing_count.get(key, 0) - 1)
+                if rem == 0:
+                    self._closing_count.pop(key, None)
+                    ev = self._idle_events.pop(key, None)
+                    if ev is not None:
+                        ev.set()
+                else:
+                    self._closing_count[key] = rem
 
     async def close_all(self) -> None:
         async with self._lock:
@@ -859,6 +893,7 @@ class XChatContextPool:
             self._ctxs.clear()
             self._ctx_proxy.clear()
             self._ctx_use.clear()
+            self._closing_count.clear()
             for ev in self._idle_events.values():
                 ev.set()
             self._idle_events.clear()

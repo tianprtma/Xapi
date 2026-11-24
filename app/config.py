@@ -427,16 +427,26 @@ def validate_proxy_url(raw: str) -> str:
 
 
 def _canon_static_proxy(raw: str) -> str:
-    """Kanonikalisasi entry PROXY_LIST (lowercase skema/host, tanpa trailing `/`)
-    agar hash key pool/session identik dengan header `X-Proxy-Url`."""
-    val = (raw or "").strip()
+    """Kanonikalisasi entry PROXY_LIST (dukung shorthand `host:port:user:pass`,
+    lowercase skema/host, tanpa trailing `/`, tolak entry tidak valid/loopback)."""
+    from urllib.parse import quote as _quote
+
+    val = (raw or "").strip().strip('"').strip("'").strip()
     if not val:
         return ""
+    if "://" not in val and val.lower() not in ("direct", "none") and not val.startswith("["):
+        parts = val.split(":", 3)
+        if len(parts) == 4 and parts[0] and "/" not in parts[0] and "@" not in parts[0] and parts[1].isdigit():
+            val = f"http://{_quote(parts[2], safe='')}:{_quote(parts[3], safe='')}@{parts[0]}:{parts[1]}"
+        elif len(parts) == 2 and parts[0] and "/" not in parts[0] and "@" not in parts[0] and parts[1].isdigit():
+            val = f"http://{parts[0]}:{parts[1]}"
     try:
         canon = validate_proxy_url(val)
         return "" if canon == _DIRECT_PROXY_SENTINEL else canon
     except ValueError:
-        return val.rstrip("/")
+        import logging as _logging
+        _logging.getLogger("xapi.config").warning("PROXY_LIST entry diabaikan karena tidak valid")
+        return ""
 
 
 # Proxy rotation: comma-separated `http://[user:pass@]host:port` urls.

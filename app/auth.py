@@ -207,6 +207,7 @@ async def warm_session(
         except WarmNetworkError:
             raise
         except Exception as exc:  # noqa: BLE001
+            await ClientPool.get().invalidate(auth_token, all_proxies=False)
             raise WarmNetworkError(
                 redact_proxy_creds(f"GET {HOMEPAGE_URL} failed twice: {type(exc).__name__}: {exc}")
             ) from exc

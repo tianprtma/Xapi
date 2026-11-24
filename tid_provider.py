@@ -160,7 +160,8 @@ class TIDProvider:
                     except Exception:  # noqa: BLE001
                         pass
             except Exception as e:  # noqa: BLE001
-                log.warning("TID home fetch via client failed: %s", e)
+                from app.config import redact_proxy_creds
+                log.warning("TID home fetch via client failed: %s", redact_proxy_creds(str(e)))
                 return None
 
         async def _fetch_home_via_browser() -> Optional[str]:
@@ -201,7 +202,8 @@ class TIDProvider:
                     finally:
                         await ContextPool.get().release(auth_token, ctx)
             except Exception as e:  # noqa: BLE001
-                log.warning("TID home fetch via browser failed: %s", e)
+                from app.config import redact_proxy_creds
+                log.warning("TID home fetch via browser failed: %s", redact_proxy_creds(str(e)))
                 return None
 
         # Urutan: browser (jika PLAYWRIGHT_ENABLED=1) → curl_cffi login →
@@ -250,6 +252,7 @@ class TIDProvider:
 
         def _do() -> ClientTransaction:
             with _BoundedSession() as sess:
+                sess.trust_env = False
                 sess.headers["User-Agent"] = (
                     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -279,10 +282,11 @@ class TIDProvider:
                     self._refresh_failures = 0
                     self._fallback_mode = False
                 except Exception as e:  # noqa: BLE001
+                    from app.config import redact_proxy_creds
                     self._refresh_failures += 1
                     log.warning(
                         "TID refresh failed (%d/%d): %s",
-                        self._refresh_failures, MAX_REFRESH_FAILURES, e,
+                        self._refresh_failures, MAX_REFRESH_FAILURES, redact_proxy_creds(str(e)),
                     )
                     if self._refresh_failures >= MAX_REFRESH_FAILURES:
                         self._fallback_mode = True

@@ -297,13 +297,6 @@ ADMIN_TOKEN: str = os.environ.get("ADMIN_TOKEN", "").strip()
 # Ambil dari env var atau terserah.
 XCHAT_BOT_USER_ID: str = os.environ.get("XCHAT_BOT_USER_ID", "").strip()
 
-# Proxy rotation: comma-separated `http://[user:pass@]host:port` urls.
-# Random per make_client call. Kosong = no proxy (direct).
-_proxy_raw = os.environ.get("PROXY_LIST", "").strip()
-PROXY_LIST: tuple[str, ...] = tuple(
-    p.strip() for p in _proxy_raw.split(",") if p.strip()
-) if _proxy_raw else tuple()
-
 # Izinkan klien mengirim header `X-Proxy-Url` per-request agar tiap project
 # (menfessllm, jkt48history, dll.) mengatur proxy sendiri di `.env` masing-masing.
 # 0 = tolak header `X-Proxy-Url` (rekomendasi jika Xapi diekspos ke publik).
@@ -316,14 +309,14 @@ _REQUEST_PROXY_VAR: contextvars.ContextVar[Optional[str]] = contextvars.ContextV
 )
 
 
-_PROXY_CREDS_RE = _re.compile(r"((?:https?|socks5h?)://)([^:@/\s]+):([^@/\s]+)@")
+_PROXY_CREDS_RE = _re.compile(r"((?:https?|socks5h?)://)([^@/\s]+)@")
 
 
 def redact_proxy_creds(text: str) -> str:
-    """Mask kredensial `user:pass` pada URL proxy agar tidak pernah bocor ke log/error."""
+    """Mask kredensial (`user:pass@` maupun `token@`) pada URL proxy agar tidak bocor ke log/error."""
     if not text or "://" not in text:
         return text
-    return _PROXY_CREDS_RE.sub(r"\1***:***@", text)
+    return _PROXY_CREDS_RE.sub(r"\1***@", text)
 
 
 def _is_disallowed_proxy_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
@@ -400,6 +393,27 @@ def validate_proxy_url(raw: str) -> str:
     canon_hostport = hostport.lower()
     canon_netloc = f"{userinfo}@{canon_hostport}" if sep else canon_hostport
     return f"{scheme}://{canon_netloc}"
+
+
+def _canon_static_proxy(raw: str) -> str:
+    """Kanonikalisasi entry PROXY_LIST (lowercase skema/host, tanpa trailing `/`)
+    agar hash key pool/session identik dengan header `X-Proxy-Url`."""
+    val = (raw or "").strip()
+    if not val:
+        return ""
+    try:
+        canon = validate_proxy_url(val)
+        return "" if canon == _DIRECT_PROXY_SENTINEL else canon
+    except ValueError:
+        return val.rstrip("/")
+
+
+# Proxy rotation: comma-separated `http://[user:pass@]host:port` urls.
+# Deterministik per auth_token. Kosong = no proxy (direct).
+_proxy_raw = os.environ.get("PROXY_LIST", "").strip()
+PROXY_LIST: tuple[str, ...] = tuple(
+    c for p in _proxy_raw.split(",") if (c := _canon_static_proxy(p))
+) if _proxy_raw else tuple()
 
 
 def get_request_proxy() -> Optional[str]:

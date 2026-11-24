@@ -533,7 +533,7 @@ async def media_upload(
             return {
                 "status": "error",
                 "http_status": st if isinstance(st, int) and st >= 400 else 502,
-                "error": f"warm-up failed (proxy & direct): {exc}",
+                "error": redact_proxy_creds(f"warm-up failed (proxy & direct): {exc}"),
                 "data": None,
             }
         finally:
@@ -566,7 +566,7 @@ async def media_upload(
         except Exception as exc:  # noqa: BLE001
             logging.getLogger("xapi.upload").warning(
                 "upload direct gagal (%s: %s) — fallback ke proxy",
-                type(exc).__name__, exc)
+                type(exc).__name__, redact_proxy_creds(str(exc)))
         finally:
             try:
                 await direct.close()

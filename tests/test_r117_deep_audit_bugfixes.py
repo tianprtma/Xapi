@@ -958,7 +958,26 @@ async def test_pass7_proxy_hardening_redaction_and_scoped_invalidation():
     redacted = redact_proxy_creds("ProxyError: http://myuser:supersecret@31.6.46.27:12323 failed")
     assert "supersecret" not in redacted
     assert "myuser" not in redacted
-    assert "http://***:***@31.6.46.27:12323" in redacted
+    assert "http://***@31.6.46.27:12323" in redacted
+
+    redacted_tok = redact_proxy_creds("ProxyError: http://secret_api_key@31.6.46.27:12323 failed")
+    assert "secret_api_key" not in redacted_tok
+    assert "http://***@31.6.46.27:12323" in redacted_tok
+
+    # warm_session evicts dead ClientPool socket (scoped to active proxy) on double transport failure
+    from app.auth import WarmNetworkError, warm_session
+    dead_client = MagicMock()
+    dead_client.cookies = MagicMock(jar=MagicMock(clear=MagicMock()))
+    dead_client.get = AsyncMock(side_effect=ConnectionResetError("proxy http://u:p@31.6.46.27:12323 reset"))
+    inv_pool_warm = AsyncMock()
+    with (
+        patch("app.auth.SessionStore.get", return_value=MagicMock(lookup=AsyncMock(return_value=None))),
+        patch("app.auth.ClientPool.get", return_value=MagicMock(invalidate=inv_pool_warm)),
+    ):
+        with pytest.raises(WarmNetworkError) as w_exc:
+            await warm_session(dead_client, "d" * 40)
+    assert "u:p" not in str(w_exc.value)
+    inv_pool_warm.assert_awaited_once_with("d" * 40, all_proxies=False)
 
     # Scoped invalidation (all_proxies=False) only removes the active proxy slot
     tok = "c" * 40

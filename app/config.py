@@ -311,6 +311,7 @@ _REQUEST_PROXY_VAR: contextvars.ContextVar[Optional[str]] = contextvars.ContextV
 
 _PROXY_CREDS_RE = _re.compile(r"((?:https?|socks5h?)://)([^@/\s]+)@")
 _VALID_PROXY_HOST_RE = _re.compile(r"^[a-z0-9.:-]+$")
+_HEX_LABEL_RE = _re.compile(r"^0x[0-9a-f]+$")
 
 
 def redact_proxy_creds(text: str) -> str:
@@ -372,29 +373,34 @@ def validate_proxy_url(raw: str) -> str:
     try:
         parsed_ip = ipaddress.ip_address(ip_candidate)
     except ValueError:
-        # Tangkap format IPv4 non-kanonik (integer `2130706433`, hex `0x7f000001`,
-        # oktal `0177.0.0.1`, shorthand `127.1`) yang diterima libcurl/OS.
-        try:
-            parsed_ip = ipaddress.IPv4Address(socket.inet_aton(ip_candidate))
-        except OSError:
-            parsed_ip = None
+        parsed_ip = None
     if parsed_ip is not None:
         if _is_disallowed_proxy_ip(parsed_ip):
             raise ValueError("alamat IP proxy loopback/link-local/reserved tidak diizinkan")
         host_fmt = f"[{parsed_ip}]" if isinstance(parsed_ip, ipaddress.IPv6Address) else str(parsed_ip)
     else:
         labels = host_clean.split(".")
-        if any(
+        if len(host_clean) > 253 or any(
             not lbl or len(lbl) > 63 or lbl.startswith("-") or lbl.endswith("-") or ":" in lbl
             for lbl in labels
         ):
             raise ValueError("host proxy tidak valid")
+        # RFC 3696 / WHATWG URL Standard: TLD (label terakhir) DNS tidak pernah
+        # seluruhnya digit atau literal hex `0x...` — menolak seluruh varian IPv4
+        # non-kanonik (integer 32/64-bit, hex, oktal `0177...`, pseudo-oktal `127.0.0.08`, shorthand `127.1`).
+        if labels[-1].isdigit() or _HEX_LABEL_RE.match(labels[-1]):
+            raise ValueError("format IPv4 non-kanonik atau TLD numerik tidak diizinkan")
         host_fmt = host_clean
     userinfo, sep, hostport = parsed.netloc.rpartition("@")
-    if sep and "@" in userinfo:
-        raise ValueError("userinfo proxy mengandung '@' tak ter-encode (gunakan %40)")
+    if sep:
+        if not userinfo or userinfo == ":":
+            raise ValueError("kredensial userinfo proxy kosong")
+        if "@" in userinfo:
+            raise ValueError("userinfo proxy mengandung '@' tak ter-encode (gunakan %40)")
     # Ekstrak raw port secara ketat (hanya digit ASCII, tolak `+8080` atau `:`)
     if hostport.startswith("["):
+        if not isinstance(parsed_ip, ipaddress.IPv6Address):
+            raise ValueError("kurung siku hanya untuk alamat IPv6")
         _, bracket_sep, port_part = hostport.partition("]")
         if not bracket_sep:
             raise ValueError("host IPv6 proxy tidak valid")

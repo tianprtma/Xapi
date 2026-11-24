@@ -1025,3 +1025,64 @@ async def test_pass7_proxy_hardening_redaction_and_scoped_invalidation():
     assert cp._pool_key(tok, "http://31.6.46.27:12323") not in cp._cache
     fake_p.close.assert_awaited_once()
     fake_d.close.assert_not_awaited()
+
+
+# ── 29. Pass 11: RFC-3696 pseudo-octal/64-bit IPv4 rejection & Playwright goto proxy error handling ──
+
+@pytest.mark.asyncio
+async def test_pass11_pseudo_octal_64bit_ipv4_and_browser_proxy_error():
+    from app.config import reset_request_proxy, set_request_proxy, validate_proxy_url
+    from playwright_search import ContextPool, _search_via_browser_impl
+
+    for bad in (
+        "http://127.0.0.08:8080",
+        "http://127.0.0.09:8080",
+        "http://0.0.0.08:8080",
+        "http://169.254.169.0258:80",
+        "http://99999999999:8080",
+        "http://6425673729:8080",
+        "http://0x1000000007f000001:8080",
+        "http://127.0.0.0x1:8080",
+    ):
+        with pytest.raises(ValueError):
+            validate_proxy_url(bad)
+
+    # Single-label docker service hostname still allowed
+    assert validate_proxy_url("http://squid:3128") == "http://squid:3128"
+
+    # ContextPool scoped invalidation + _search_via_browser_impl goto proxy failure -> 502 + redacted + scoped evict
+    tok = "e" * 40
+    pool = ContextPool()
+    ctx_direct = MagicMock(close=AsyncMock())
+    ctx_proxy = MagicMock(close=AsyncMock())
+    pool._ctxs[tok] = (ctx_direct, 1.0)
+    t = set_request_proxy("http://31.6.46.27:12323")
+    try:
+        pkey = pool._ctx_key(tok)
+        pool._ctxs[pkey] = (ctx_proxy, 1.0)
+        await pool.invalidate(tok, all_proxies=False)
+        assert pkey not in pool._ctxs
+        assert tok in pool._ctxs
+        ctx_proxy.close.assert_awaited_once()
+        ctx_direct.close.assert_not_awaited()
+
+        fake_page = MagicMock()
+        fake_page.on = MagicMock()
+        fake_page.goto = AsyncMock(side_effect=RuntimeError("ERR_PROXY_CONNECTION_FAILED http://usr:sec@31.6.46.27:12323"))
+        fake_page.close = AsyncMock()
+        fake_ctx = MagicMock(new_page=AsyncMock(return_value=fake_page))
+        inv_mock = AsyncMock()
+        fake_cp = MagicMock(
+            acquire=AsyncMock(return_value=fake_ctx),
+            release=AsyncMock(),
+            invalidate=inv_mock,
+        )
+        with patch("playwright_search.ContextPool.get", return_value=fake_cp):
+            res = await _search_via_browser_impl(tok, "hello", "Latest", timeout=5.0)
+    finally:
+        reset_request_proxy(t)
+
+    assert res["status"] == "error"
+    assert res["http_status"] == 502
+    assert "sec" not in res["error"]
+    inv_mock.assert_awaited_once_with(tok, all_proxies=False)

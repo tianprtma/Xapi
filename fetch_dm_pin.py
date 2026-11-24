@@ -40,6 +40,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from app.auth import api_headers, login_with_auth_token, resolve_me_id, warm_session  # noqa: E402
 from app.client_pool import pooled_client  # noqa: E402
 from app.clients import dm_call, graphql_call  # noqa: E402
+from app.config import reset_request_proxy, set_request_proxy, validate_proxy_url  # noqa: E402
 from app.xchat_e2ee import (  # noqa: E402
     get_cached_e2ee_media,
     resolve_dm_pin,
@@ -133,6 +134,8 @@ async def main() -> int:
     ap.add_argument("--scan-limit", type=int, default=6,
                     help="Max percakapan di-scan cari media (default 6)")
     ap.add_argument("--max", type=int, default=50, help="max hasil (default 50)")
+    ap.add_argument("--proxy", default=os.environ.get("XAPI_PROXY", ""),
+                    help="Proxy override (URL / 'direct'). Default: env XAPI_PROXY")
     args = ap.parse_args()
 
     tok = args.token.strip()
@@ -140,6 +143,23 @@ async def main() -> int:
         print("ERROR: --token/TEST_AUTH_TOKEN kosong atau bukan 40-hex", file=sys.stderr)
         return 2
     pin = resolve_dm_pin(args.pin)
+
+    proxy_ctx_tok = None
+    if (args.proxy or "").strip():
+        try:
+            proxy_ctx_tok = set_request_proxy(validate_proxy_url(args.proxy))
+        except ValueError as exc:
+            print(f"ERROR: --proxy tidak valid: {exc}", file=sys.stderr)
+            return 2
+
+    try:
+        return await _run_cli(args, tok, pin)
+    finally:
+        if proxy_ctx_tok is not None:
+            reset_request_proxy(proxy_ctx_tok)
+
+
+async def _run_cli(args, tok: str, pin) -> int:
 
     # 1) Validasi token + profil (login flow, network via PROXY_LIST)
     login = await login_with_auth_token(tok)

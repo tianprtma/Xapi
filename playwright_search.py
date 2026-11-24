@@ -490,10 +490,14 @@ class ContextPool:
             except Exception:  # noqa: BLE001
                 pass
 
-    async def invalidate(self, auth_token: str) -> None:
+    async def invalidate(self, auth_token: str, *, all_proxies: bool = True) -> None:
         prefix = f"{auth_token}:p:"
+        target_key = None if all_proxies else self._ctx_key(auth_token)
         async with self._lock:
-            keys = [k for k in self._ctxs if k == auth_token or k.startswith(prefix)]
+            if target_key is not None:
+                keys = [target_key] if target_key in self._ctxs else []
+            else:
+                keys = [k for k in self._ctxs if k == auth_token or k.startswith(prefix)]
             for k in keys:
                 entry = self._ctxs.pop(k, None)
                 if entry and self._ctx_use.get(id(entry[0]), 0) > 0:
@@ -960,7 +964,17 @@ async def _click_action_via_browser_impl(
 
     try:
         page = await context.new_page()
-        await page.goto(navigate_url, wait_until="domcontentloaded", timeout=int(timeout * 1000))
+        try:
+            await page.goto(navigate_url, wait_until="domcontentloaded", timeout=int(timeout * 1000))
+        except Exception as exc:  # noqa: BLE001
+            from app.config import redact_proxy_creds
+            await ContextPool.get().invalidate(auth_token, all_proxies=False)
+            return {
+                "status": "error",
+                "http_status": 502,
+                "error": redact_proxy_creds(f"browser navigation failed: {type(exc).__name__}: {exc}"),
+                "data": None,
+            }
         await asyncio.sleep(2)
         # Attach listener right before click so navigation HTML responses are
         # never prematurely captured when match_response_substr is omitted.
@@ -1043,7 +1057,17 @@ async def _action_via_browser_impl(
     try:
         page = await context.new_page()
         # Warm: x.com/home → page jadi punya semua cookie + TID generator loaded
-        await page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=int(timeout * 1000))
+        try:
+            await page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=int(timeout * 1000))
+        except Exception as exc:  # noqa: BLE001
+            from app.config import redact_proxy_creds
+            await ContextPool.get().invalidate(auth_token, all_proxies=False)
+            return {
+                "status": "error",
+                "http_status": 502,
+                "error": redact_proxy_creds(f"browser navigation failed: {type(exc).__name__}: {exc}"),
+                "data": None,
+            }
         # Tunggu sampai bundle ready (TID generator init)
         await asyncio.sleep(3)
 
@@ -1184,7 +1208,17 @@ async def _fetch_via_browser_impl(
     try:
         page = await context.new_page()
         page.on("response", lambda r: asyncio.create_task(_on_response(r)))
-        await page.goto(navigate_url, wait_until="domcontentloaded", timeout=int(timeout * 1000))
+        try:
+            await page.goto(navigate_url, wait_until="domcontentloaded", timeout=int(timeout * 1000))
+        except Exception as exc:  # noqa: BLE001
+            from app.config import redact_proxy_creds
+            await ContextPool.get().invalidate(auth_token, all_proxies=False)
+            return {
+                "status": "error",
+                "http_status": 502,
+                "error": redact_proxy_creds(f"browser navigation failed: {type(exc).__name__}: {exc}"),
+                "data": None,
+            }
 
         if click_selector:
             try:
@@ -1313,7 +1347,17 @@ async def _search_via_browser_impl(
         from urllib.parse import quote
 
         url = f"https://x.com/search?q={quote(q)}&src=typed_query&f={f}"
-        await page.goto(url, wait_until="domcontentloaded", timeout=int(timeout * 1000))
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=int(timeout * 1000))
+        except Exception as exc:  # noqa: BLE001
+            from app.config import redact_proxy_creds
+            await ContextPool.get().invalidate(auth_token, all_proxies=False)
+            return {
+                "status": "error",
+                "http_status": 502,
+                "error": redact_proxy_creds(f"browser navigation failed: {type(exc).__name__}: {exc}"),
+                "data": None,
+            }
 
         # Tunggu response ke-capture
         deadline = asyncio.get_event_loop().time() + timeout

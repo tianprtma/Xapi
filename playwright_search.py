@@ -585,13 +585,20 @@ class XChatContextPool:
                 # health check: context yang sudah mati melempar di .pages
                 try:
                     _ = ctx.pages
+                    await _apply_session_cookies(ctx, auth_token, ct0)
                     self._ctxs.move_to_end(key)
                     self._ctx_use[id(ctx)] = self._ctx_use.get(id(ctx), 0) + 1
-                    await _apply_session_cookies(ctx, auth_token, ct0)
                     return ctx
                 except Exception:  # noqa: BLE001
                     self._ctxs.pop(key, None)
-                    self._ctx_use.pop(id(ctx), None)
+                    if self._ctx_use.get(id(ctx), 0) > 0:
+                        self._dropped.add(ctx)
+                    else:
+                        self._ctx_use.pop(id(ctx), None)
+                        try:
+                            await ctx.close()
+                        except Exception:  # noqa: BLE001
+                            pass
 
             prof = profile_for_token(auth_token)
             is_win = "Windows" in prof["sec_ch_ua_platform"]
@@ -785,7 +792,7 @@ async def _click_action_via_browser_impl(
     timeout: float = 25.0,
 ) -> dict[str, Any]:
     context = await ContextPool.get().acquire(auth_token)
-    page = await context.new_page()
+    page = None
 
     captured: dict[str, Any] = {}
     matchers: list[str] = []
@@ -809,9 +816,9 @@ async def _click_action_via_browser_impl(
             except Exception:  # noqa: BLE001
                 pass
 
-    page.on("response", lambda r: asyncio.create_task(_on_response(r)))
-
     try:
+        page = await context.new_page()
+        page.on("response", lambda r: asyncio.create_task(_on_response(r)))
         await page.goto(navigate_url, wait_until="domcontentloaded", timeout=int(timeout * 1000))
         await asyncio.sleep(2)
 
@@ -848,10 +855,11 @@ async def _click_action_via_browser_impl(
             "data": captured.get("data") or {"raw": captured.get("raw")},
         }
     finally:
-        try:
-            await page.close()
-        except Exception:  # noqa: BLE001
-            pass
+        if page is not None:
+            try:
+                await page.close()
+            except Exception:  # noqa: BLE001
+                pass
         await ContextPool.get().release(auth_token, context)
         # context tetap di pool — jangan close
 
@@ -885,9 +893,10 @@ async def _action_via_browser_impl(
 ) -> dict[str, Any]:
     from app.config import WEB_BEARER
     context = await ContextPool.get().acquire(auth_token)
-    page = await context.new_page()
+    page = None
 
     try:
+        page = await context.new_page()
         # Warm: x.com/home → page jadi punya semua cookie + TID generator loaded
         await page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=int(timeout * 1000))
         # Tunggu sampai bundle ready (TID generator init)
@@ -945,10 +954,11 @@ async def _action_via_browser_impl(
             "data": payload,
         }
     finally:
-        try:
-            await page.close()
-        except Exception:  # noqa: BLE001
-            pass
+        if page is not None:
+            try:
+                await page.close()
+            except Exception:  # noqa: BLE001
+                pass
         await ContextPool.get().release(auth_token, context)
         # context tetap di pool — jangan close
 
@@ -994,7 +1004,7 @@ async def _fetch_via_browser_impl(
     click_selector: Optional[str] = None,
 ) -> dict[str, Any]:
     context = await ContextPool.get().acquire(auth_token)
-    page = await context.new_page()
+    page = None
 
     captured: dict[str, Any] = {}
     matchers = [match_path] if isinstance(match_path, str) else list(match_path)
@@ -1016,9 +1026,9 @@ async def _fetch_via_browser_impl(
             except Exception:  # noqa: BLE001
                 pass
 
-    page.on("response", lambda r: asyncio.create_task(_on_response(r)))
-
     try:
+        page = await context.new_page()
+        page.on("response", lambda r: asyncio.create_task(_on_response(r)))
         await page.goto(navigate_url, wait_until="domcontentloaded", timeout=int(timeout * 1000))
 
         if click_selector:
@@ -1057,10 +1067,11 @@ async def _fetch_via_browser_impl(
             "data": captured["data"],
         }
     finally:
-        try:
-            await page.close()
-        except Exception:  # noqa: BLE001
-            pass
+        if page is not None:
+            try:
+                await page.close()
+            except Exception:  # noqa: BLE001
+                pass
         await ContextPool.get().release(auth_token, context)
         # context tetap di pool — jangan close
 
@@ -1098,7 +1109,7 @@ async def _search_via_browser_impl(
     timeout: float = 20.0,
 ) -> dict[str, Any]:
     context = await ContextPool.get().acquire(auth_token)
-    page = await context.new_page()
+    page = None
 
     captured: dict[str, Any] = {}
 
@@ -1126,9 +1137,9 @@ async def _search_via_browser_impl(
             except Exception:  # noqa: BLE001
                 pass
 
-    page.on("response", lambda r: asyncio.create_task(_on_response(r)))
-
     try:
+        page = await context.new_page()
+        page.on("response", lambda r: asyncio.create_task(_on_response(r)))
         f = URL_FILTER.get(search_type, "live")
         from urllib.parse import quote
 
@@ -1166,9 +1177,10 @@ async def _search_via_browser_impl(
             "data": captured["data"],
         }
     finally:
-        try:
-            await page.close()
-        except Exception:  # noqa: BLE001
-            pass
+        if page is not None:
+            try:
+                await page.close()
+            except Exception:  # noqa: BLE001
+                pass
         await ContextPool.get().release(auth_token, context)
         # context tetap di pool — jangan close

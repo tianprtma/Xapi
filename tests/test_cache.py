@@ -176,3 +176,55 @@ def test_session_expires_by_max_age_even_when_actively_polled():
     s.created_at = time.time() - (MAX_SESSION_AGE_SECONDS + 5)
     s.last_used = time.time()  # baru saja dipakai
     assert s.is_alive() is False
+
+
+@pytest.mark.asyncio
+async def test_search_via_browser_releases_context_when_new_page_fails(monkeypatch):
+    """Jika `context.new_page()` gagal, ContextPool.release WAJIB tetap dipanggil
+    agar refcount `_ctx_use` tidak bocor permanen."""
+    from unittest.mock import AsyncMock
+    import playwright_search as ps
+
+    fake_ctx = AsyncMock()
+    fake_ctx.new_page.side_effect = RuntimeError("target crashed")
+
+    pool = AsyncMock()
+    pool.acquire.return_value = fake_ctx
+    monkeypatch.setattr(ps.ContextPool, "get", classmethod(lambda cls: pool))
+
+    with pytest.raises(RuntimeError, match="target crashed"):
+        await ps._search_via_browser_impl("a" * 40, "test", "Latest", timeout=5.0)
+
+    pool.release.assert_awaited_once_with("a" * 40, fake_ctx)
+
+
+@pytest.mark.asyncio
+async def test_xchat_context_pool_closes_dead_context_before_relaunch(monkeypatch, tmp_path):
+    """Saat health check / cookie apply gagal pada persistent context yang idle,
+    context lama harus ditutup dulu agar lock profil disk dilepas sebelum relaunch."""
+    from unittest.mock import AsyncMock
+    import playwright_search as ps
+
+    monkeypatch.setattr(ps, "XCHAT_PROFILE_DIR", str(tmp_path))
+    pool = ps.XChatContextPool()
+    tok = "b" * 40
+    import hashlib
+    key = hashlib.sha256(f"xchat:{tok}".encode()).hexdigest()[:16]
+
+    dead_ctx = AsyncMock()
+    dead_ctx.pages = []
+    dead_ctx.add_cookies.side_effect = RuntimeError("context closed")
+    pool._ctxs[key] = dead_ctx
+
+    fresh_ctx = AsyncMock()
+    fresh_ctx.pages = []
+    driver = AsyncMock()
+    driver.chromium.launch_persistent_context.return_value = fresh_ctx
+    pw_pool = AsyncMock()
+    pw_pool.driver.return_value = driver
+    monkeypatch.setattr(ps.PlaywrightPool, "get", classmethod(lambda cls: pw_pool))
+
+    got = await pool.acquire(tok)
+    assert got is fresh_ctx
+    dead_ctx.close.assert_awaited_once()
+    assert pool._ctx_use.get(id(fresh_ctx)) == 1

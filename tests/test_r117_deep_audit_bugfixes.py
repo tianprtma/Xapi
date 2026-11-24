@@ -901,8 +901,8 @@ async def test_pass6_duplicate_proxy_header_media_401_fallback_and_xchat_wait():
         reset_request_proxy(ctx_tok)
     assert calls == ["direct", "proxy"]
     assert res["http_status"] == 403
-    inv_sess.assert_awaited_once_with(tok)
-    inv_pool.assert_awaited_once_with(tok)
+    inv_sess.assert_awaited_once_with(tok, all_proxies=False)
+    inv_pool.assert_awaited_once_with(tok, all_proxies=False)
 
     # XChatContextPool waits for in-use context to release before switching proxy
     pool = XChatContextPool()
@@ -934,3 +934,64 @@ async def test_pass6_duplicate_proxy_header_media_401_fallback_and_xchat_wait():
     assert got is new_ctx
     old_ctx.close.assert_awaited_once()
     assert pool._ctx_proxy[key] == "http://31.6.46.27:12323"
+
+
+# ── 28. Pass 7: 0.0.0.0/8, IDNA/control chars, empty port, cred redaction & scoped proxy invalidation ──
+
+@pytest.mark.asyncio
+async def test_pass7_proxy_hardening_redaction_and_scoped_invalidation():
+    from app.client_pool import ClientPool
+    from app.config import redact_proxy_creds, reset_request_proxy, set_request_proxy, validate_proxy_url
+    from session_cache import SessionStore
+
+    for bad in (
+        "http://0.1.2.3:8080",
+        "http://0.0.0.1:8080",
+        "http://127\u30020\u30020\u30021:8080",
+        "http://\uff11\uff12\uff17.\uff10.\uff10.\uff11:8080",
+        "http://31.6.46.27:12323\x0b",
+        "http://31.6.46.27:",
+    ):
+        with pytest.raises(ValueError):
+            validate_proxy_url(bad)
+
+    redacted = redact_proxy_creds("ProxyError: http://myuser:supersecret@31.6.46.27:12323 failed")
+    assert "supersecret" not in redacted
+    assert "myuser" not in redacted
+    assert "http://***:***@31.6.46.27:12323" in redacted
+
+    # Scoped invalidation (all_proxies=False) only removes the active proxy slot
+    tok = "c" * 40
+    store = SessionStore()
+    await store.store(tok, "ct0_direct", {"auth_token": tok, "ct0": "ct0_direct"})
+    t1 = set_request_proxy("http://31.6.46.27:12323")
+    try:
+        await store.store(tok, "ct0_proxy", {"auth_token": tok, "ct0": "ct0_proxy"})
+        await store.invalidate(tok, all_proxies=False)
+        assert await store.lookup(tok) is None
+    finally:
+        reset_request_proxy(t1)
+    # Direct session must remain intact after proxy-only 403 invalidation!
+    direct_sess = await store.lookup(tok)
+    assert direct_sess is not None and direct_sess.ct0 == "ct0_direct"
+
+    # Full invalidation (all_proxies=True, e.g. 401) removes everything
+    await store.invalidate(tok, all_proxies=True)
+    assert await store.lookup(tok) is None
+
+    # ClientPool scoped invalidation preserves direct entry when proxy entry drops
+    cp = ClientPool()
+    fake_d = MagicMock(close=AsyncMock())
+    fake_p = MagicMock(close=AsyncMock())
+    from app.client_pool import _Entry
+    cp._cache[cp._pool_key(tok, None)] = _Entry(fake_d)
+    cp._cache[cp._pool_key(tok, "http://31.6.46.27:12323")] = _Entry(fake_p)
+    t2 = set_request_proxy("http://31.6.46.27:12323")
+    try:
+        await cp.invalidate(tok, all_proxies=False)
+    finally:
+        reset_request_proxy(t2)
+    assert cp._pool_key(tok, None) in cp._cache
+    assert cp._pool_key(tok, "http://31.6.46.27:12323") not in cp._cache
+    fake_p.close.assert_awaited_once()
+    fake_d.close.assert_not_awaited()

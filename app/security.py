@@ -364,7 +364,7 @@ class RequestProxyMiddleware:
             await self.app(scope, receive, send)
             return
         headers = Headers(scope=scope)
-        raw_vals = [v.strip() for v in headers.getlist("x-proxy-url") if (v or "").strip()]
+        raw_vals = [v.strip(" \t") for v in headers.getlist("x-proxy-url") if (v or "").strip(" \t")]
         if not raw_vals:
             await self.app(scope, receive, send)
             return

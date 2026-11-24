@@ -316,9 +316,22 @@ _REQUEST_PROXY_VAR: contextvars.ContextVar[Optional[str]] = contextvars.ContextV
 )
 
 
+_PROXY_CREDS_RE = _re.compile(r"((?:https?|socks5h?)://)([^:@/\s]+):([^@/\s]+)@")
+
+
+def redact_proxy_creds(text: str) -> str:
+    """Mask kredensial `user:pass` pada URL proxy agar tidak pernah bocor ke log/error."""
+    if not text or "://" not in text:
+        return text
+    return _PROXY_CREDS_RE.sub(r"\1***:***@", text)
+
+
 def _is_disallowed_proxy_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     """True bila IP (atau IPv4 tertanam di IPv6 mapped/6to4/teredo) tidak aman untuk proxy."""
     if ip.is_loopback or ip.is_link_local or ip.is_unspecified or ip.is_multicast or ip.is_reserved:
+        return True
+    # RFC 1122 0.0.0.0/8 ("this network") — pada Linux dapat merutekan ke host lokal.
+    if isinstance(ip, ipaddress.IPv4Address) and ip.packed[0] == 0:
         return True
     if isinstance(ip, ipaddress.IPv6Address):
         if ip.ipv4_mapped is not None and _is_disallowed_proxy_ip(ip.ipv4_mapped):
@@ -334,10 +347,15 @@ def _is_disallowed_proxy_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -
 
 def validate_proxy_url(raw: str) -> str:
     """Validasi & kanonikalisasi URL proxy dari header `X-Proxy-Url` (tolak skema asing / loopback SSRF)."""
-    val = (raw or "").strip()
+    raw_str = raw or ""
+    # Cek karakter kontrol (<32 / >=127) & non-ASCII SEBELUM strip agar \r/\n/\x0b/\x0c
+    # tidak lolos diam-diam melalui str.strip().
+    if any(ord(ch) < 32 or ord(ch) >= 127 or ch == "\\" for ch in raw_str):
+        raise ValueError("proxy URL mengandung karakter terlarang")
+    val = raw_str.strip(" \t")
     if not val:
         raise ValueError("proxy URL kosong")
-    if any(ch in val for ch in ("\r", "\n", "\x00", " ", "\t", "\\")):
+    if any(ch in val for ch in (" ", "\t")):
         raise ValueError("proxy URL mengandung karakter terlarang")
     if val.lower() in ("direct", "none"):
         return _DIRECT_PROXY_SENTINEL
@@ -366,6 +384,11 @@ def validate_proxy_url(raw: str) -> str:
             parsed_ip = None
     if parsed_ip is not None and _is_disallowed_proxy_ip(parsed_ip):
         raise ValueError("alamat IP proxy loopback/link-local/reserved tidak diizinkan")
+    userinfo, sep, hostport = parsed.netloc.rpartition("@")
+    if sep and "@" in userinfo:
+        raise ValueError("userinfo proxy mengandung '@' tak ter-encode (gunakan %40)")
+    if hostport.endswith(":"):
+        raise ValueError("port proxy kosong")
     try:
         port = parsed.port
     except ValueError as exc:
@@ -374,9 +397,6 @@ def validate_proxy_url(raw: str) -> str:
         raise ValueError("port proxy di luar rentang 1-65535")
     # Kanonikalisasi skema & host (lowercase, tanpa trailing `/`) agar key
     # ClientPool/SessionStore/ContextPool tidak terfragmentasi.
-    userinfo, sep, hostport = parsed.netloc.rpartition("@")
-    if sep and "@" in userinfo:
-        raise ValueError("userinfo proxy mengandung '@' tak ter-encode (gunakan %40)")
     canon_hostport = hostport.lower()
     canon_netloc = f"{userinfo}@{canon_hostport}" if sep else canon_hostport
     return f"{scheme}://{canon_netloc}"

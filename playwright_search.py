@@ -717,10 +717,12 @@ class XChatContextPool:
                             **launch_kwargs,
                         )
                     except Exception as exc:  # noqa: BLE001
+                        from app.config import redact_proxy_creds
                         raise RuntimeError(
                             f"XChat profile '{profile_dir.name}' gagal dibuka — "
                             f"profil terkunci oleh proses lain (server & fetch_dm_pin.py "
-                            f"bareng?) atau Chromium gagal launch: {type(exc).__name__}: {exc}"
+                            f"bareng?) atau Chromium gagal launch: {type(exc).__name__}: "
+                            f"{redact_proxy_creds(str(exc))}"
                         ) from exc
                     try:
                         await ctx.add_init_script(
@@ -833,6 +835,9 @@ class XChatContextPool:
         async with self._lock:
             ctx = self._ctxs.pop(key, None)
             self._ctx_proxy.pop(key, None)
+            ev = self._idle_events.pop(key, None)
+            if ev is not None:
+                ev.set()
             if ctx and self._ctx_use.get(id(ctx), 0) > 0:
                 self._dropped.add(ctx)
                 return
@@ -850,6 +855,9 @@ class XChatContextPool:
             self._ctxs.clear()
             self._ctx_proxy.clear()
             self._ctx_use.clear()
+            for ev in self._idle_events.values():
+                ev.set()
+            self._idle_events.clear()
             dropped, self._dropped = list(self._dropped), set()
         for ctx in ctxs + dropped:
             try:

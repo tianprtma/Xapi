@@ -47,6 +47,7 @@ from .config import (
     profile_for_token,
     proxy_for_token,
     random_user_agent,
+    redact_proxy_creds,
     reset_request_proxy,
     set_request_proxy,
 )
@@ -149,17 +150,19 @@ async def _graphql_call_once(
                     "queryId": meta["queryId"],
                 })
         except Exception as exc:  # noqa: BLE001
+            await ClientPool.get().invalidate(auth_token, all_proxies=False)
             return {
                 "status": "error",
                 "http_status": 502,
-                "error": f"upstream request failed: {type(exc).__name__}: {exc}",
+                "error": redact_proxy_creds(f"upstream request failed: {type(exc).__name__}: {exc}"),
                 "data": None,
             }
 
         if resp.status_code != 200:
             if resp.status_code in (401, 403):
-                await SessionStore.get().invalidate(auth_token)
-                await ClientPool.get().invalidate(auth_token)
+                all_p = resp.status_code == 401
+                await SessionStore.get().invalidate(auth_token, all_proxies=all_p)
+                await ClientPool.get().invalidate(auth_token, all_proxies=all_p)
             return {
                 "status": "error",
                 "http_status": resp.status_code if resp.status_code >= 400 else 502,
@@ -255,17 +258,19 @@ async def _rest_call_once(
                 headers["content-type"] = "application/x-www-form-urlencoded"
                 resp = await client.request(method, url, headers=headers, data=data or {})
         except Exception as exc:  # noqa: BLE001
+            await ClientPool.get().invalidate(auth_token, all_proxies=False)
             return {
                 "status": "error",
                 "http_status": 502,
-                "error": f"upstream request failed: {type(exc).__name__}: {exc}",
+                "error": redact_proxy_creds(f"upstream request failed: {type(exc).__name__}: {exc}"),
                 "data": None,
             }
 
         if resp.status_code >= 400:
             if resp.status_code in (401, 403):
-                await SessionStore.get().invalidate(auth_token)
-                await ClientPool.get().invalidate(auth_token)
+                all_p = resp.status_code == 401
+                await SessionStore.get().invalidate(auth_token, all_proxies=all_p)
+                await ClientPool.get().invalidate(auth_token, all_proxies=all_p)
             return {
                 "status": "error",
                 "http_status": resp.status_code,
@@ -370,10 +375,11 @@ async def _dm_call_once(
             else:
                 resp = await client.request(method, url, headers=headers, params=final_params)
         except Exception as exc:  # noqa: BLE001
+            await ClientPool.get().invalidate(auth_token, all_proxies=False)
             return {
                 "status": "error",
                 "http_status": 502,
-                "error": f"upstream request failed: {type(exc).__name__}: {exc}",
+                "error": redact_proxy_creds(f"upstream request failed: {type(exc).__name__}: {exc}"),
                 "data": None,
             }
 
@@ -384,8 +390,9 @@ async def _dm_call_once(
 
         if resp.status_code >= 400:
             if resp.status_code in (401, 403):
-                await SessionStore.get().invalidate(auth_token)
-                await ClientPool.get().invalidate(auth_token)
+                all_p = resp.status_code == 401
+                await SessionStore.get().invalidate(auth_token, all_proxies=all_p)
+                await ClientPool.get().invalidate(auth_token, all_proxies=all_p)
             return {
                 "status": "error",
                 "http_status": resp.status_code,
@@ -491,10 +498,11 @@ async def media_upload(
     except Exception as exc:  # noqa: BLE001 — network/proxy error, lanjut direct bila ada proxy
         st = getattr(exc, "http_status", 502)
         warm_err_status = st if isinstance(st, int) and st >= 400 else 502
-        warm_err_msg = getattr(exc, "message", None) or str(exc)
+        warm_err_msg = redact_proxy_creds(getattr(exc, "message", None) or str(exc))
+        await ClientPool.get().invalidate(auth_token, all_proxies=False)
         if has_proxy:
             logging.getLogger("xapi.upload").info(
-                "warm via proxy gagal (%s) — coba warm direct", exc)
+                "warm via proxy gagal (%s) — coba warm direct", warm_err_msg)
 
     if ct0 is None:
         if not (has_proxy and MEDIA_PROXY_EXEMPT):
@@ -589,14 +597,16 @@ async def media_upload(
             up_res = await _upload_chunks(
                 client, base_headers, file_bytes, media_type, media_category, max_poll_seconds=timeout)
             if up_res.get("status") != "ok" and up_res.get("http_status") in (401, 403):
-                await SessionStore.get().invalidate(auth_token)
-                await ClientPool.get().invalidate(auth_token)
+                all_p = up_res.get("http_status") == 401
+                await SessionStore.get().invalidate(auth_token, all_proxies=all_p)
+                await ClientPool.get().invalidate(auth_token, all_proxies=all_p)
             return up_res
         except Exception as exc:  # noqa: BLE001
+            await ClientPool.get().invalidate(auth_token, all_proxies=False)
             return {
                 "status": "error",
                 "http_status": 502,
-                "error": f"upload failed: {type(exc).__name__}: {exc}",
+                "error": redact_proxy_creds(f"upload failed: {type(exc).__name__}: {exc}"),
                 "data": None,
             }
         finally:

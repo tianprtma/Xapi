@@ -29,6 +29,7 @@ from .config import (
     headers_for_token,
     profile_for_token,
     proxy_for_token,
+    redact_proxy_creds,
 )
 
 
@@ -205,9 +206,9 @@ async def warm_session(
                 )
         except WarmNetworkError:
             raise
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             raise WarmNetworkError(
-                f"GET {HOMEPAGE_URL} failed twice: {type(exc).__name__}: {exc}"
+                redact_proxy_creds(f"GET {HOMEPAGE_URL} failed twice: {type(exc).__name__}: {exc}")
             ) from exc
 
     # X kasih ct0 server-issued di domain .x.com (leading dot). Placeholder lokal
@@ -292,10 +293,11 @@ async def login_with_auth_token(auth_token: str) -> dict[str, Any]:
                 },
             )
         except Exception as exc:  # noqa: BLE001
+            await ClientPool.get().invalidate(auth_token, all_proxies=False)
             return {
                 "status": "error",
                 "http_status": 502,
-                "error": f"viewer request failed: {type(exc).__name__}: {exc}",
+                "error": redact_proxy_creds(f"viewer request failed: {type(exc).__name__}: {exc}"),
                 "cookies": {},
                 "tokens": {"bearer": WEB_BEARER, "ct0": ct0, "auth_token": auth_token},
                 "user": None,
@@ -343,9 +345,10 @@ async def login_with_auth_token(auth_token: str) -> dict[str, Any]:
             except (json.JSONDecodeError, KeyError, AttributeError):
                 pass
         elif viewer_resp.status_code in (401, 403):
+            all_p = viewer_resp.status_code == 401
             if hasattr(store, "invalidate"):
-                await store.invalidate(auth_token)
-            await ClientPool.get().invalidate(auth_token)
+                await store.invalidate(auth_token, all_proxies=all_p)
+            await ClientPool.get().invalidate(auth_token, all_proxies=all_p)
             return {
                 "status": "invalid",
                 "http_status": viewer_resp.status_code,

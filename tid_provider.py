@@ -100,7 +100,11 @@ class TIDProvider:
                 try:
                     return _run(proxy)
                 except Exception as exc:  # noqa: BLE001
-                    log.warning("TID home fetch via proxy requests failed (%s) — fallback direct", exc)
+                    from app.config import redact_proxy_creds
+                    log.warning(
+                        "TID home fetch via proxy requests failed (%s) — fallback direct",
+                        redact_proxy_creds(str(exc)),
+                    )
             return _run(None)
 
         async def _fetch_home_via_client() -> Optional[str]:

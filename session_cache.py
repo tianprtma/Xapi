@@ -131,12 +131,16 @@ class SessionStore:
                 return sess.viewer
             return None
 
-    async def invalidate(self, auth_token: str) -> None:
+    async def invalidate(self, auth_token: str, *, all_proxies: bool = True) -> None:
         base = token_key(auth_token)
         prefix = f"{base}:p:"
+        target_key = None if all_proxies else self._session_key(auth_token)
         async with self._lock:
-            for k in [k for k in self._cache if k == base or k.startswith(prefix)]:
-                self._cache.pop(k, None)
+            if target_key is not None:
+                self._cache.pop(target_key, None)
+            else:
+                for k in [k for k in self._cache if k == base or k.startswith(prefix)]:
+                    self._cache.pop(k, None)
 
     async def stats(self) -> dict[str, int]:
         async with self._lock:

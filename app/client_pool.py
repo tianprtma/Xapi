@@ -150,17 +150,22 @@ class ClientPool:
         if should_close:
             await entry.close()
 
-    async def invalidate(self, auth_token: str) -> None:
-        """Drop all pooled sessions for `auth_token` (direct & proxied variants).
+    async def invalidate(self, auth_token: str, *, all_proxies: bool = True) -> None:
+        """Drop pooled session(s) for `auth_token`.
 
-        If a session is currently in use, it is removed from the pool (so no
-        new caller can acquire it) and close() is deferred to release().
+        - `all_proxies=True` (default, mis. 401 token dead): hapus semua varian direct & proxy.
+        - `all_proxies=False` (mis. transport error / 403 satu proxy): hapus hanya slot
+          `(auth_token, active_proxy)` agar proxy lain / direct tidak ikut terbuang.
         """
         base = token_key(auth_token)
         prefix = f"{base}:p:"
+        target_key = None if all_proxies else self._pool_key(auth_token, proxy_for_token(auth_token))
         to_close: list[_Entry] = []
         async with self._lock:
-            matching_keys = [k for k in self._cache if k == base or k.startswith(prefix)]
+            if target_key is not None:
+                matching_keys = [target_key] if target_key in self._cache else []
+            else:
+                matching_keys = [k for k in self._cache if k == base or k.startswith(prefix)]
             for k in matching_keys:
                 entry = self._cache.pop(k, None)
                 if not entry:

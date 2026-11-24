@@ -316,12 +316,28 @@ _REQUEST_PROXY_VAR: contextvars.ContextVar[Optional[str]] = contextvars.ContextV
 )
 
 
+def _is_disallowed_proxy_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """True bila IP (atau IPv4 tertanam di IPv6 mapped/6to4/teredo) tidak aman untuk proxy."""
+    if ip.is_loopback or ip.is_link_local or ip.is_unspecified or ip.is_multicast or ip.is_reserved:
+        return True
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip.ipv4_mapped is not None and _is_disallowed_proxy_ip(ip.ipv4_mapped):
+            return True
+        if ip.sixtofour is not None and _is_disallowed_proxy_ip(ip.sixtofour):
+            return True
+        if ip.teredo is not None:
+            for sub in ip.teredo:
+                if _is_disallowed_proxy_ip(sub):
+                    return True
+    return False
+
+
 def validate_proxy_url(raw: str) -> str:
-    """Validasi URL proxy dari header `X-Proxy-Url` (tolak skema asing / loopback SSRF)."""
+    """Validasi & kanonikalisasi URL proxy dari header `X-Proxy-Url` (tolak skema asing / loopback SSRF)."""
     val = (raw or "").strip()
     if not val:
         raise ValueError("proxy URL kosong")
-    if any(ch in val for ch in ("\r", "\n", "\x00", " ", "\t")):
+    if any(ch in val for ch in ("\r", "\n", "\x00", " ", "\t", "\\")):
         raise ValueError("proxy URL mengandung karakter terlarang")
     if val.lower() in ("direct", "none"):
         return _DIRECT_PROXY_SENTINEL
@@ -329,6 +345,8 @@ def validate_proxy_url(raw: str) -> str:
     scheme = (parsed.scheme or "").lower()
     if scheme not in _ALLOWED_PROXY_SCHEMES:
         raise ValueError("skema proxy harus http, https, socks5, atau socks5h")
+    if parsed.params or parsed.query or parsed.fragment or parsed.path not in ("", "/"):
+        raise ValueError("URL proxy tidak boleh mengandung path, query, atau fragment")
     host = (parsed.hostname or "").strip().lower()
     host_clean = host.rstrip(".")
     if not host_clean:
@@ -346,18 +364,22 @@ def validate_proxy_url(raw: str) -> str:
             parsed_ip = ipaddress.IPv4Address(socket.inet_aton(ip_candidate))
         except OSError:
             parsed_ip = None
-    if parsed_ip is not None:
-        if isinstance(parsed_ip, ipaddress.IPv6Address) and parsed_ip.ipv4_mapped is not None:
-            parsed_ip = parsed_ip.ipv4_mapped
-        if parsed_ip.is_loopback or parsed_ip.is_link_local or parsed_ip.is_unspecified or parsed_ip.is_multicast:
-            raise ValueError("alamat IP proxy loopback/link-local tidak diizinkan")
+    if parsed_ip is not None and _is_disallowed_proxy_ip(parsed_ip):
+        raise ValueError("alamat IP proxy loopback/link-local/reserved tidak diizinkan")
     try:
         port = parsed.port
     except ValueError as exc:
         raise ValueError("port proxy tidak valid") from exc
     if port is not None and not (1 <= port <= 65535):
         raise ValueError("port proxy di luar rentang 1-65535")
-    return val
+    # Kanonikalisasi skema & host (lowercase, tanpa trailing `/`) agar key
+    # ClientPool/SessionStore/ContextPool tidak terfragmentasi.
+    userinfo, sep, hostport = parsed.netloc.rpartition("@")
+    if sep and "@" in userinfo:
+        raise ValueError("userinfo proxy mengandung '@' tak ter-encode (gunakan %40)")
+    canon_hostport = hostport.lower()
+    canon_netloc = f"{userinfo}@{canon_hostport}" if sep else canon_hostport
+    return f"{scheme}://{canon_netloc}"
 
 
 def get_request_proxy() -> Optional[str]:
@@ -403,7 +425,11 @@ def playwright_proxy_for_token(auth_token: str) -> Optional[dict[str, str]]:
         host_fmt = f"[{host}]"
     else:
         host_fmt = host
-    server = f"{scheme}://{host_fmt}:{parsed.port}" if parsed.port else f"{scheme}://{host_fmt}"
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    server = f"{scheme}://{host_fmt}:{port}" if port else f"{scheme}://{host_fmt}"
     cfg: dict[str, str] = {"server": server}
     if parsed.username is not None:
         cfg["username"] = unquote(parsed.username)

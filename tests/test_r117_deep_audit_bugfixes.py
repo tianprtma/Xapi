@@ -810,3 +810,127 @@ async def test_pass5_network_error_and_warm_429_preservation():
         up_res = await media_upload(tok, b"abc", "image/jpeg")
     assert up_res["status"] == "error"
     assert up_res["http_status"] == 502
+
+
+# ── 27. Pass 6: Proxy deep-audit (IPv6 tunnels, canonicalization, dup header, media_upload 401/invalidation, XChat proxy wait) ──
+
+def test_validate_proxy_url_ipv6_tunnels_path_and_canonicalization():
+    from app.config import validate_proxy_url
+
+    for bad in (
+        "http://[::ffff:0:127.0.0.1]:8080",
+        "http://[64:ff9b::127.0.0.1]:8080",
+        "http://[2002:7f00:0001::]:8080",
+        "http://[::127.0.0.1]:8080",
+        "http://31.6.46.27:12323/extra/path",
+        "http://31.6.46.27:12323?q=1",
+        "http://31.6.46.27:12323#frag",
+        "http://127.0.0.1\\@31.6.46.27:12323",
+        "http://user:p@ss@31.6.46.27:12323",
+    ):
+        with pytest.raises(ValueError):
+            validate_proxy_url(bad)
+
+    # Canonicalization: uppercase scheme/host and trailing `/` map to the exact same key
+    c1 = validate_proxy_url("HTTP://User:Pass@Proxy.Example.COM:8080/")
+    c2 = validate_proxy_url("http://User:Pass@proxy.example.com:8080")
+    assert c1 == c2 == "http://User:Pass@proxy.example.com:8080"
+
+
+@pytest.mark.asyncio
+async def test_pass6_duplicate_proxy_header_media_401_fallback_and_xchat_wait():
+    from contextlib import asynccontextmanager
+    from app.clients import media_upload
+    from app.config import reset_request_proxy, set_request_proxy
+    from app.security import RequestProxyMiddleware
+    from playwright_search import XChatContextPool
+
+    # Duplicate conflicting X-Proxy-Url headers -> 400
+    captured = []
+    async def _dummy_app(scope, receive, send):
+        captured.append("called")
+    mw = RequestProxyMiddleware(_dummy_app)
+    sent = []
+    async def _send(msg):
+        sent.append(msg)
+    scope = {
+        "type": "http",
+        "headers": [
+            (b"x-proxy-url", b"http://1.2.3.4:8080"),
+            (b"x-proxy-url", b"http://5.6.7.8:8080"),
+        ],
+    }
+    await mw(scope, AsyncMock(), _send)
+    assert not captured
+    assert sent[0]["status"] == 400
+
+    # media_upload falls back to proxy on direct 401 AND invalidates on final 403
+    tok = "b" * 40
+    calls = []
+    class _FakeSess:
+        def __init__(self, tag):
+            self.tag = tag
+            self.cookies = MagicMock(jar=[])
+            self.timeout = 20.0
+        async def close(self):
+            pass
+    @asynccontextmanager
+    async def _fake_pooled(_t):
+        yield _FakeSess("proxy")
+    async def _fake_upload(sess, *a, **kw):
+        calls.append(sess.tag)
+        if sess.tag == "direct":
+            return {"status": "error", "http_status": 401, "error": "ip mismatch", "stage": "INIT", "data": None}
+        return {"status": "error", "http_status": 403, "error": "forbidden", "stage": "INIT", "data": None}
+
+    inv_sess = AsyncMock()
+    inv_pool = AsyncMock()
+    ctx_tok = set_request_proxy("http://31.6.46.27:12323")
+    try:
+        with (
+            patch("app.clients.MEDIA_PROXY_EXEMPT", True),
+            patch("app.clients.pooled_client", _fake_pooled),
+            patch("app.clients.warm_session", AsyncMock(return_value=("ct0v", {}))),
+            patch("app.clients._direct_session", return_value=_FakeSess("direct")),
+            patch("app.clients._upload_chunks", side_effect=_fake_upload),
+            patch("app.clients.SessionStore.get", return_value=MagicMock(invalidate=inv_sess)),
+            patch("app.clients.ClientPool.get", return_value=MagicMock(invalidate=inv_pool)),
+        ):
+            res = await media_upload(tok, b"img", "image/jpeg")
+    finally:
+        reset_request_proxy(ctx_tok)
+    assert calls == ["direct", "proxy"]
+    assert res["http_status"] == 403
+    inv_sess.assert_awaited_once_with(tok)
+    inv_pool.assert_awaited_once_with(tok)
+
+    # XChatContextPool waits for in-use context to release before switching proxy
+    pool = XChatContextPool()
+    old_ctx = MagicMock(pages=[], close=AsyncMock())
+    new_ctx = MagicMock(pages=[], add_init_script=AsyncMock(), add_cookies=AsyncMock(), close=AsyncMock())
+    import hashlib as _hl
+    key = _hl.sha256(f"xchat:{tok}".encode()).hexdigest()[:16]
+    pool._ctxs[key] = old_ctx
+    pool._ctx_proxy[key] = None  # currently direct
+    pool._ctx_use[id(old_ctx)] = 1  # in-use!
+
+    fake_driver = MagicMock()
+    fake_driver.chromium.launch_persistent_context = AsyncMock(return_value=new_ctx)
+    async def _release_soon():
+        await asyncio.sleep(0.05)
+        await pool.release(tok, old_ctx)
+
+    ctx_tok2 = set_request_proxy("http://31.6.46.27:12323")
+    try:
+        with (
+            patch("playwright_search.PlaywrightPool.get", return_value=MagicMock(driver=AsyncMock(return_value=fake_driver))),
+            patch("playwright_search._apply_session_cookies", AsyncMock()),
+        ):
+            rel_task = asyncio.create_task(_release_soon())
+            got = await pool.acquire(tok)
+            await rel_task
+    finally:
+        reset_request_proxy(ctx_tok2)
+    assert got is new_ctx
+    old_ctx.close.assert_awaited_once()
+    assert pool._ctx_proxy[key] == "http://31.6.46.27:12323"

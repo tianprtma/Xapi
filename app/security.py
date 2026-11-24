@@ -364,10 +364,24 @@ class RequestProxyMiddleware:
             await self.app(scope, receive, send)
             return
         headers = Headers(scope=scope)
-        raw_proxy = (headers.get("x-proxy-url") or "").strip()
-        if not raw_proxy:
+        raw_vals = [v.strip() for v in headers.getlist("x-proxy-url") if (v or "").strip()]
+        if not raw_vals:
             await self.app(scope, receive, send)
             return
+        if len(set(raw_vals)) > 1:
+            import json as _json
+            from .errors import build_error
+            body = _json.dumps(
+                build_error("VALIDATION_INVALID_PARAM", param="X-Proxy-Url", reason="duplicate X-Proxy-Url header")
+            ).encode()
+            await send({
+                "type": "http.response.start",
+                "status": 400,
+                "headers": [(b"content-type", b"application/json")],
+            })
+            await send({"type": "http.response.body", "body": body, "more_body": False})
+            return
+        raw_proxy = raw_vals[0]
         if not ALLOW_REQUEST_PROXY:
             import json as _json
             from .errors import build_error

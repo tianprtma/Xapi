@@ -123,6 +123,7 @@ def make_client(auth_token: str) -> AsyncSession:
         timeout=20.0,
         impersonate=prof["impersonate"],
         allow_redirects=True,
+        trust_env=False,
     )
     if proxy:
         kwargs["proxies"] = {"http": proxy, "https": proxy}

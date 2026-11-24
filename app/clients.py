@@ -471,8 +471,11 @@ async def media_upload(
     # Warm session via jalur proxy dulu (konsisten dengan crawl). Kalau
     # proxy mati dan MEDIA_PROXY_EXEMPT aktif, warm ulang via direct —
     # session upload memang direct, jadi konsisten.
+    has_proxy = bool(proxy_for_token(auth_token))
     jar: dict[str, str] = {}
     ct0: Optional[str] = None
+    warm_err_status: int = 502
+    warm_err_msg: str = "warm-up failed"
     try:
         async with pooled_client(auth_token) as client:
             try:
@@ -485,16 +488,24 @@ async def media_upload(
                     "data": None,
                 }
             jar = {c.name: c.value for c in client.cookies.jar}
-    except Exception as exc:  # noqa: BLE001 — network/proxy error, lanjut direct
-        logging.getLogger("xapi.upload").info(
-            "warm via proxy gagal (%s) — coba warm direct", exc)
+    except Exception as exc:  # noqa: BLE001 — network/proxy error, lanjut direct bila ada proxy
+        st = getattr(exc, "http_status", 502)
+        warm_err_status = st if isinstance(st, int) and st >= 400 else 502
+        warm_err_msg = getattr(exc, "message", None) or str(exc)
+        if has_proxy:
+            logging.getLogger("xapi.upload").info(
+                "warm via proxy gagal (%s) — coba warm direct", exc)
 
     if ct0 is None:
-        if not MEDIA_PROXY_EXEMPT:
+        if not (has_proxy and MEDIA_PROXY_EXEMPT):
             return {
                 "status": "error",
-                "http_status": 502,
-                "error": "warm-up failed (proxy down, MEDIA_PROXY_EXEMPT off)",
+                "http_status": warm_err_status,
+                "error": (
+                    f"warm-up failed: {warm_err_msg}"
+                    if not has_proxy
+                    else f"warm-up failed (proxy down, MEDIA_PROXY_EXEMPT off): {warm_err_msg}"
+                ),
                 "data": None,
             }
         direct0 = _direct_session(auth_token, {}, 30.0)
@@ -510,9 +521,10 @@ async def media_upload(
                 "data": None,
             }
         except Exception as exc:  # noqa: BLE001
+            st = getattr(exc, "http_status", 502)
             return {
                 "status": "error",
-                "http_status": 502,
+                "http_status": st if isinstance(st, int) and st >= 400 else 502,
                 "error": f"warm-up failed (proxy & direct): {exc}",
                 "data": None,
             }
@@ -529,15 +541,14 @@ async def media_upload(
         "x-csrf-token": ct0,
     }
 
-    if MEDIA_PROXY_EXEMPT:
+    if has_proxy and MEDIA_PROXY_EXEMPT:
         direct = _direct_session(auth_token, jar, timeout)
         try:
             direct_res = await _upload_chunks(
                 direct, base_headers, file_bytes, media_type, media_category, max_poll_seconds=timeout)
             if (
                 direct_res.get("status") == "ok"
-                or not proxy_for_token(auth_token)
-                or direct_res.get("http_status") not in (403, 429, 500, 502, 503, 504)
+                or direct_res.get("http_status") not in (401, 403, 429, 500, 502, 503, 504)
             ):
                 return direct_res
             logging.getLogger("xapi.upload").warning(
@@ -575,8 +586,12 @@ async def media_upload(
         old_timeout = getattr(client, "timeout", 20.0)
         client.timeout = timeout
         try:
-            return await _upload_chunks(
+            up_res = await _upload_chunks(
                 client, base_headers, file_bytes, media_type, media_category, max_poll_seconds=timeout)
+            if up_res.get("status") != "ok" and up_res.get("http_status") in (401, 403):
+                await SessionStore.get().invalidate(auth_token)
+                await ClientPool.get().invalidate(auth_token)
+            return up_res
         except Exception as exc:  # noqa: BLE001
             return {
                 "status": "error",
@@ -600,6 +615,7 @@ def _direct_session(auth_token: str, jar: dict[str, str],
         impersonate=prof["impersonate"],
         timeout=timeout,
         allow_redirects=True,
+        trust_env=False,
     )
     return sess
 

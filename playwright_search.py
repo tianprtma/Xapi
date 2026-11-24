@@ -615,6 +615,7 @@ class XChatContextPool:
         self._ctxs: OrderedDict[str, BrowserContext] = OrderedDict()  # key = hash
         self._ctx_use: dict[int, int] = {}   # id(ctx) -> jumlah holder
         self._ctx_proxy: dict[str, Optional[str]] = {}  # key -> proxy URL aktif
+        self._idle_events: dict[str, asyncio.Event] = {}  # key -> notif saat context idle
         self._dropped: set = set()           # dihapus saat masih dipakai
         self._lock = asyncio.Lock()
 
@@ -633,166 +634,191 @@ class XChatContextPool:
         desired_proxy = proxy_for_token(auth_token)
         pw_proxy = playwright_proxy_for_token(auth_token)
 
-        async with self._lock:
-            # ct0 STABIL per profil — baca/tulis di dalam lock agar concurrent
-            # first-time acquire tidak menulis ct0 yang saling bentrok.
-            ct0 = None
-            if ct0_file.is_file():
-                ct0 = ct0_file.read_text().strip() or None
-            if not ct0:
-                ct0 = gen_ct0()
-                profile_dir.mkdir(parents=True, exist_ok=True)
-                ct0_file.write_text(ct0)
+        deadline = asyncio.get_running_loop().time() + 30.0
+        while True:
+            wait_ev: Optional[asyncio.Event] = None
+            async with self._lock:
+                # ct0 STABIL per profil — baca/tulis di dalam lock agar concurrent
+                # first-time acquire tidak menulis ct0 yang saling bentrok.
+                ct0 = None
+                if ct0_file.is_file():
+                    ct0 = ct0_file.read_text().strip() or None
+                if not ct0:
+                    ct0 = gen_ct0()
+                    profile_dir.mkdir(parents=True, exist_ok=True)
+                    ct0_file.write_text(ct0)
 
-            ctx = self._ctxs.get(key)
-            if ctx is not None:
-                # Bila proxy berubah untuk akun ini dan context sedang idle,
-                # tutup lalu buka ulang agar Chromium memakai proxy terbaru.
-                if self._ctx_proxy.get(key) != desired_proxy and self._ctx_use.get(id(ctx), 0) == 0:
-                    self._ctxs.pop(key, None)
-                    self._ctx_proxy.pop(key, None)
-                    self._ctx_use.pop(id(ctx), None)
-                    try:
-                        await ctx.close()
-                    except Exception:  # noqa: BLE001
-                        pass
-                    ctx = None
-            if ctx is not None:
-                # health check: context yang sudah mati melempar di .pages / add_cookies
-                try:
-                    _ = ctx.pages
-                    await _apply_session_cookies(ctx, auth_token, ct0)
-                    self._ctxs.move_to_end(key)
-                    self._ctx_use[id(ctx)] = self._ctx_use.get(id(ctx), 0) + 1
-                    return ctx
-                except Exception:  # noqa: BLE001
-                    self._ctxs.pop(key, None)
-                    self._ctx_proxy.pop(key, None)
+                ctx = self._ctxs.get(key)
+                if ctx is not None and self._ctx_proxy.get(key) != desired_proxy:
                     if self._ctx_use.get(id(ctx), 0) > 0:
-                        self._dropped.add(ctx)
+                        # Context sedang dipakai dengan proxy berbeda — tunggu
+                        # holder selesai agar tidak pernah membocorkan IP salah.
+                        wait_ev = self._idle_events.get(key)
+                        if wait_ev is None or wait_ev.is_set():
+                            wait_ev = asyncio.Event()
+                            self._idle_events[key] = wait_ev
                     else:
+                        self._ctxs.pop(key, None)
+                        self._ctx_proxy.pop(key, None)
                         self._ctx_use.pop(id(ctx), None)
                         try:
                             await ctx.close()
                         except Exception:  # noqa: BLE001
                             pass
+                        ctx = None
+                if wait_ev is None:
+                    if ctx is not None:
+                        # health check: context yang sudah mati melempar di .pages / add_cookies
+                        try:
+                            _ = ctx.pages
+                            await _apply_session_cookies(ctx, auth_token, ct0)
+                            self._ctxs.move_to_end(key)
+                            self._ctx_use[id(ctx)] = self._ctx_use.get(id(ctx), 0) + 1
+                            return ctx
+                        except Exception:  # noqa: BLE001
+                            self._ctxs.pop(key, None)
+                            self._ctx_proxy.pop(key, None)
+                            if self._ctx_use.get(id(ctx), 0) > 0:
+                                self._dropped.add(ctx)
+                            else:
+                                self._ctx_use.pop(id(ctx), None)
+                                try:
+                                    await ctx.close()
+                                except Exception:  # noqa: BLE001
+                                    pass
 
-            prof = profile_for_token(auth_token)
-            is_win = "Windows" in prof["sec_ch_ua_platform"]
-            profile_dir.mkdir(parents=True, exist_ok=True)
+                    prof = profile_for_token(auth_token)
+                    is_win = "Windows" in prof["sec_ch_ua_platform"]
+                    profile_dir.mkdir(parents=True, exist_ok=True)
 
-            driver = await PlaywrightPool.get().driver()
-            launch_kwargs: dict[str, Any] = {
-                "headless": XCHAT_HEADLESS,
-                "user_agent": prof["user_agent"],
-                "viewport": {"width": 1366, "height": 768} if is_win else {"width": 1440, "height": 900},
-                "locale": "en-US",
-                "timezone_id": "America/New_York",
-                "extra_http_headers": {
-                    "sec-ch-ua": prof["sec_ch_ua"],
-                    "sec-ch-ua-mobile": "?0",
-                    "sec-ch-ua-platform": prof["sec_ch_ua_platform"],
-                },
-                "args": [
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                ],
-            }
-            if pw_proxy:
-                launch_kwargs["proxy"] = pw_proxy
-            try:
-                ctx = await driver.chromium.launch_persistent_context(
-                    str(profile_dir),
-                    **launch_kwargs,
-                )
-            except Exception as exc:  # noqa: BLE001
+                    driver = await PlaywrightPool.get().driver()
+                    launch_kwargs: dict[str, Any] = {
+                        "headless": XCHAT_HEADLESS,
+                        "user_agent": prof["user_agent"],
+                        "viewport": {"width": 1366, "height": 768} if is_win else {"width": 1440, "height": 900},
+                        "locale": "en-US",
+                        "timezone_id": "America/New_York",
+                        "extra_http_headers": {
+                            "sec-ch-ua": prof["sec_ch_ua"],
+                            "sec-ch-ua-mobile": "?0",
+                            "sec-ch-ua-platform": prof["sec_ch_ua_platform"],
+                        },
+                        "args": [
+                            "--disable-blink-features=AutomationControlled",
+                            "--no-sandbox",
+                            "--disable-dev-shm-usage",
+                        ],
+                    }
+                    if pw_proxy:
+                        launch_kwargs["proxy"] = pw_proxy
+                    try:
+                        ctx = await driver.chromium.launch_persistent_context(
+                            str(profile_dir),
+                            **launch_kwargs,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        raise RuntimeError(
+                            f"XChat profile '{profile_dir.name}' gagal dibuka — "
+                            f"profil terkunci oleh proses lain (server & fetch_dm_pin.py "
+                            f"bareng?) atau Chromium gagal launch: {type(exc).__name__}: {exc}"
+                        ) from exc
+                    try:
+                        await ctx.add_init_script(
+                            """
+                            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+                            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                            Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+                            Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+                            Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 0 });
+                            window.chrome = window.chrome || { runtime: {}, loadTimes: function() {}, csi: function() {}, app: {} };
+                            // R106: spoof WebGL renderer — SwiftShader (software headless) adalah
+                            // sinyal anti-bot kuat; X chat menolak me-render konten dengannya.
+                            const spoofGL = (proto) => {
+                                if (!proto) return;
+                                const orig = proto.getParameter;
+                                proto.getParameter = function(p) {
+                                    const dbg = this.getExtension && this.getExtension('WEBGL_debug_renderer_info');
+                                    if (dbg && p === dbg.UNMASKED_VENDOR_WEBGL) return 'Google Inc. (Intel)';
+                                    if (dbg && p === dbg.UNMASKED_RENDERER_WEBGL) return 'ANGLE (Intel, Intel(R) Iris(R) Xe Graphics (0x00009A49) Direct3D11 vs_5_0 ps_5_0, D3D11)';
+                                    return orig.apply(this, arguments);
+                                };
+                            };
+                            try { spoofGL(WebGLRenderingContext.prototype); } catch(e) {}
+                            try { spoofGL(WebGL2RenderingContext.prototype); } catch(e) {}
+                            try {
+                                const origQuery = window.navigator.permissions && window.navigator.permissions.query;
+                                if (origQuery) window.navigator.permissions.query = (p) => (
+                                    p && p.name === 'notifications'
+                                        ? Promise.resolve({ state: Notification.permission })
+                                        : origQuery(p));
+                            } catch(e) {}
+                            try {
+                                Object.defineProperty(screen, 'width', { get: () => 1440 });
+                                Object.defineProperty(screen, 'height', { get: () => 900 });
+                                Object.defineProperty(screen, 'availWidth', { get: () => 1440 });
+                                Object.defineProperty(screen, 'availHeight', { get: () => 900 });
+                                Object.defineProperty(screen, 'colorDepth', { get: () => 24 });
+                                Object.defineProperty(screen, 'pixelDepth', { get: () => 24 });
+                            } catch(e) {}
+                            """
+                        )
+                        await _apply_session_cookies(ctx, auth_token, ct0)
+                    except BaseException:
+                        # Tutup persistent context bila init gagal/cancel agar proses
+                        # Chromium dan SingletonLock tidak bocor permanen.
+                        try:
+                            await ctx.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+                        raise
+
+                    self._ctxs[key] = ctx
+                    self._ctx_proxy[key] = desired_proxy
+                    self._ctx_use[id(ctx)] = self._ctx_use.get(id(ctx), 0) + 1
+
+                    # Evict LRU idle bila melebihi cap (persistent: aman, state di disk)
+                    while len(self._ctxs) > XCHAT_PERSISTENT_MAX:
+                        evict_key = next(
+                            (k for k, c in self._ctxs.items() if self._ctx_use.get(id(c), 0) == 0),
+                            None,
+                        )
+                        if evict_key is None:
+                            break  # semua in-use — biarkan melebihi cap sementara
+                        old = self._ctxs.pop(evict_key)
+                        self._ctx_proxy.pop(evict_key, None)
+                        self._ctx_use.pop(id(old), None)
+                        self._dropped.discard(old)
+                        try:
+                            await old.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+
+                    return ctx
+
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
                 raise RuntimeError(
-                    f"XChat profile '{profile_dir.name}' gagal dibuka — "
-                    f"profil terkunci oleh proses lain (server & fetch_dm_pin.py "
-                    f"bareng?) atau Chromium gagal launch: {type(exc).__name__}: {exc}"
-                ) from exc
+                    "XChat context sedang dipakai dengan proxy berbeda dan belum idle"
+                )
             try:
-                await ctx.add_init_script(
-                    """
-                    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-                    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-                    Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
-                    Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
-                    Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 0 });
-                    window.chrome = window.chrome || { runtime: {}, loadTimes: function() {}, csi: function() {}, app: {} };
-                    // R106: spoof WebGL renderer — SwiftShader (software headless) adalah
-                    // sinyal anti-bot kuat; X chat menolak me-render konten dengannya.
-                    const spoofGL = (proto) => {
-                        if (!proto) return;
-                        const orig = proto.getParameter;
-                        proto.getParameter = function(p) {
-                            const dbg = this.getExtension && this.getExtension('WEBGL_debug_renderer_info');
-                            if (dbg && p === dbg.UNMASKED_VENDOR_WEBGL) return 'Google Inc. (Intel)';
-                            if (dbg && p === dbg.UNMASKED_RENDERER_WEBGL) return 'ANGLE (Intel, Intel(R) Iris(R) Xe Graphics (0x00009A49) Direct3D11 vs_5_0 ps_5_0, D3D11)';
-                            return orig.apply(this, arguments);
-                        };
-                    };
-                    try { spoofGL(WebGLRenderingContext.prototype); } catch(e) {}
-                    try { spoofGL(WebGL2RenderingContext.prototype); } catch(e) {}
-                    try {
-                        const origQuery = window.navigator.permissions && window.navigator.permissions.query;
-                        if (origQuery) window.navigator.permissions.query = (p) => (
-                            p && p.name === 'notifications'
-                                ? Promise.resolve({ state: Notification.permission })
-                                : origQuery(p));
-                    } catch(e) {}
-                    try {
-                        Object.defineProperty(screen, 'width', { get: () => 1440 });
-                        Object.defineProperty(screen, 'height', { get: () => 900 });
-                        Object.defineProperty(screen, 'availWidth', { get: () => 1440 });
-                        Object.defineProperty(screen, 'availHeight', { get: () => 900 });
-                        Object.defineProperty(screen, 'colorDepth', { get: () => 24 });
-                        Object.defineProperty(screen, 'pixelDepth', { get: () => 24 });
-                    } catch(e) {}
-                    """
-                )
-                await _apply_session_cookies(ctx, auth_token, ct0)
-            except BaseException:
-                # Tutup persistent context bila init gagal/cancel agar proses
-                # Chromium dan SingletonLock tidak bocor permanen.
-                try:
-                    await ctx.close()
-                except Exception:  # noqa: BLE001
-                    pass
-                raise
-
-            self._ctxs[key] = ctx
-            self._ctx_proxy[key] = desired_proxy
-            self._ctx_use[id(ctx)] = self._ctx_use.get(id(ctx), 0) + 1
-
-            # Evict LRU idle bila melebihi cap (persistent: aman, state di disk)
-            while len(self._ctxs) > XCHAT_PERSISTENT_MAX:
-                evict_key = next(
-                    (k for k, c in self._ctxs.items() if self._ctx_use.get(id(c), 0) == 0),
-                    None,
-                )
-                if evict_key is None:
-                    break  # semua in-use — biarkan melebihi cap sementara
-                old = self._ctxs.pop(evict_key)
-                self._ctx_proxy.pop(evict_key, None)
-                self._ctx_use.pop(id(old), None)
-                self._dropped.discard(old)
-                try:
-                    await old.close()
-                except Exception:  # noqa: BLE001
-                    pass
-
-            return ctx
+                await asyncio.wait_for(wait_ev.wait(), timeout=remaining)
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError(
+                    "XChat context sedang dipakai dengan proxy berbeda dan belum idle"
+                ) from exc
 
     async def release(self, auth_token: str, ctx: BrowserContext) -> None:
+        key = hashlib.sha256(f"xchat:{auth_token}".encode()).hexdigest()[:16]
         async with self._lock:
             count = self._ctx_use.get(id(ctx), 0)
             if count > 1:
                 self._ctx_use[id(ctx)] = count - 1
                 return
             self._ctx_use.pop(id(ctx), None)
+            ev = self._idle_events.pop(key, None)
+            if ev is not None:
+                ev.set()
             dropped = ctx in self._dropped
             if dropped:
                 self._dropped.discard(ctx)

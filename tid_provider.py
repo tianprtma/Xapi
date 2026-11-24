@@ -76,15 +76,32 @@ class TIDProvider:
 
     async def _refresh(self, auth_token: Optional[str] = None) -> None:
         loop = asyncio.get_event_loop()
+        active_proxy: Optional[str] = None
+        if auth_token:
+            try:
+                from app.config import proxy_for_token
+                active_proxy = proxy_for_token(auth_token)
+            except Exception:  # noqa: BLE001
+                active_proxy = None
 
-        def _fetch_home_via_requests() -> str:
-            with _BoundedSession() as sess:
-                sess.headers["User-Agent"] = (
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36"
-                )
-                return str(handle_x_migration(sess))
+        def _fetch_home_via_requests(proxy: Optional[str] = None) -> str:
+            def _run(use_proxy: Optional[str]) -> str:
+                with _BoundedSession() as sess:
+                    sess.trust_env = False
+                    if use_proxy:
+                        sess.proxies = {"http": use_proxy, "https": use_proxy}
+                    sess.headers["User-Agent"] = (
+                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0.0.0 Safari/537.36"
+                    )
+                    return str(handle_x_migration(sess))
+            if proxy:
+                try:
+                    return _run(proxy)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("TID home fetch via proxy requests failed (%s) — fallback direct", exc)
+            return _run(None)
 
         async def _fetch_home_via_client() -> Optional[str]:
             """Home login via curl_cffi impersonate — tanpa browser.
@@ -118,6 +135,7 @@ class TIDProvider:
                     timeout=20.0,
                     impersonate=prof["impersonate"],
                     allow_redirects=True,
+                    trust_env=False,
                 )
                 proxy = proxy_for_token(auth_token)
                 if proxy:
@@ -187,7 +205,7 @@ class TIDProvider:
         home_html = (
             await _fetch_home_via_browser()
             or await _fetch_home_via_client()
-            or await loop.run_in_executor(None, _fetch_home_via_requests)
+            or await loop.run_in_executor(None, lambda: _fetch_home_via_requests(active_proxy))
         )
         home = bs4.BeautifulSoup(home_html, "html.parser")
 

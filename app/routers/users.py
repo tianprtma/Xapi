@@ -400,6 +400,7 @@ BOT_DB_PATH = os.environ.get(
 
 def _cached_profile(user_id: str) -> Optional[dict[str, Any]]:
     """V2 user object dari snapshot profil bot DB (read-only, tanpa browser)."""
+    conn = None
     try:
         conn = sqlite3.connect(f"file:{BOT_DB_PATH}?mode=ro", uri=True, timeout=5)
         conn.row_factory = sqlite3.Row
@@ -408,9 +409,11 @@ def _cached_profile(user_id: str) -> Optional[dict[str, Any]]:
             " followers_count, verified FROM profile_snapshots"
             " WHERE member_id = ? ORDER BY captured_at DESC LIMIT 1",
             (user_id,)).fetchone()
-        conn.close()
     except Exception:  # noqa: BLE001
         return None
+    finally:
+        if conn is not None:
+            conn.close()
     if row is None:
         return None
     return {

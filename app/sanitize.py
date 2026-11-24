@@ -132,9 +132,6 @@ class QueryParamSanitizerMiddleware:
             qs = raw_qs.decode("utf-8", errors="strict")
         except (UnicodeDecodeError, ValueError):
             # Invalid UTF-8 in query string — likely probe/attack
-            from starlette.datastructures import MutableHeaders
-            from app.security import _send_too_large
-            # Reuse _send_too_large pattern for ASGI-level 400
             import json as _json
             from app.errors import build_error as _build_error
             body = _json.dumps(_build_error("VALIDATION_INVALID_PARAM", param="query", reason="invalid utf-8")).encode()
@@ -156,6 +153,8 @@ class QueryParamSanitizerMiddleware:
             for v in values:
                 sv = sanitize_url_param(v)
                 if sv is not None:
+                    if sv != v:
+                        mutated = True
                     cleaned.append(sv)
                 else:
                     mutated = True  # value became empty → drop this occurrence

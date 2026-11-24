@@ -218,6 +218,46 @@ class TestSanitizeUrlParam:
         assert sanitize_url_param("\x00\x01\x02") is None
 
 
+class TestQueryParamSanitizerMiddleware:
+    def test_rewrites_query_string_when_control_chars_stripped(self):
+        import asyncio
+        from app.sanitize import QueryParamSanitizerMiddleware
+
+        seen_qs: list[bytes] = []
+
+        async def downstream(scope, receive, send):
+            seen_qs.append(scope["query_string"])
+
+        mw = QueryParamSanitizerMiddleware(downstream)
+        scope = {"type": "http", "query_string": b"query=hello%00%07world&other=1"}
+
+        async def _noop(*_args, **_kwargs):
+            return None
+
+        asyncio.run(mw(scope, _noop, _noop))
+        assert seen_qs == [b"query=helloworld&other=1"]
+
+    def test_truncates_overlong_query_param_in_scope(self):
+        import asyncio
+        import urllib.parse
+        from app.sanitize import QueryParamSanitizerMiddleware
+
+        seen_qs: list[bytes] = []
+
+        async def downstream(scope, receive, send):
+            seen_qs.append(scope["query_string"])
+
+        mw = QueryParamSanitizerMiddleware(downstream)
+        scope = {"type": "http", "query_string": ("query=" + "a" * 600).encode()}
+
+        async def _noop(*_args, **_kwargs):
+            return None
+
+        asyncio.run(mw(scope, _noop, _noop))
+        parsed = urllib.parse.parse_qs(seen_qs[0].decode())
+        assert len(parsed["query"][0]) == 500
+
+
 # ════════════════════════ errors.py ════════════════════════
 
 

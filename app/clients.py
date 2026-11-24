@@ -499,7 +499,8 @@ async def media_upload(
         st = getattr(exc, "http_status", 502)
         warm_err_status = st if isinstance(st, int) and st >= 400 else 502
         warm_err_msg = redact_proxy_creds(getattr(exc, "message", None) or str(exc))
-        await ClientPool.get().invalidate(auth_token, all_proxies=False)
+        if warm_err_status != 429:
+            await ClientPool.get().invalidate(auth_token, all_proxies=False)
         if has_proxy:
             logging.getLogger("xapi.upload").info(
                 "warm via proxy gagal (%s) — coba warm direct", warm_err_msg)

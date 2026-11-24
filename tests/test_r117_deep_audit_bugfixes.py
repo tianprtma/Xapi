@@ -951,6 +951,10 @@ async def test_pass7_proxy_hardening_redaction_and_scoped_invalidation():
         "http://\uff11\uff12\uff17.\uff10.\uff10.\uff11:8080",
         "http://31.6.46.27:12323\x0b",
         "http://31.6.46.27:",
+        "http://%6c%6f%63%61%6c%68%6f%73%74:8080",
+        "http://%31%32%37.0.0.1:8080",
+        "http://127.0.0.%31:8080",
+        "http://[::ffff:%31%32%37.0.0.1]:8080",
     ):
         with pytest.raises(ValueError):
             validate_proxy_url(bad)

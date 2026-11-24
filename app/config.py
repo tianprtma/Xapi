@@ -310,6 +310,7 @@ _REQUEST_PROXY_VAR: contextvars.ContextVar[Optional[str]] = contextvars.ContextV
 
 
 _PROXY_CREDS_RE = _re.compile(r"((?:https?|socks5h?)://)([^@/\s]+)@")
+_VALID_PROXY_HOST_RE = _re.compile(r"^[a-z0-9.:-]+$")
 
 
 def redact_proxy_creds(text: str) -> str:
@@ -362,9 +363,11 @@ def validate_proxy_url(raw: str) -> str:
     host_clean = host.rstrip(".")
     if not host_clean:
         raise ValueError("host proxy tidak valid")
+    if "%" in host_clean or not _VALID_PROXY_HOST_RE.match(host_clean):
+        raise ValueError("host proxy mengandung karakter/encoding tidak valid")
     if host_clean in ("localhost", "localhost.localdomain") or host_clean.endswith(".localhost"):
         raise ValueError("host proxy loopback tidak diizinkan")
-    ip_candidate = host_clean.split("%", 1)[0]
+    ip_candidate = host_clean
     parsed_ip = None
     try:
         parsed_ip = ipaddress.ip_address(ip_candidate)

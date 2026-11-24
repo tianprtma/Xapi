@@ -299,10 +299,19 @@ async def login_with_auth_token(auth_token: str) -> dict[str, Any]:
                 "user": None,
             }
 
+        v_headers = api_headers(ct0, auth_token)
+        try:
+            from tid_provider import TIDProvider
+            tid = await TIDProvider.get().generate("GET", _urlparse(VIEWER_URL).path, auth_token)
+            if tid:
+                v_headers["x-client-transaction-id"] = tid
+        except Exception:  # noqa: BLE001
+            pass
+
         try:
             viewer_resp = await client.get(
                 VIEWER_URL,
-                headers=api_headers(ct0, auth_token),
+                headers=v_headers,
                 params={
                     "variables": json.dumps({"withCommunitiesMemberships": True}),
                     "features": json.dumps(VIEWER_FEATURES),
@@ -361,14 +370,13 @@ async def login_with_auth_token(auth_token: str) -> dict[str, Any]:
                 })
             except (json.JSONDecodeError, KeyError, AttributeError):
                 pass
-        elif viewer_resp.status_code in (401, 403):
-            all_p = viewer_resp.status_code == 401
+        elif viewer_resp.status_code == 401:
             if hasattr(store, "invalidate"):
-                await store.invalidate(auth_token, all_proxies=all_p)
-            await ClientPool.get().invalidate(auth_token, all_proxies=all_p)
+                await store.invalidate(auth_token, all_proxies=True)
+            await ClientPool.get().invalidate(auth_token, all_proxies=True)
             return {
                 "status": "invalid",
-                "http_status": viewer_resp.status_code,
+                "http_status": 401,
                 "error": viewer_resp.text[:500],
                 "cookies": jar,
                 "tokens": {"bearer": WEB_BEARER, "ct0": ct0, "auth_token": auth_token},
@@ -376,7 +384,12 @@ async def login_with_auth_token(auth_token: str) -> dict[str, Any]:
             }
         else:
             raw_v_st = viewer_resp.status_code
-            if raw_v_st in (402, 407):
+            if raw_v_st == 403:
+                if hasattr(store, "invalidate"):
+                    await store.invalidate(auth_token, all_proxies=False)
+                await ClientPool.get().invalidate(auth_token, all_proxies=False)
+                err_st = 403
+            elif raw_v_st in (402, 407):
                 await ClientPool.get().invalidate(auth_token, all_proxies=False)
                 err_st = 502
             else:

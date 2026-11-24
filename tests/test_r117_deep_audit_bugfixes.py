@@ -1176,3 +1176,26 @@ async def test_pass14_warm_session_proxy_407_403_not_401_and_407_mapped_to_502()
         reset_request_proxy(t_ctx)
     assert up["status"] == "ok"
     assert warm_calls == ["proxy", "direct"]
+
+    # 5. login_with_auth_token: viewer 403 (CF/proxy challenge after valid warm) returns status='error' (403), NOT 'invalid' (401)!
+    from app.auth import login_with_auth_token
+    v_sess = MagicMock()
+    v_sess.cookies = MagicMock(jar=[])
+    v_sess.get = AsyncMock(return_value=MagicMock(status_code=403, text="CF Challenge"))
+    @asynccontextmanager
+    async def _v_pool(_t):
+        yield v_sess
+    inv_s_v = AsyncMock()
+    inv_c_v = AsyncMock()
+    with (
+        patch("app.auth.SessionStore.get", return_value=MagicMock(lookup_viewer=AsyncMock(return_value=None), invalidate=inv_s_v)),
+        patch("app.auth.pooled_client", _v_pool),
+        patch("app.auth.warm_session", AsyncMock(return_value=("ct0v", {"twid": "u%3D42"}))),
+        patch("app.auth.ClientPool.get", return_value=MagicMock(invalidate=inv_c_v)),
+        patch("tid_provider.TIDProvider.get", return_value=MagicMock(generate=AsyncMock(return_value="tid123"))),
+    ):
+        v_res = await login_with_auth_token(tok)
+    assert v_res["status"] == "error"
+    assert v_res["http_status"] == 403
+    inv_s_v.assert_awaited_once_with(tok, all_proxies=False)
+    inv_c_v.assert_awaited_once_with(tok, all_proxies=False)

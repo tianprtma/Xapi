@@ -17,6 +17,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from formatter import (
+    _merge_dm_event_obj,
     format_birdwatch_batsignal,
     format_birdwatch_note_result,
     format_birdwatch_notes_slice,
@@ -271,10 +272,7 @@ def _format_dm_events_smart(
                     or (r_ev.get("referenced_tweets") and not ev.get("referenced_tweets"))
                     or (r_ev.get("entities") and not ev.get("entities"))
                 ):
-                    merged = {**ev, **r_ev}
-                    if not r_ev.get("_xchat_encrypted"):
-                        merged.pop("_xchat_encrypted", None)
-                        merged.pop("encrypted_text", None)
+                    merged = _merge_dm_event_obj(ev, r_ev)
                     upgraded.append(merged)
                 else:
                     upgraded.append(ev)
@@ -526,18 +524,51 @@ async def _enrich_conv_events_with_e2ee(
                 ]
                 if len(candidates) == 1:
                     d_ev = candidates[0]
-            if d_ev is None and is_encrypted and msg_idx < len(dec_newest_first):
-                cand = dec_newest_first[msg_idx]
-                cand_id = str(cand.get("id") or "")
+            if d_ev is None and is_encrypted:
+                ev_sender = str(ev.get("sender_id") or "")
                 ev_ts = _event_epoch_sec(ev)
-                cand_ts = _event_epoch_sec(cand)
-                ts_compatible = (
-                    ev_ts is None
-                    or cand_ts is None
-                    or abs(ev_ts - cand_ts) <= 300.0
-                )
-                if cand_id not in consumed_dec_ids and ts_compatible:
-                    d_ev = cand
+
+                def _sender_ok(cand_ev: dict[str, Any]) -> bool:
+                    cs = str(cand_ev.get("sender_id") or "")
+                    if ev_sender.isdigit() and cs.isdigit():
+                        return cs == ev_sender
+                    if ev_sender.isdigit() and me and cand_ev.get("is_outgoing") is not None:
+                        return bool(cand_ev["is_outgoing"]) == (ev_sender == str(me))
+                    return True
+
+                # Pass A: cocokkan timestamp terdekat (<= 300s) dengan sender_id
+                # yang cocok agar pesan baru/balasan bot di OPFS tidak menggeser
+                # atau menimpa menfess terenkripsi pengirim lain.
+                if ev_ts is not None:
+                    best_cand = None
+                    best_diff = None
+                    for cand in dec_newest_first:
+                        cand_id = str(cand.get("id") or "")
+                        if cand_id in consumed_dec_ids or not _sender_ok(cand):
+                            continue
+                        cand_ts = _event_epoch_sec(cand)
+                        if cand_ts is None:
+                            continue
+                        diff = abs(ev_ts - cand_ts)
+                        if diff <= 300.0 and (best_diff is None or diff < best_diff):
+                            best_cand = cand
+                            best_diff = diff
+                    if best_cand is not None:
+                        d_ev = best_cand
+
+                # Pass B: fallback posisional (untuk baris DOM tanpa timestamp)
+                # dengan tetap menjaga kecocokan sender_id dan batas selisih 300s.
+                if d_ev is None and msg_idx < len(dec_newest_first):
+                    cand = dec_newest_first[msg_idx]
+                    cand_id = str(cand.get("id") or "")
+                    cand_ts = _event_epoch_sec(cand)
+                    ts_compatible = (
+                        ev_ts is None
+                        or cand_ts is None
+                        or abs(ev_ts - cand_ts) <= 300.0
+                    )
+                    if cand_id not in consumed_dec_ids and ts_compatible and _sender_ok(cand):
+                        d_ev = cand
             msg_idx += 1
             is_uuid_candidate = bool(eid and not eid.isdigit())
             if d_ev is None:
@@ -548,6 +579,8 @@ async def _enrich_conv_events_with_e2ee(
                 new_events.append(kept)
                 continue
             merged = {**ev, **d_ev, "id": ev.get("id") or d_ev.get("id")}
+            if not is_encrypted and ev.get("text") and not d_ev.get("text"):
+                merged["text"] = ev["text"]
             if str(ev.get("sender_id") or "").isdigit():
                 merged["sender_id"] = ev["sender_id"]
                 if me:

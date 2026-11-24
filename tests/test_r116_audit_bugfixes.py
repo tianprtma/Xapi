@@ -204,3 +204,111 @@ def test_body_size_limit_middleware_chunked_no_double_send():
     assert len(bodies) == 1
     assert bodies[0]["more_body"] is False
     assert b"downstream-ok" not in bodies[0]["body"]
+
+
+def test_format_dm_events_smart_does_not_clobber_gql_text_with_empty_rest_text():
+    """REST copy with empty text + entities/referenced_tweets must NOT overwrite
+    non-empty GraphQL plaintext during _format_dm_events_smart merge."""
+    from app.routers.dm import _format_dm_events_smart
+
+    payload = {
+        "data": {
+            "get_initial_chat_page": {
+                "conversations": [
+                    {
+                        "conversation_id": "100:200",
+                        "type": "ONE_TO_ONE",
+                        "messages": [
+                            {
+                                "id": "7777",
+                                "sender_id": "200",
+                                "text": "wots pesan asli graphql",
+                                "created_at": "1700000000000",
+                            }
+                        ],
+                    }
+                ]
+            }
+        },
+        "inbox_initial_state": {
+            "entries": [
+                {
+                    "message": {
+                        "id": "7777",
+                        "conversation_id": "100-200",
+                        "time": "1700000000000",
+                        "message_data": {
+                            "sender_id": "200",
+                            "text": "",
+                            "entities": {
+                                "urls": [
+                                    {
+                                        "url": "https://t.co/abc",
+                                        "expanded_url": "https://x.com/u/status/1234567890123",
+                                    }
+                                ]
+                            },
+                        },
+                    }
+                }
+            ]
+        },
+    }
+    res = _format_dm_events_smart(payload)
+    assert len(res["data"]) == 1
+    assert res["data"][0]["text"] == "wots pesan asli graphql"
+    assert res["data"][0]["entities"]["urls"][0]["url"] == "https://t.co/abc"
+
+
+@pytest.mark.asyncio
+async def test_enrich_conv_events_does_not_pair_bot_reply_to_user_encrypted_placeholder():
+    """An extra newer bot reply in OPFS at index 0 must NOT be paired onto an
+    incoming user's encrypted GraphQL placeholder (sender_id mismatch)."""
+    formatted = {
+        "data": [
+            {
+                "id": "9999999999999999999",
+                "event_type": "MessageCreate",
+                "dm_conversation_id": "100-200",
+                "sender_id": "200",
+                "text": "[XChat E2EE Encrypted Message]",
+                "_xchat_encrypted": True,
+                "created_at": "2026-11-24T10:05:00.000Z",
+            }
+        ],
+        "meta": {"result_count": 1},
+    }
+    opfs_chrono = [
+        {
+            "id": "u-user",
+            "event_type": "MessageCreate",
+            "dm_conversation_id": "100-200",
+            "sender_id": "200",
+            "is_outgoing": False,
+            "text": "wots menfess asli user",
+            "created_at": "2026-11-24T10:05:02.000Z",
+            "_xchat_media_state": "none",
+        },
+        {
+            "id": "u-bot",
+            "event_type": "MessageCreate",
+            "dm_conversation_id": "100-200",
+            "sender_id": "100",
+            "is_outgoing": True,
+            "text": "Menfess kamu berhasil diposting!",
+            "created_at": "2026-11-24T10:05:30.000Z",
+            "_xchat_media_state": "none",
+        },
+    ]
+    with (
+        patch("app.routers.dm.resolve_me_id", new=AsyncMock(return_value="100")),
+        patch("app.routers.dm.unlock_and_read_xchat_conversation", new=AsyncMock(return_value=opfs_chrono)),
+    ):
+        res = await _enrich_conv_events_with_e2ee(
+            formatted, tok="a" * 40, pin="123456", conv_id="100-200", max_results=10
+        )
+    by_id = {ev["id"]: ev for ev in res["data"]}
+    assert by_id["9999999999999999999"]["text"] == "wots menfess asli user"
+    assert by_id["9999999999999999999"]["sender_id"] == "200"
+    assert by_id["u-bot"]["sender_id"] == "100"
+

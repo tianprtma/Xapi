@@ -1727,10 +1727,12 @@ async def unlock_and_read_xchat_conversation(
                                     log.info("R99/R101: trigger unduh media %s mulai (attempts=%d)", norm_conv_id, _MEDIA_TRIGGER_ATTEMPTS)
                                     for _attempt in range(_MEDIA_TRIGGER_ATTEMPTS):
                                         try:
-                                            await page.goto(
+                                            nav_trig = await page.goto(
                                                 f"https://x.com/i/chat/{norm_conv_id}",
                                                 wait_until="domcontentloaded", timeout=25000,
                                             )
+                                            if (await _handle_xchat_nav_status(auth_token, nav_trig)) is not None:
+                                                break
                                             await _ensure_pin_unlocked(page, dm_pin)
                                             for _i in range(8):
                                                 try:
@@ -1808,14 +1810,18 @@ async def unlock_and_read_xchat_conversation(
 
             # If PIN redirect sent us to /i/chat main list, navigate to the specific conversation
             if norm_conv_id not in page.url:
-                await page.goto(url, wait_until="domcontentloaded", timeout=25000)
+                nav_re = await page.goto(url, wait_until="domcontentloaded", timeout=25000)
+                if (await _handle_xchat_nav_status(auth_token, nav_re)) is not None:
+                    return []
             # Guard anti salah-percakapan: setelah redirect PIN, URL WAJIB menunjuk
             # ke percakapan yang diminta. Kalau masih meleset (tab terbuka
             # percakapan lain), jangan baca apa pun — mencegah pesan dari
             # percakapan yang salah berpasangan ke placeholder inbox.
             for _gu in range(2):
                 if norm_conv_id not in page.url:
-                    await page.goto(url, wait_until="domcontentloaded", timeout=25000)
+                    nav_gu = await page.goto(url, wait_until="domcontentloaded", timeout=25000)
+                    if (await _handle_xchat_nav_status(auth_token, nav_gu)) is not None:
+                        return []
                     await asyncio.sleep(1.0)
             if norm_conv_id not in page.url:
                 log.warning(
@@ -2166,12 +2172,26 @@ async def send_xchat_dm_via_browser(
                 return {"status": "error", "error": "XChat PIN unlock failed"}
 
             if norm_conv_id not in page.url:
-                await page.goto(url, wait_until="domcontentloaded", timeout=25000)
+                nav_re = await page.goto(url, wait_until="domcontentloaded", timeout=25000)
+                bad_re = await _handle_xchat_nav_status(auth_token, nav_re)
+                if bad_re is not None:
+                    return {
+                        "status": "invalid" if bad_re == 401 else "error",
+                        "http_status": 502 if bad_re in (402, 407) else bad_re,
+                        "error": f"XChat navigation HTTP {bad_re}",
+                    }
             # Guard anti salah-percakapan: jangan kirim kalau URL tidak menunjuk
             # ke percakapan yang dituju (PIN redirect bisa mendarat di chat lain).
             for _gu in range(2):
                 if norm_conv_id not in page.url:
-                    await page.goto(url, wait_until="domcontentloaded", timeout=25000)
+                    nav_gu = await page.goto(url, wait_until="domcontentloaded", timeout=25000)
+                    bad_gu = await _handle_xchat_nav_status(auth_token, nav_gu)
+                    if bad_gu is not None:
+                        return {
+                            "status": "invalid" if bad_gu == 401 else "error",
+                            "http_status": 502 if bad_gu in (402, 407) else bad_gu,
+                            "error": f"XChat navigation HTTP {bad_gu}",
+                        }
                     await asyncio.sleep(1.0)
             if norm_conv_id not in page.url:
                 return {"status": "error", "error": f"Browser tidak berada di percakapan {norm_conv_id}"}

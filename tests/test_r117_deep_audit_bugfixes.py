@@ -2041,3 +2041,66 @@ async def test_pass31_tid_migration_407_fallback_search_post_rewarm_upload_rewar
     ):
         resp_429 = await v2_tweets_search_recent(query="test", max_results=10, next_token=None, type="Latest", authorization=f"Bearer {tok}", auth_token=None, raw=0)
     assert resp_429.status_code == 429
+
+
+# ── 38. Pass 33: DM multi-call dead-proxy short-circuit & error surfacing (no fake 200 empty), plus XChat post-redirect goto>=400 guard ──
+
+@pytest.mark.asyncio
+async def test_pass33_dm_dead_proxy_short_circuit_no_fake_200_and_xchat_redirect_407():
+    from app.routers.dm import v2_chat_conversations, v2_dm_conv_events, v2_dm_events
+    from app.xchat_e2ee import send_xchat_dm_via_browser
+
+    tok = "f" * 40
+
+    # 1. Dead proxy (`warm-up failed:`) on DM endpoints short-circuits redundant GraphQL/REST calls
+    #    AND surfaces 502/429/401 instead of returning fake HTTP 200 {"data": []}!
+    gql_mock = AsyncMock(return_value={"status": "error", "http_status": 502, "error": "warm-up failed: proxy unreachable"})
+    dm_mock = AsyncMock(return_value={"status": "error", "http_status": 502, "error": "should not be called"})
+    with (
+        patch("app.routers.dm.graphql_call", gql_mock),
+        patch("app.routers.dm.dm_call", dm_mock),
+    ):
+        r_convs = await v2_chat_conversations(
+            pagination_token=None, max_results=10, mode="auto",
+            dm_pin=None, x_dm_pin=None, authorization=f"Bearer {tok}", auth_token=None, raw=0,
+        )
+        r_conv_ev = await v2_dm_conv_events(
+            conversation_id="111-222", max_results=10, pagination_token=None, event_types=None,
+            dm_event_fields=None, expansions=None, media_fields=None, user_fields=None,
+            tweet_fields=None, mode="auto", dm_pin=None, x_dm_pin=None,
+            authorization=f"Bearer {tok}", auth_token=None, raw=0,
+        )
+        r_events = await v2_dm_events(
+            max_results=10, pagination_token=None, event_types=None, dm_event_fields=None,
+            expansions=None, media_fields=None, user_fields=None, tweet_fields=None,
+            include_requests=1, mode="auto", authorization=f"Bearer {tok}", auth_token=None, raw=0,
+        )
+    assert r_convs.status_code == 502
+    assert r_conv_ev.status_code == 502
+    assert r_events.status_code == 502
+    assert gql_mock.await_count == 3  # Exactly 1 call per endpoint, NOT 2!
+    assert dm_mock.await_count == 0   # Short-circuited REST fallback completely!
+
+    # 2. XChat post-PIN redirect `page.goto` returning HTTP 407 immediately evicts XChatContextPool & returns 502
+    nav_calls = 0
+
+    class _RedirPage:
+        url = "https://x.com/i/chat"
+        async def goto(self, target_url, **kw):
+            nonlocal nav_calls
+            nav_calls += 1
+            return MagicMock(status=200 if nav_calls == 1 else 407)
+        async def close(self):
+            pass
+
+    x_ctx = MagicMock(new_page=AsyncMock(return_value=_RedirPage()))
+    x_inv = AsyncMock()
+    with (
+        patch("app.xchat_e2ee.PlaywrightPool.get", return_value=MagicMock(semaphore=asyncio.Semaphore(1))),
+        patch("app.xchat_e2ee.XChatContextPool.get", return_value=MagicMock(acquire=AsyncMock(return_value=x_ctx), invalidate=x_inv, release=AsyncMock())),
+        patch("app.xchat_e2ee._ensure_pin_unlocked", AsyncMock(return_value=True)),
+    ):
+        send_redir = await send_xchat_dm_via_browser(tok, "1234", "111-222", "hello")
+    assert send_redir["status"] == "error"
+    assert send_redir["http_status"] == 502
+    x_inv.assert_awaited_once_with(tok)

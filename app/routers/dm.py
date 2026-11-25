@@ -118,6 +118,20 @@ async def v2_chat_members(conversation_id: str = PathParam(..., pattern=r"^\d+$"
     return stub_501(feature="chat_members", reason=OAUTH2_USER_CTX_REASON)
 
 
+def _is_fatal_proxy_or_auth_err(res: Any) -> bool:
+    """True bila panggilan pertama sudah membuktikan `auth_token` invalid (401)
+    atau `warm_session` gagal di tingkat proxy/jaringan (`warm-up failed:`),
+    sehingga fallback beruntun ke endpoint lain hanya akan menggandakan hang."""
+    if not isinstance(res, dict):
+        return False
+    if res.get("status") == "invalid":
+        return True
+    return (
+        res.get("status") == "error"
+        and str(res.get("error") or "").startswith("warm-up failed:")
+    )
+
+
 async def _resolve_me_or_error(
     tok: str,
     *,
@@ -726,14 +740,14 @@ async def v2_chat_conversations(
                 {"count": max_results},
                 tok,
             )
-            if not _has_gql_dm_data(result):
+            if not _has_gql_dm_data(result) and not _is_fatal_proxy_or_auth_err(result):
                 result = await graphql_call(
                     "GetInboxPageRequestQuery",
                     {"count": max_results},
                     tok,
                 )
 
-    if mode.lower() == "rest" or (mode.lower() == "auto"):
+    if (mode.lower() == "rest" or mode.lower() == "auto") and not _is_fatal_proxy_or_auth_err(result):
         params: dict[str, Any] = {}
         if pagination_token:
             # Token XChat bisa 'cursor_id|graph_snapshot_id' — REST 1.1 hanya
@@ -750,6 +764,8 @@ async def v2_chat_conversations(
 
     if raw:
         return wrap(result)
+    if result.get("status") == "invalid":
+        return finalize(result, _format_dm_conversations_smart, False)
 
     formatted = _format_dm_conversations_smart(result.get("data") or {}, max_results=max_results)
     convs = formatted.get("data") or []
@@ -860,6 +876,8 @@ async def v2_chat_conversations(
             formatted["data"] = merged_convs[:max_results]
             formatted["meta"] = {**(formatted.get("meta") or {}), "result_count": len(formatted["data"])}
 
+    if result.get("status") == "error" and not formatted.get("data"):
+        return finalize(result, _format_dm_conversations_smart, False)
     return JSONResponse(status_code=200, content=formatted)
 
 
@@ -884,7 +902,7 @@ async def v2_chat_conversation_messages(
         variables["cursor"] = pagination_token
 
     result = await graphql_call("GetConversationPageQuery", variables, tok)
-    if not _has_gql_dm_data(result):
+    if not _has_gql_dm_data(result) and not _is_fatal_proxy_or_auth_err(result):
         result = await graphql_call("GetMessageEventsPageQuery", variables, tok)
 
     return finalize(result, lambda d: _format_dm_events_smart(d, max_results=max_results), bool(raw))
@@ -910,6 +928,8 @@ async def v2_chat_requests(
         _xchat_requests_variables(pagination_token, max_results),
         tok,
     )
+    if _is_fatal_proxy_or_auth_err(result):
+        return finalize(result, lambda d: _format_dm_events_smart(d, max_results=max_results), bool(raw))
 
     # Also query REST 1.1 untrusted & untrusted_low_quality timelines so plaintext requests are included
     # max_id WAJIB hadir (nilai None diterima) — tanpa key ini X menolak 400.
@@ -1025,7 +1045,7 @@ async def v2_dm_events(
                 {"count": max_results},
                 tok,
             )
-            if not _has_gql_dm_data(result):
+            if not _has_gql_dm_data(result) and not _is_fatal_proxy_or_auth_err(result):
                 result = await graphql_call(
                     "GetInboxPageRequestQuery",
                     {"count": max_results},
@@ -1049,7 +1069,7 @@ async def v2_dm_events(
                     merged_inner = {**req_data, **base_data}
                     result = {**result, "data": {**base_outer, "data": merged_inner}}
 
-    if mode.lower() == "rest" or (mode.lower() == "auto"):
+    if (mode.lower() == "rest" or mode.lower() == "auto") and not _is_fatal_proxy_or_auth_err(result):
         params: dict[str, Any] = {}
         if pagination_token:
             # Token XChat bisa 'cursor_id|graph_snapshot_id' — REST 1.1 hanya
@@ -1169,7 +1189,7 @@ async def v2_dm_event_by_id(
                 {"conversation_id": conv_id, "conversationId": conv_id, "count": 50},
                 tok,
             )
-        if not _has_gql_dm_data(result):
+        if not _has_gql_dm_data(result) and not _is_fatal_proxy_or_auth_err(result):
             result = await graphql_call("GetInitialXChatPageQuery", {"count": 50}, tok)
 
         if _has_gql_dm_data(result):
@@ -1183,7 +1203,7 @@ async def v2_dm_event_by_id(
                     content={"data": hit, **({"includes": formatted["includes"]} if "includes" in formatted else {})},
                 )
 
-    if mode.lower() in ("rest", "auto"):
+    if mode.lower() in ("rest", "auto") and not _is_fatal_proxy_or_auth_err(result):
         rest_res = await dm_call("dm/user_updates.json", tok)
         if raw and mode.lower() == "rest":
             return wrap(rest_res)
@@ -1245,10 +1265,10 @@ async def v2_dm_conv_events(
         if pagination_token:
             variables["cursor"] = pagination_token
         result = await graphql_call("GetConversationPageQuery", variables, tok)
-        if not _has_gql_dm_data(result):
+        if not _has_gql_dm_data(result) and not _is_fatal_proxy_or_auth_err(result):
             result = await graphql_call("GetMessageEventsPageQuery", variables, tok)
 
-    if mode.lower() == "rest" or (mode.lower() == "auto"):
+    if (mode.lower() == "rest" or mode.lower() == "auto") and not _is_fatal_proxy_or_auth_err(result):
         params: dict[str, Any] = {"count": max_results}
         if pagination_token:
             params["max_id"] = pagination_token
@@ -1263,6 +1283,8 @@ async def v2_dm_conv_events(
 
     if raw:
         return wrap(result)
+    if result.get("status") == "invalid":
+        return finalize(result, _format_dm_events_smart, False)
 
     formatted = _format_dm_events_smart(
         result.get("data") or {},
@@ -1273,6 +1295,12 @@ async def v2_dm_conv_events(
     )
     if pin:
         formatted = await _enrich_conv_events_with_e2ee(formatted, tok, pin, conv_id, max_results=max_results)
+    if (
+        result.get("status") == "error"
+        and not formatted.get("data")
+        and not (formatted.get("meta") or {}).get("xchat_decrypted")
+    ):
+        return finalize(result, _format_dm_events_smart, False)
     return JSONResponse(status_code=200, content=formatted)
 
 
@@ -1321,10 +1349,10 @@ async def v2_dm_with_user_events(
         if pagination_token:
             variables["cursor"] = pagination_token
         result = await graphql_call("GetConversationPageQuery", variables, tok)
-        if not _has_gql_dm_data(result):
+        if not _has_gql_dm_data(result) and not _is_fatal_proxy_or_auth_err(result):
             result = await graphql_call("GetMessageEventsPageQuery", variables, tok)
 
-    if mode.lower() == "rest" or (mode.lower() == "auto"):
+    if (mode.lower() == "rest" or mode.lower() == "auto") and not _is_fatal_proxy_or_auth_err(result):
         params: dict[str, Any] = {"count": max_results}
         if pagination_token:
             params["max_id"] = pagination_token
@@ -1339,6 +1367,8 @@ async def v2_dm_with_user_events(
 
     if raw:
         return wrap(result)
+    if result.get("status") == "invalid":
+        return finalize(result, _format_dm_events_smart, False)
 
     formatted = _format_dm_events_smart(
         result.get("data") or {},
@@ -1349,6 +1379,12 @@ async def v2_dm_with_user_events(
     )
     if pin:
         formatted = await _enrich_conv_events_with_e2ee(formatted, tok, pin, conv_id, max_results=max_results)
+    if (
+        result.get("status") == "error"
+        and not formatted.get("data")
+        and not (formatted.get("meta") or {}).get("xchat_decrypted")
+    ):
+        return finalize(result, _format_dm_events_smart, False)
     return JSONResponse(status_code=200, content=formatted)
 
 

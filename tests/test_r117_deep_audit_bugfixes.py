@@ -2975,3 +2975,135 @@ async def test_pass48_playwright_search_captive_200_and_dm_hybrid_rest_dead_prox
     ):
         r_evid = await v2_dm_event_by_id(event_id="999", conversation_id=None, mode="auto", authorization=f"Bearer {tok}", auth_token=None, raw=0)
     assert r_evid.status_code == 502
+
+
+@pytest.mark.asyncio
+async def test_pass49_socks5_auth_relay_schemeless_encoded_redaction_and_browser_5xx_evict():
+    """Pass 49: `_Socks5AuthRelayPool` bridges unauthenticated loopback SOCKS5 for Chromium to
+    authenticated RFC 1928/1929 upstream SOCKS5 (since Chromium rejects `socks5://user:pass@host:port`);
+    `redact_proxy_creds` + `LogRecordFactory` redact single-token schemeless `tok@host:port` and
+    percent-encoded proxy URLs (`http%3A%2F%2Fusr%3Asecret%40host%3Aport`) without false positives;
+    `is_dead_proxy_error_result` recognizes browser proxy/non-JSON errors; and Playwright sub-request
+    5xx gateway errors evict `ContextPool`."""
+    import logging
+    from app.clients import is_dead_proxy_error_result
+    from app.config import redact_proxy_creds
+    from app.observability import install_proxy_log_record_factory
+    from playwright_search import _Socks5AuthRelayPool
+
+    # 1. Single-token schemeless & percent-encoded proxy credential redaction + zero false positives
+    assert redact_proxy_creds("err mytoken@31.6.46.27:12323 refused") == "err ***@31.6.46.27:12323 refused"
+    assert redact_proxy_creds("PROXY_LIST=tok1@31.6.46.27:12323,tok2@[2606:4700::1]:1080/") == (
+        "PROXY_LIST=***@31.6.46.27:12323,***@[2606:4700::1]:1080/"
+    )
+    assert redact_proxy_creds("redirect=http%3A%2F%2Fusr%3Asecret49%4031.6.46.27%3A12323&x=1") == (
+        "redirect=http%3A%2F%2F***%4031.6.46.27%3A12323&x=1"
+    )
+    assert redact_proxy_creds("alice@gmail.com and git@github.com:123/repo.git and http://example.com:8080?q=@alice") == (
+        "alice@gmail.com and git@github.com:123/repo.git and http://example.com:8080?q=@alice"
+    )
+
+    install_proxy_log_record_factory()
+    rec49 = logging.getLogRecordFactory()(
+        "xapi.p49", logging.WARNING, __file__, 1,
+        "gw redirect=%s", ("socks5h%3A%2F%2Fusr%3Aencsec49%4031.6.46.27%3A1080",), None,
+    )
+    assert "encsec49" not in rec49.getMessage()
+    assert "socks5h%3A%2F%2F***%4031.6.46.27%3A1080" in rec49.getMessage()
+
+    # 2. is_dead_proxy_error_result recognizes browser 407/502/non-JSON errors while keeping 403 False
+    assert is_dead_proxy_error_result({"status": "error", "http_status": 502, "error": "browser navigation HTTP 407"}) is True
+    assert is_dead_proxy_error_result({"status": "error", "http_status": 502, "error": "upstream non-JSON response (200)"}) is True
+    assert is_dead_proxy_error_result({"status": "error", "http_status": 403, "error": "browser navigation HTTP 403"}) is False
+
+    # 3. End-to-end RFC 1928 + RFC 1929 SOCKS5 auth loopback relay test against real mock upstream SOCKS5 + target server
+    async def _mock_target_http(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        try:
+            req_bytes = await asyncio.wait_for(r.readuntil(b"\r\n\r\n"), timeout=5.0)
+            assert b"GET / HTTP/1.1" in req_bytes
+            w.write(b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\n\r\nHELLO_VIA_SOCKS5")
+            await w.drain()
+        finally:
+            w.close()
+            await w.wait_closed()
+
+    target_srv = await asyncio.start_server(_mock_target_http, host="127.0.0.1", port=0)
+    target_port = target_srv.sockets[0].getsockname()[1]
+    seen_auth: list[tuple[bytes, bytes, bytes, int]] = []
+
+    async def _mock_upstream_socks5(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        tw: Optional[asyncio.StreamWriter] = None
+        try:
+            g = await r.readexactly(2)
+            methods = await r.readexactly(g[1])
+            assert 0x02 in methods
+            w.write(b"\x05\x02")
+            await w.drain()
+            ver = (await r.readexactly(1))[0]
+            assert ver == 0x01
+            ulen = (await r.readexactly(1))[0]
+            ub = await r.readexactly(ulen)
+            plen = (await r.readexactly(1))[0]
+            pb = await r.readexactly(plen)
+            if (ub, pb) != (b"socksuser", b"socksp@ss"):
+                w.write(b"\x01\x01")
+                await w.drain()
+                return
+            w.write(b"\x01\x00")
+            await w.drain()
+            req_h = await r.readexactly(4)
+            assert req_h[:2] == b"\x05\x01" and req_h[3] == 0x03
+            dlen = (await r.readexactly(1))[0]
+            dom = await r.readexactly(dlen)
+            dport = int.from_bytes(await r.readexactly(2), "big")
+            seen_auth.append((ub, pb, dom, dport))
+            tr, tw = await asyncio.open_connection("127.0.0.1", dport)
+            w.write(b"\x05\x00\x00\x01\x7f\x00\x00\x01\x00\x00")
+            await w.drain()
+            await asyncio.gather(
+                _Socks5AuthRelayPool._pump(r, tw),
+                _Socks5AuthRelayPool._pump(tr, w),
+            )
+        finally:
+            for s_w in (tw, w):
+                if s_w is not None:
+                    s_w.close()
+                    await s_w.wait_closed()
+
+    up_socks_srv = await asyncio.start_server(_mock_upstream_socks5, host="127.0.0.1", port=0)
+    up_socks_port = up_socks_srv.sockets[0].getsockname()[1]
+    relay_pool = _Socks5AuthRelayPool()
+    try:
+        resolved = await relay_pool.resolve_playwright_proxy({
+            "server": f"socks5://127.0.0.1:{up_socks_port}",
+            "username": "socksuser",
+            "password": "socksp@ss",
+        })
+        assert resolved is not None
+        assert "username" not in resolved and "password" not in resolved
+        assert resolved["server"].startswith("socks5://127.0.0.1:")
+        relay_port = int(resolved["server"].rsplit(":", 1)[1])
+
+        # Connect to local relay as Chromium does (unauthenticated SOCKS5 + ATYP=0x03 domainname)
+        cr, cw = await asyncio.open_connection("127.0.0.1", relay_port)
+        cw.write(b"\x05\x01\x00")
+        await cw.drain()
+        assert await cr.readexactly(2) == b"\x05\x00"
+        host_b = b"x.com"
+        cw.write(b"\x05\x01\x00\x03" + bytes([len(host_b)]) + host_b + target_port.to_bytes(2, "big"))
+        await cw.drain()
+        rep = await cr.readexactly(10)
+        assert rep[:2] == b"\x05\x00"
+        cw.write(b"GET / HTTP/1.1\r\nHost: x.com\r\n\r\n")
+        await cw.drain()
+        payload = await asyncio.wait_for(cr.readuntil(b"HELLO_VIA_SOCKS5"), timeout=5.0)
+        assert b"HELLO_VIA_SOCKS5" in payload
+        assert seen_auth == [(b"socksuser", b"socksp@ss", b"x.com", target_port)]
+        cw.close()
+        await cw.wait_closed()
+    finally:
+        await relay_pool.close_all()
+        up_socks_srv.close()
+        await up_socks_srv.wait_closed()
+        target_srv.close()
+        await target_srv.wait_closed()

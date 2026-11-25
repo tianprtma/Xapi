@@ -90,6 +90,10 @@ def is_dead_proxy_error_result(res: Any) -> bool:
         "upstream request failed:",
         "rejected by proxy/upstream",
         "non-JSON",
+        "upstream non-JSON",
+        "browser navigation",
+        "browser context unavailable",
+        "browser fetch",
     )):
         return True
     if st in (502, 503, 504):

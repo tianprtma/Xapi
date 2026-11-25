@@ -302,6 +302,11 @@ class PlaywrightPool:
                 await ContextPool._instance.close_all()
             except Exception:  # noqa: BLE001
                 pass
+        if _Socks5AuthRelayPool._instance is not None:
+            try:
+                await _Socks5AuthRelayPool._instance.close_all()
+            except Exception:  # noqa: BLE001
+                pass
         async with self._lock:
             if self._browser is not None:
                 try:
@@ -315,6 +320,188 @@ class PlaywrightPool:
                 except Exception:  # noqa: BLE001
                     pass
                 self._pw = None
+
+
+class _Socks5AuthRelayPool:
+    """Relay loopback `127.0.0.1:<ephemeral>` (SOCKS5 tanpa auth) -> upstream SOCKS5 ber-auth (RFC 1928/1929).
+
+    Chromium/Playwright menolak `socks5://user:pass@host:port` secara langsung
+    (`Browser does not support socks5 proxy authentication`), tetapi mendukung
+    `socks5://127.0.0.1:<port>` tanpa auth (dengan remote DNS ATYP=0x03).
+    """
+
+    MAX_RELAYS = 32
+    _instance: "_Socks5AuthRelayPool | None" = None
+
+    def __init__(self) -> None:
+        self._servers: "OrderedDict[tuple[str, int, str, str], asyncio.AbstractServer]" = OrderedDict()
+        self._lock = asyncio.Lock()
+
+    @classmethod
+    def get(cls) -> "_Socks5AuthRelayPool":
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    @staticmethod
+    async def _pump(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            while True:
+                chunk = await reader.read(65536)
+                if not chunk:
+                    if writer.can_write_eof():
+                        writer.write_eof()
+                    break
+                writer.write(chunk)
+                await writer.drain()
+        except Exception:  # noqa: BLE001
+            try:
+                writer.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    @classmethod
+    async def _handle_client(
+        cls,
+        client_r: asyncio.StreamReader,
+        client_w: asyncio.StreamWriter,
+        up_host: str,
+        up_port: int,
+        username: str,
+        password: str,
+    ) -> None:
+        up_r: Optional[asyncio.StreamReader] = None
+        up_w: Optional[asyncio.StreamWriter] = None
+        try:
+            greet = await asyncio.wait_for(client_r.readexactly(2), timeout=10.0)
+            if greet[0] != 0x05:
+                return
+            methods = await asyncio.wait_for(client_r.readexactly(greet[1]), timeout=10.0)
+            if 0x00 not in methods:
+                client_w.write(b"\x05\xff")
+                await client_w.drain()
+                return
+            client_w.write(b"\x05\x00")
+            await client_w.drain()
+
+            req_head = await asyncio.wait_for(client_r.readexactly(4), timeout=10.0)
+            if req_head[0] != 0x05 or req_head[1] != 0x01:
+                client_w.write(b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00")
+                await client_w.drain()
+                return
+            atyp = req_head[3]
+            if atyp == 0x01:
+                addr_port = await asyncio.wait_for(client_r.readexactly(6), timeout=10.0)
+            elif atyp == 0x03:
+                dlen = await asyncio.wait_for(client_r.readexactly(1), timeout=10.0)
+                addr_port = dlen + await asyncio.wait_for(client_r.readexactly(dlen[0] + 2), timeout=10.0)
+            elif atyp == 0x04:
+                addr_port = await asyncio.wait_for(client_r.readexactly(18), timeout=10.0)
+            else:
+                client_w.write(b"\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00")
+                await client_w.drain()
+                return
+
+            try:
+                up_r, up_w = await asyncio.wait_for(asyncio.open_connection(up_host, up_port), timeout=15.0)
+            except Exception:  # noqa: BLE001
+                client_w.write(b"\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00")
+                await client_w.drain()
+                return
+
+            up_w.write(b"\x05\x02\x00\x02")
+            await up_w.drain()
+            up_greet = await asyncio.wait_for(up_r.readexactly(2), timeout=10.0)
+            if up_greet[0] != 0x05:
+                client_w.write(b"\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00")
+                await client_w.drain()
+                return
+            if up_greet[1] == 0x02:
+                u_b = username.encode("utf-8")
+                p_b = password.encode("utf-8")
+                up_w.write(b"\x01" + bytes([len(u_b)]) + u_b + bytes([len(p_b)]) + p_b)
+                await up_w.drain()
+                auth_res = await asyncio.wait_for(up_r.readexactly(2), timeout=10.0)
+                if auth_res[1] != 0x00:
+                    client_w.write(b"\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00")
+                    await client_w.drain()
+                    return
+            elif up_greet[1] != 0x00:
+                client_w.write(b"\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00")
+                await client_w.drain()
+                return
+
+            up_w.write(req_head + addr_port)
+            await up_w.drain()
+            await asyncio.gather(cls._pump(client_r, up_w), cls._pump(up_r, client_w))
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            for w in (up_w, client_w):
+                if w is not None:
+                    try:
+                        w.close()
+                        await w.wait_closed()
+                    except Exception:  # noqa: BLE001
+                        pass
+
+    async def resolve_playwright_proxy(self, pw_proxy: Optional[dict[str, str]]) -> Optional[dict[str, str]]:
+        if not pw_proxy:
+            return None
+        srv = str(pw_proxy.get("server") or "")
+        if not srv.lower().startswith("socks5://") or (
+            pw_proxy.get("username") is None and pw_proxy.get("password") is None
+        ):
+            return pw_proxy
+        from urllib.parse import urlparse as _up
+
+        parsed = _up(srv)
+        up_host = parsed.hostname or ""
+        up_port = parsed.port or 1080
+        username = str(pw_proxy.get("username") or "")
+        password = str(pw_proxy.get("password") or "")
+        if not up_host or len(username.encode("utf-8")) > 255 or len(password.encode("utf-8")) > 255:
+            raise ValueError("kredensial atau host proxy SOCKS5 tidak valid untuk relay")
+
+        key = (up_host, int(up_port), username, password)
+        async with self._lock:
+            existing = self._servers.get(key)
+            if existing is not None and existing.is_serving() and existing.sockets:
+                self._servers.move_to_end(key)
+                port = existing.sockets[0].getsockname()[1]
+                return {"server": f"socks5://127.0.0.1:{port}"}
+            if existing is not None:
+                self._servers.pop(key, None)
+                try:
+                    existing.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+            server = await asyncio.start_server(
+                lambda r, w: self._handle_client(r, w, up_host, int(up_port), username, password),
+                host="127.0.0.1",
+                port=0,
+            )
+            while len(self._servers) >= self.MAX_RELAYS:
+                _, old_srv = self._servers.popitem(last=False)
+                try:
+                    old_srv.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            self._servers[key] = server
+            local_port = server.sockets[0].getsockname()[1]
+            return {"server": f"socks5://127.0.0.1:{local_port}"}
+
+    async def close_all(self) -> None:
+        async with self._lock:
+            servers = list(self._servers.values())
+            self._servers.clear()
+        for s in servers:
+            try:
+                s.close()
+                await s.wait_closed()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 async def _new_context(browser: Browser, auth_token: str) -> BrowserContext:
@@ -334,7 +521,9 @@ async def _new_context(browser: Browser, auth_token: str) -> BrowserContext:
             "sec-ch-ua-platform": prof["sec_ch_ua_platform"],
         },
     }
-    pw_proxy = playwright_proxy_for_token(auth_token)
+    pw_proxy = await _Socks5AuthRelayPool.get().resolve_playwright_proxy(
+        playwright_proxy_for_token(auth_token)
+    )
     if pw_proxy:
         ctx_kwargs["proxy"] = pw_proxy
     try:
@@ -778,7 +967,7 @@ class XChatContextPool:
                         ],
                     }
                     if pw_proxy:
-                        launch_kwargs["proxy"] = pw_proxy
+                        launch_kwargs["proxy"] = await _Socks5AuthRelayPool.get().resolve_playwright_proxy(pw_proxy)
                     try:
                         ctx = await driver.chromium.launch_persistent_context(
                             str(profile_dir),
@@ -1199,7 +1388,7 @@ async def _click_action_via_browser_impl(
             if cap_st == 401:
                 from app.response_cache import ResponseCache
                 ResponseCache.get().invalidate_token(auth_token)
-            if cap_st in (401, 403, 402, 407):
+            if cap_st in (401, 403, 402, 407) or cap_st >= 500:
                 await ContextPool.get().invalidate(auth_token, all_proxies=(cap_st == 401))
             return {
                 "status": "invalid" if cap_st == 401 else "error",
@@ -1355,7 +1544,7 @@ async def _action_via_browser_impl(
             if status_code == 401:
                 from app.response_cache import ResponseCache
                 ResponseCache.get().invalidate_token(auth_token)
-            if status_code in (401, 403, 402, 407):
+            if status_code in (401, 403, 402, 407) or status_code >= 500:
                 await ContextPool.get().invalidate(auth_token, all_proxies=(status_code == 401))
             return {
                 "status": "invalid" if status_code == 401 else "error",
@@ -1505,7 +1694,7 @@ async def _fetch_via_browser_impl(
             if raw_st == 401:
                 from app.response_cache import ResponseCache
                 ResponseCache.get().invalidate_token(auth_token)
-            if (isinstance(raw_st, int) and raw_st in (401, 403, 402, 407)) or "raw" in captured:
+            if (isinstance(raw_st, int) and (raw_st in (401, 403, 402, 407) or raw_st >= 500)) or "raw" in captured:
                 await ContextPool.get().invalidate(auth_token, all_proxies=(raw_st == 401))
             norm_raw_st = (
                 502
@@ -1531,7 +1720,7 @@ async def _fetch_via_browser_impl(
             if cap_st == 401:
                 from app.response_cache import ResponseCache
                 ResponseCache.get().invalidate_token(auth_token)
-            if cap_st in (401, 403, 402, 407):
+            if cap_st in (401, 403, 402, 407) or cap_st >= 500:
                 await ContextPool.get().invalidate(auth_token, all_proxies=(cap_st == 401))
             return {
                 "status": "invalid" if cap_st == 401 else "error",
@@ -1669,7 +1858,7 @@ async def _search_via_browser_impl(
             if raw_st == 401:
                 from app.response_cache import ResponseCache
                 ResponseCache.get().invalidate_token(auth_token)
-            if (isinstance(raw_st, int) and raw_st in (401, 403, 402, 407)) or "raw" in captured:
+            if (isinstance(raw_st, int) and (raw_st in (401, 403, 402, 407) or raw_st >= 500)) or "raw" in captured:
                 await ContextPool.get().invalidate(auth_token, all_proxies=(raw_st == 401))
             norm_raw_st = (
                 502
@@ -1695,7 +1884,7 @@ async def _search_via_browser_impl(
             if cap_st == 401:
                 from app.response_cache import ResponseCache
                 ResponseCache.get().invalidate_token(auth_token)
-            if cap_st in (401, 403, 402, 407):
+            if cap_st in (401, 403, 402, 407) or cap_st >= 500:
                 await ContextPool.get().invalidate(auth_token, all_proxies=(cap_st == 401))
             return {
                 "status": "invalid" if cap_st == 401 else "error",

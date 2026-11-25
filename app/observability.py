@@ -85,7 +85,7 @@ def install_proxy_log_record_factory() -> None:
         rec = cur_factory(*args, **kwargs)
         try:
             rendered = rec.getMessage()
-            if "://" in rendered or "@" in rendered or ":" in rendered:
+            if "://" in rendered or "@" in rendered or ":" in rendered or "%" in rendered:
                 rec.msg = redact_proxy_creds(rendered)
                 rec.args = ()
         except Exception:  # noqa: BLE001

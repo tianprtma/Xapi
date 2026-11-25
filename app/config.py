@@ -328,7 +328,17 @@ _PROXY_SHORTHAND_CREDS_RE = _re.compile(
     r"((?<![A-Za-z0-9._/-])(?:\[[0-9a-fA-F:]+\]|[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+\.?):\d{1,5}):[^\s,'\";\]})]+:(?:(?![,.:!?](?:\s|$)|," + _NEXT_PROXY_LIST_ENTRY_RE + r")[^\s'\";\]})])+"
 )
 _PROXY_SCHEMELESS_AT_RE = _re.compile(
-    r"(?:(?<=[\s'\"(<\[,;={])|^)(?!(?:\[[0-9a-fA-F:]+\]|[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+\.?):\d{1,5}:)[^\s/:'\"<>@=,]+:(?!//|[0-9]{1,5}(?:[/?#,\s]|$))(?:(?!://)[^\s'\"<>])+?@(?=(?:\[[0-9a-fA-F:]+\]|[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.?):\d{1,5}(?:[\s/'\"<>),;\]}.!?#]|:(?!\d)|$))"
+    r"(?:(?<=[\s'\"(<\[,;={])|^)"
+    r"(?!(?:\[[0-9a-fA-F:]+\]|[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+\.?):\d{1,5}:)"
+    r"(?:[^\s/:'\"<>@=,]+:(?!//|[0-9]{1,5}(?:[/?#,\s]|$))(?:(?!://)[^\s'\"<>])+?|(?!\*{3}@)[^\s/:'\"<>@=,]+)"
+    r"@(?=(?:\[[0-9a-fA-F:]+\]|[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.?):\d{1,5}(?:[\s'\"<>),;\]}.!?#]|/(?=[\s'\"<>),;\]}.!?#]|:(?!\d)|$)|:(?!\d)|$))"
+)
+_PROXY_ENCODED_CREDS_RE = _re.compile(
+    r"((?:https?|socks(?:4a?|5h?)?)%(?:25)?3[Aa]%(?:25)?2[Ff]%(?:25)?2[Ff])"
+    r"(?!\*{3}%(?:25)?40)"
+    r"(?:(?!(?:https?|socks(?:4a?|5h?)?)%(?:25)?3[Aa]%(?:25)?2[Ff]%(?:25)?2[Ff]|%(?:25)?3[Ff]|%(?:25)?23)[^\s'\"<>&#])+?"
+    r"(%(?:25)?40(?=(?:%(?:25)?5[Bb][0-9a-fA-F:%]+%(?:25)?5[Dd]|[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+|[A-Za-z0-9-]+%(?:25)?3[Aa]\d{1,5})))",
+    _re.IGNORECASE,
 )
 def _detect_local_self_hosts() -> frozenset[str]:
     out: set[str] = set()
@@ -688,10 +698,12 @@ def normalize_proxy_input(raw: str) -> str:
 
 
 def redact_proxy_creds(text: str) -> str:
-    """Mask kredensial (`user:pass@`, `token@`, maupun shorthand `host:port:user:pass`) agar tidak bocor ke log/error."""
+    """Mask kredensial (`user:pass@`, `token@`, URL-encoded, maupun shorthand `host:port:user:pass`) agar tidak bocor ke log/error."""
     if not text:
         return text
     out = _PROXY_CREDS_RE.sub(r"\1***@", text) if "://" in text else text
+    if "%" in out and "40" in out:
+        out = _PROXY_ENCODED_CREDS_RE.sub(r"\1***\2", out)
     if "@" in out and ":" in out:
         out = _PROXY_SCHEMELESS_AT_RE.sub("***@", out)
     if ":" in out:

@@ -2919,3 +2919,59 @@ async def test_pass47_xchat_warmup_proxy_abort_captive_200_and_bookmark_secondar
     ):
         r_ub47 = await v2_unblock(source_user_id="1", target_user_id="2", authorization=f"Bearer {tok}", auth_token=None, raw=0)
     assert r_ub47.status_code == 502
+
+
+@pytest.mark.asyncio
+async def test_pass48_playwright_search_captive_200_and_dm_hybrid_rest_dead_proxy_propagation():
+    """Pass 48: `_check_nav_response_error` in `playwright_search.py` catches HTTP 200 non-X captive-portal
+    HTML without redirect (evicting `ContextPool`); and hybrid GraphQL+REST DM routes (`v2_chat_conversations`,
+    `v2_dm_conv_events`, `v2_dm_event_by_id`, `v2_chat_requests`) propagate dead-proxy 502 / 401 from `dm_call`
+    instead of launching Chromium E2EE or returning false 200/404."""
+    from app.config import reset_request_proxy, set_request_proxy
+    from app.routers.dm import v2_chat_conversations, v2_dm_conv_events, v2_dm_event_by_id
+    from playwright_search import _check_nav_response_error
+
+    tok = "a" * 40
+    px_tok = set_request_proxy("http://31.6.46.27:12323")
+    try:
+        cp_inv_48 = AsyncMock()
+        fake_nav = MagicMock(status=200, text=AsyncMock(return_value="<html><body>Captive WiFi Login</body></html>"))
+        fake_pg = MagicMock(url="https://x.com/search?q=test")
+        with patch("playwright_search.ContextPool.get", return_value=MagicMock(invalidate=cp_inv_48)):
+            nav_err_48 = await _check_nav_response_error(tok, fake_nav, page=fake_pg)
+        assert nav_err_48 is not None and nav_err_48["http_status"] == 502
+        cp_inv_48.assert_awaited_once_with(tok, all_proxies=False)
+    finally:
+        reset_request_proxy(px_tok)
+
+    # GraphQL 403 + REST dead-proxy 502 -> v2_chat_conversations & v2_dm_conv_events skip XChat Chromium & return 502!
+    gql_403 = {"status": "error", "http_status": 403, "error": "Forbidden", "data": None}
+    rest_dead = {"status": "error", "http_status": 502, "error": "upstream request failed: ProxyError", "data": None}
+    xchat_inbox_spy = AsyncMock()
+    xchat_conv_spy = AsyncMock()
+
+    with (
+        patch("app.routers.dm.graphql_call", AsyncMock(return_value=gql_403)),
+        patch("app.routers.dm.dm_call", AsyncMock(return_value=rest_dead)),
+        patch("app.routers.dm.unlock_and_read_xchat_inbox", xchat_inbox_spy),
+    ):
+        r_convs = await v2_chat_conversations(pagination_token=None, max_results=20, mode="auto", dm_pin=None, x_dm_pin="1234", authorization=f"Bearer {tok}", auth_token=None, raw=0)
+    assert r_convs.status_code == 502
+    assert xchat_inbox_spy.await_count == 0
+
+    with (
+        patch("app.routers.dm.graphql_call", AsyncMock(return_value=gql_403)),
+        patch("app.routers.dm.dm_call", AsyncMock(return_value=rest_dead)),
+        patch("app.routers.dm._enrich_conv_events_with_e2ee", xchat_conv_spy),
+    ):
+        r_cevs = await v2_dm_conv_events(conversation_id="111-222", max_results=20, pagination_token=None, event_types=None, dm_event_fields=None, expansions=None, media_fields=None, user_fields=None, tweet_fields=None, mode="auto", dm_pin=None, x_dm_pin="1234", authorization=f"Bearer {tok}", auth_token=None, raw=0)
+    assert r_cevs.status_code == 502
+    assert xchat_conv_spy.await_count == 0
+
+    # GraphQL empty 200 + REST dead-proxy 502 on v2_dm_event_by_id -> returns 502, NOT false 404!
+    with (
+        patch("app.routers.dm.graphql_call", AsyncMock(return_value={"status": "ok", "http_status": 200, "data": {}})),
+        patch("app.routers.dm.dm_call", AsyncMock(return_value=rest_dead)),
+    ):
+        r_evid = await v2_dm_event_by_id(event_id="999", conversation_id=None, mode="auto", authorization=f"Bearer {tok}", auth_token=None, raw=0)
+    assert r_evid.status_code == 502

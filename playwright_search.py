@@ -1067,6 +1067,32 @@ async def _check_nav_response_error(auth_token: str, nav_resp: Any, *, page: Any
                 "error": "browser navigation redirected off-domain by proxy/captive-portal",
                 "data": None,
             }
+    if isinstance(nav_st, int) and nav_st == 200 and nav_resp is not None:
+        import inspect as _inspect
+        from app.config import proxy_for_token
+
+        txt_fn = getattr(nav_resp, "text", None)
+        if callable(txt_fn) and proxy_for_token(auth_token):
+            try:
+                cand_txt = txt_fn()
+                nav_txt = (await cand_txt) if _inspect.isawaitable(cand_txt) else cand_txt
+                if (
+                    isinstance(nav_txt, str)
+                    and nav_txt.lstrip()[:32].lower().startswith(("<!doctype", "<html", "<head", "<body"))
+                    and not any(
+                        m in nav_txt.lower()
+                        for m in ("twimg.com", "ondemand.s", "loading-x-anim", "twitter-site-verification", "__initial_state__")
+                    )
+                ):
+                    await ContextPool.get().invalidate(auth_token, all_proxies=False)
+                    return {
+                        "status": "error",
+                        "http_status": 502,
+                        "error": "non-JSON HTML response from proxy/upstream",
+                        "data": None,
+                    }
+            except Exception:  # noqa: BLE001
+                pass
     return None
 
 

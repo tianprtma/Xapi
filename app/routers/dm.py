@@ -785,7 +785,10 @@ async def v2_chat_conversations(
                 result = {**result, "data": {**rest_res["data"], **result["data"]}}
             else:
                 result = rest_res
-        elif not result:
+        elif not result or (
+            not _has_gql_dm_data(result)
+            and (rest_res.get("status") == "invalid" or _is_dead_proxy_err(rest_res))
+        ):
             result = rest_res
 
     if raw:
@@ -800,8 +803,15 @@ async def v2_chat_conversations(
     # diberikan, penelepon sudah menanggung biaya browser — selalu gabungkan.
     needs_e2ee = bool(pin) and not _is_dead_proxy_err(result)
     if needs_e2ee and pin:
+        clear_last_resolve_me_warm_error()
         me = await resolve_me_id(tok)
-        inbox_items = await unlock_and_read_xchat_inbox(tok, pin, my_user_id=me, max_results=max_results)
+        me_warm_err = get_last_resolve_me_warm_error()
+        clear_last_resolve_me_warm_error()
+        inbox_items = (
+            []
+            if me_warm_err is not None
+            else await unlock_and_read_xchat_inbox(tok, pin, my_user_id=me, max_results=max_results)
+        )
         if inbox_items:
             def _canon_cid(raw_cid: str) -> str:
                 norm = str(raw_cid or "").replace(":", "-")
@@ -990,6 +1000,8 @@ async def v2_chat_requests(
             result = {**rest_res, "data": {"inbox_initial_state": rest_tl}}
         elif not _has_gql_dm_data(result):
             result = rest_res
+    elif not _has_gql_dm_data(result) and (rest_res.get("status") == "invalid" or _is_dead_proxy_err(rest_res) or not result):
+        result = rest_res
 
     return finalize(result, lambda d: _format_dm_events_smart(d, max_results=max_results), bool(raw))
 
@@ -1119,6 +1131,8 @@ async def v2_dm_events(
                 extra_params: dict[str, Any] = {"max_id": max_id}
                 extra = await dm_call(tl_path, tok, params=extra_params)
                 if extra.get("status") != "ok":
+                    if _is_fatal_proxy_or_auth_err(extra):
+                        break
                     continue
                 tl = (extra.get("data") or {}).get("inbox_timeline") or {}
                 if not isinstance(tl, dict):
@@ -1137,7 +1151,10 @@ async def v2_dm_events(
                 result = {**result, "data": {**rest_res["data"], **result["data"]}}
             else:
                 result = rest_res
-        elif not result:
+        elif not result or (
+            not _has_gql_dm_data(result)
+            and (rest_res.get("status") == "invalid" or _is_dead_proxy_err(rest_res))
+        ):
             result = rest_res
 
     return finalize(
@@ -1242,6 +1259,8 @@ async def v2_dm_event_by_id(
                     content={"data": hit, **({"includes": formatted["includes"]} if "includes" in formatted else {})},
                 )
             result = rest_res
+        elif rest_res.get("status") == "invalid" or _is_dead_proxy_err(rest_res) or not result:
+            result = rest_res
 
     if raw and result:
         return wrap(result)
@@ -1304,7 +1323,10 @@ async def v2_dm_conv_events(
                 result = {**result, "data": {**rest_res["data"], **result["data"]}}
             else:
                 result = rest_res
-        elif not result:
+        elif not result or (
+            not _has_gql_dm_data(result)
+            and (rest_res.get("status") == "invalid" or _is_dead_proxy_err(rest_res))
+        ):
             result = rest_res
 
     if raw:
@@ -1388,7 +1410,10 @@ async def v2_dm_with_user_events(
                 result = {**result, "data": {**rest_res["data"], **result["data"]}}
             else:
                 result = rest_res
-        elif not result:
+        elif not result or (
+            not _has_gql_dm_data(result)
+            and (rest_res.get("status") == "invalid" or _is_dead_proxy_err(rest_res))
+        ):
             result = rest_res
 
     if raw:

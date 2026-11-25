@@ -196,6 +196,12 @@ class TIDProvider:
                             )
                             if resp is None:
                                 return None
+                            resp_st = getattr(resp, "status", 200)
+                            if isinstance(resp_st, int) and resp_st != 200:
+                                if resp_st in (401, 403, 402, 407) or resp_st >= 500:
+                                    await ContextPool.get().invalidate(auth_token, all_proxies=(resp_st == 401))
+                                log.warning("TID home fetch via browser: HTTP %s", resp_st)
+                                return None
                             return await resp.text()
                         except Exception:
                             await ContextPool.get().invalidate(auth_token, all_proxies=False)

@@ -131,6 +131,14 @@ class ResponseCache:
             while len(self._cache) > MAX_CACHE_ENTRIES:
                 self._cache.popitem(last=False)
 
+    def invalidate_token(self, auth_token: str) -> None:
+        """Evict all cached responses for a revoked/invalidated `auth_token`."""
+        if not auth_token or not self._cache:
+            return
+        tkey = token_key(auth_token)
+        for k in [k for k in self._cache if len(k) >= 3 and k[2] == tkey]:
+            self._cache.pop(k, None)
+
     async def stats(self) -> dict[str, Any]:
         async with self._lock:
             now = time.time()

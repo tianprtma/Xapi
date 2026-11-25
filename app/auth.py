@@ -53,10 +53,11 @@ class WarmNetworkError(Exception):
     meng-invalidate session cache — sifatnya sementara (502), bukan 401.
     """
 
-    def __init__(self, message: str, http_status: int = 502):
+    def __init__(self, message: str, http_status: int = 502, *, no_retry: bool = False):
         super().__init__(message)
         self.message = message
         self.http_status = http_status
+        self.no_retry = no_retry
 
 
 # ──────────────────────────── Helpers ────────────────────────────
@@ -199,6 +200,7 @@ async def warm_session(
                 raise WarmNetworkError(
                     f"GET {HOMEPAGE_URL} returned HTTP {bad_st} twice",
                     http_status=bad_st,
+                    no_retry=(bad_st != 429),
                 )
     except WarmNetworkError:
         raise
@@ -215,13 +217,15 @@ async def warm_session(
                 raise WarmNetworkError(
                     f"GET {HOMEPAGE_URL} returned HTTP {bad_st} on retry",
                     http_status=bad_st,
+                    no_retry=(bad_st != 429),
                 )
         except WarmNetworkError:
             raise
         except Exception as exc:  # noqa: BLE001
             await ClientPool.get().invalidate(auth_token, all_proxies=False)
             raise WarmNetworkError(
-                redact_proxy_creds(f"GET {HOMEPAGE_URL} failed twice: {type(exc).__name__}: {exc}")
+                redact_proxy_creds(f"GET {HOMEPAGE_URL} failed twice: {type(exc).__name__}: {exc}"),
+                no_retry=True,
             ) from exc
 
     # Jika proxy/WAF menolak GET /home (mis. 407 Proxy Auth, 402 kuota proxy habis,
@@ -234,6 +238,7 @@ async def warm_session(
         raise WarmNetworkError(
             f"GET {HOMEPAGE_URL} rejected by proxy/upstream (HTTP {final_home_st})",
             http_status=mapped_st,
+            no_retry=(final_home_st in (402, 407)),
         )
 
     # X kasih ct0 server-issued di domain .x.com (leading dot). Placeholder lokal
@@ -390,6 +395,8 @@ async def login_with_auth_token(auth_token: str, *, _rewarm_retry: bool = False)
             except (json.JSONDecodeError, KeyError, AttributeError):
                 pass
         elif viewer_resp.status_code == 401:
+            from .response_cache import ResponseCache
+            ResponseCache.get().invalidate_token(auth_token)
             if hasattr(store, "invalidate"):
                 await store.invalidate(auth_token, all_proxies=True)
             await ClientPool.get().invalidate(auth_token, all_proxies=True)

@@ -127,12 +127,15 @@ async def _graphql_call_once(
         except InvalidTokenError as e:
             return _invalid_token_response(e, auth_token)
         except WarmNetworkError as e:
-            return {
+            res_w: dict[str, Any] = {
                 "status": "error",
                 "http_status": getattr(e, "http_status", 502),
                 "error": f"warm-up failed: {e.message}",
                 "data": None,
             }
+            if getattr(e, "no_retry", False):
+                res_w["_no_retry"] = True
+            return res_w
 
         params = {
             "variables": json.dumps(variables),
@@ -169,22 +172,28 @@ async def _graphql_call_once(
             }
 
         if resp.status_code != 200:
+            is_proxy_auth_or_quota = resp.status_code in (402, 407)
             if resp.status_code in (401, 403):
                 all_p = resp.status_code == 401
+                if all_p:
+                    ResponseCache.get().invalidate_token(auth_token)
                 await SessionStore.get().invalidate(auth_token, all_proxies=all_p)
                 await ClientPool.get().invalidate(auth_token, all_proxies=all_p)
                 if had_cached_session:
                     need_rewarm = True
-            elif resp.status_code in (402, 407):
+            elif is_proxy_auth_or_quota:
                 await ClientPool.get().invalidate(auth_token, all_proxies=False)
             if not need_rewarm:
-                out_st = 502 if resp.status_code in (402, 407) or resp.status_code < 400 else resp.status_code
-                return {
+                out_st = 502 if is_proxy_auth_or_quota or resp.status_code < 400 else resp.status_code
+                err_out: dict[str, Any] = {
                     "status": "error",
                     "http_status": out_st,
                     "error": resp.text[:1000],
                     "data": None,
                 }
+                if is_proxy_auth_or_quota:
+                    err_out["_no_retry"] = True
+                return err_out
 
         if not need_rewarm:
             try:
@@ -261,12 +270,15 @@ async def _rest_call_once(
         except InvalidTokenError as e:
             return _invalid_token_response(e, auth_token)
         except WarmNetworkError as e:
-            return {
+            res_w: dict[str, Any] = {
                 "status": "error",
                 "http_status": getattr(e, "http_status", 502),
                 "error": f"warm-up failed: {e.message}",
                 "data": None,
             }
+            if getattr(e, "no_retry", False):
+                res_w["_no_retry"] = True
+            return res_w
 
         headers = {
             **headers_for_token(auth_token),
@@ -299,21 +311,27 @@ async def _rest_call_once(
             }
 
         if resp.status_code >= 400:
+            is_proxy_auth_or_quota = resp.status_code in (402, 407)
             if resp.status_code in (401, 403):
                 all_p = resp.status_code == 401
+                if all_p:
+                    ResponseCache.get().invalidate_token(auth_token)
                 await SessionStore.get().invalidate(auth_token, all_proxies=all_p)
                 await ClientPool.get().invalidate(auth_token, all_proxies=all_p)
                 if had_cached_session:
                     need_rewarm = True
-            elif resp.status_code in (402, 407):
+            elif is_proxy_auth_or_quota:
                 await ClientPool.get().invalidate(auth_token, all_proxies=False)
             if not need_rewarm:
-                return {
+                err_out = {
                     "status": "error",
-                    "http_status": 502 if resp.status_code in (402, 407) else resp.status_code,
+                    "http_status": 502 if is_proxy_auth_or_quota else resp.status_code,
                     "error": resp.text[:1000],
                     "data": None,
                 }
+                if is_proxy_auth_or_quota:
+                    err_out["_no_retry"] = True
+                return err_out
 
         if not need_rewarm:
             try:
@@ -399,12 +417,15 @@ async def _dm_call_once(
         except InvalidTokenError as e:
             return _invalid_token_response(e, auth_token)
         except WarmNetworkError as e:
-            return {
+            res_w: dict[str, Any] = {
                 "status": "error",
                 "http_status": getattr(e, "http_status", 502),
                 "error": f"warm-up failed: {e.message}",
                 "data": None,
             }
+            if getattr(e, "no_retry", False):
+                res_w["_no_retry"] = True
+            return res_w
 
         headers = {
             **headers_for_token(auth_token),
@@ -447,21 +468,27 @@ async def _dm_call_once(
             payload = {"raw": resp.text[:1000]}
 
         if resp.status_code >= 400:
+            is_proxy_auth_or_quota = resp.status_code in (402, 407)
             if resp.status_code in (401, 403):
                 all_p = resp.status_code == 401
+                if all_p:
+                    ResponseCache.get().invalidate_token(auth_token)
                 await SessionStore.get().invalidate(auth_token, all_proxies=all_p)
                 await ClientPool.get().invalidate(auth_token, all_proxies=all_p)
                 if had_cached_session:
                     need_rewarm = True
-            elif resp.status_code in (402, 407):
+            elif is_proxy_auth_or_quota:
                 await ClientPool.get().invalidate(auth_token, all_proxies=False)
             if not need_rewarm:
-                return {
+                err_out = {
                     "status": "error",
-                    "http_status": 502 if resp.status_code in (402, 407) else resp.status_code,
+                    "http_status": 502 if is_proxy_auth_or_quota else resp.status_code,
                     "error": payload,
                     "data": None,
                 }
+                if is_proxy_auth_or_quota:
+                    err_out["_no_retry"] = True
+                return err_out
 
         if not need_rewarm:
             return {
@@ -555,6 +582,12 @@ async def media_upload(
     # session upload memang direct, jadi konsisten.
     has_proxy = bool(proxy_for_token(auth_token))
     proxy_warm_ok = False
+    had_cached_proxy_session = False
+    _lk_up = getattr(SessionStore.get(), "lookup", None)
+    if callable(_lk_up):
+        _cand_up = _lk_up(auth_token)
+        if asyncio.iscoroutine(_cand_up):
+            had_cached_proxy_session = (await _cand_up) is not None
     jar: dict[str, str] = {}
     ct0: Optional[str] = None
     warm_err_status: int = 502
@@ -565,6 +598,7 @@ async def media_upload(
                 ct0, _ = await warm_session(client, auth_token)
                 proxy_warm_ok = True
             except InvalidTokenError as e:
+                ResponseCache.get().invalidate_token(auth_token)
                 return {
                     "status": "invalid",
                     "http_status": e.http_status,
@@ -660,55 +694,71 @@ async def media_upload(
             except Exception:  # noqa: BLE001
                 pass
 
-    async with pooled_client(auth_token) as client:
-        try:
-            pooled_ct0, _ = await warm_session(client, auth_token)
-            base_headers = {**base_headers, "x-csrf-token": pooled_ct0}
-        except InvalidTokenError as e:
-            return {
-                "status": "invalid",
-                "http_status": e.http_status,
-                "error": e.message,
-                "data": None,
-            }
-        except WarmNetworkError as e:
-            return {
-                "status": "error",
-                "http_status": getattr(e, "http_status", 502),
-                "error": f"warm-up failed: {e.message}",
-                "data": None,
-            }
-        old_timeout = getattr(client, "timeout", 20.0)
-        client.timeout = timeout
-        try:
-            up_res = await _upload_chunks(
-                client, base_headers, file_bytes, media_type, media_category, max_poll_seconds=timeout)
-            if up_res.get("status") != "ok":
-                if up_res.get("http_status") in (401, 403):
-                    all_p = up_res.get("http_status") == 401
-                    await SessionStore.get().invalidate(auth_token, all_proxies=all_p)
-                    await ClientPool.get().invalidate(auth_token, all_proxies=all_p)
-                elif up_res.pop("_proxy_err", False):
-                    await ClientPool.get().invalidate(auth_token, all_proxies=False)
-            return up_res
-        except Exception as exc:  # noqa: BLE001
-            await ClientPool.get().invalidate(auth_token, all_proxies=False)
-            return {
-                "status": "error",
-                "http_status": 502,
-                "error": redact_proxy_creds(f"upload failed: {type(exc).__name__}: {exc}"),
-                "data": None,
-            }
-        finally:
-            client.timeout = old_timeout
+    for _up_attempt in range(2):
+        need_up_rewarm = False
+        async with pooled_client(auth_token) as client:
+            try:
+                pooled_ct0, _ = await warm_session(client, auth_token)
+                base_headers = {**base_headers, "x-csrf-token": pooled_ct0}
+            except InvalidTokenError as e:
+                ResponseCache.get().invalidate_token(auth_token)
+                return {
+                    "status": "invalid",
+                    "http_status": e.http_status,
+                    "error": e.message,
+                    "data": None,
+                }
+            except WarmNetworkError as e:
+                return {
+                    "status": "error",
+                    "http_status": getattr(e, "http_status", 502),
+                    "error": f"warm-up failed: {e.message}",
+                    "data": None,
+                }
+            old_timeout = getattr(client, "timeout", 20.0)
+            client.timeout = timeout
+            try:
+                up_res = await _upload_chunks(
+                    client, base_headers, file_bytes, media_type, media_category, max_poll_seconds=timeout)
+                if up_res.get("status") != "ok":
+                    if up_res.get("http_status") in (401, 403):
+                        all_p = up_res.get("http_status") == 401
+                        if all_p:
+                            ResponseCache.get().invalidate_token(auth_token)
+                        await SessionStore.get().invalidate(auth_token, all_proxies=all_p)
+                        await ClientPool.get().invalidate(auth_token, all_proxies=all_p)
+                        if _up_attempt == 0 and had_cached_proxy_session and up_res.get("stage") == "INIT":
+                            need_up_rewarm = True
+                    elif up_res.pop("_proxy_err", False):
+                        await ClientPool.get().invalidate(auth_token, all_proxies=False)
+                if not need_up_rewarm:
+                    return up_res
+            except Exception as exc:  # noqa: BLE001
+                await ClientPool.get().invalidate(auth_token, all_proxies=False)
+                return {
+                    "status": "error",
+                    "http_status": 502,
+                    "error": redact_proxy_creds(f"upload failed: {type(exc).__name__}: {exc}"),
+                    "data": None,
+                }
+            finally:
+                client.timeout = old_timeout
+
+    return up_res
+
+
+_CF_IP_BOUND_COOKIES = frozenset({"__cf_bm", "_cfuvid", "cf_clearance"})
 
 
 def _direct_session(auth_token: str, jar: dict[str, str],
                     timeout: float) -> Any:
-    """Session curl_cffi TANPA proxy — untuk jalur media (hemat kuota), tetap sinkron dengan profil browser."""
+    """Session curl_cffi TANPA proxy — untuk jalur media (hemat kuota), tetap sinkron dengan profil browser.
+    Buang cookie Cloudflare yang terikat IP proxy (`__cf_bm`, `_cfuvid`, `cf_clearance`)
+    agar tidak ditolak 403 saat dikirim dari IP direct server."""
     prof = profile_for_token(auth_token)
     cookies = {"auth_token": auth_token, "ct0": gen_ct0()}
-    cookies.update(jar or {})
+    if jar:
+        cookies.update({k: v for k, v in jar.items() if k not in _CF_IP_BOUND_COOKIES})
     sess = CurlAsyncSession(
         cookies=cookies,
         headers=headers_for_token(auth_token),
@@ -834,6 +884,7 @@ async def _upload_chunks(
 
 
 def _invalid_token_response(e: InvalidTokenError, auth_token: str) -> dict[str, Any]:
+    ResponseCache.get().invalidate_token(auth_token)
     return {
         "status": "invalid",
         "http_status": e.http_status,

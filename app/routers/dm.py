@@ -1393,6 +1393,9 @@ async def v2_dm_media_proxy(
                 return Response(content=resp.content, media_type=content_type)
             if resp.status_code in (401, 403):
                 all_p = resp.status_code == 401
+                if all_p:
+                    from ..response_cache import ResponseCache
+                    ResponseCache.get().invalidate_token(tok)
                 await SessionStore.get().invalidate(tok, all_proxies=all_p)
                 await ClientPool.get().invalidate(tok, all_proxies=all_p)
                 if _attempt == 0 and had_cached_session:

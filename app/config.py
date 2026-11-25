@@ -364,6 +364,7 @@ def normalize_proxy_input(raw: str) -> str:
         return val.lower()
     if "://" in val:
         scheme, rest = val.split("://", 1)
+        scheme = scheme.lower()
         if "@" in rest:
             userinfo, _, hostport = rest.rpartition("@")
             if hostport.endswith("/") and "/" not in hostport[:-1]:

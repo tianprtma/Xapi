@@ -1490,3 +1490,152 @@ async def test_pass20_proxy_algorithms_rewarm_userinfo_redaction_browser_and_tid
         ton_407 = await v2_dm_media_proxy("111", "222", "img.jpg", authorization=f"Bearer {tok}", auth_token=None)
     assert ton_407.status_code == 502
     assert b'"status":502' in ton_407.body or b'"status": 502' in ton_407.body
+
+
+# ── 33. Pass 22: _direct_session strips __cf_bm, no_retry on 407/double-warm, ResponseCache 401 eviction, Playwright goto>=400 fail-fast & TID browser status check ──
+
+@pytest.mark.asyncio
+async def test_pass22_cf_cookie_strip_no_retry_407_response_cache_401_and_browser_nav_status(monkeypatch):
+    from contextlib import asynccontextmanager
+    from app.auth import InvalidTokenError, warm_session
+    from app.clients import _direct_session, graphql_call, media_upload
+    from app.config import normalize_proxy_input
+    from app.response_cache import ResponseCache
+    from playwright_search import ContextPool, _search_via_browser_impl
+    from tid_provider import TIDProvider
+
+    tok = "b" * 40
+
+    # 1. Uppercase scheme normalization & _direct_session strips proxy IP-bound Cloudflare cookies
+    assert normalize_proxy_input("HTTP://usr:pass@31.6.46.27:12323") == "http://usr:pass@31.6.46.27:12323"
+    ds = _direct_session(
+        tok,
+        {"twid": "u%3D1", "__cf_bm": "proxy_ip_bound", "_cfuvid": "uv1", "cf_clearance": "cfc", "kdt": "keepme"},
+        10.0,
+    )
+    try:
+        jar_names = {c.name for c in ds.cookies.jar}
+        assert "twid" in jar_names and "kdt" in jar_names
+        assert "__cf_bm" not in jar_names and "_cfuvid" not in jar_names and "cf_clearance" not in jar_names
+    finally:
+        await ds.close()
+
+    # 2. graphql_call (with_retry) does NOT retry 3x when proxy returns 407 or warm_session failed twice
+    attempts_407 = 0
+
+    class _Proxy407Sess:
+        async def get(self, url, headers=None, params=None):
+            nonlocal attempts_407
+            attempts_407 += 1
+            return MagicMock(status_code=407, text="Proxy Auth Required")
+
+    @asynccontextmanager
+    async def _p407_pool(_t):
+        yield _Proxy407Sess()
+
+    with (
+        patch("app.clients.ResponseCache.get", return_value=MagicMock(lookup=AsyncMock(return_value=None), store=AsyncMock())),
+        patch("app.clients.SessionStore.get", return_value=MagicMock(lookup=AsyncMock(return_value=None), invalidate=AsyncMock())),
+        patch("app.clients.ClientPool.get", return_value=MagicMock(invalidate=AsyncMock())),
+        patch("app.clients.pooled_client", _p407_pool),
+        patch("app.clients.warm_session", AsyncMock(return_value=("ct0v", {}))),
+        patch("app.clients.TIDProvider.get", return_value=MagicMock(generate=AsyncMock(return_value="tid"))),
+    ):
+        r_no_retry = await graphql_call("UserByRestId", {"userId": "1"}, tok)
+    assert r_no_retry["http_status"] == 502
+    assert "_no_retry" not in r_no_retry
+    assert attempts_407 == 1  # Never hammered 3x on 407!
+
+    # 2b. warm_session double network failure sets no_retry=True so graphql_call doesn't multiply 2x into 6x
+    dead_home_calls = 0
+
+    class _DeadProxySess:
+        def __init__(self):
+            self.cookies = MagicMock()
+            self.cookies.jar = MagicMock(__iter__=lambda self: iter([]), clear=MagicMock())
+        async def get(self, url, **kw):
+            nonlocal dead_home_calls
+            dead_home_calls += 1
+            raise ConnectionError("proxy unreachable")
+
+    @asynccontextmanager
+    async def _dead_pool(_t):
+        yield _DeadProxySess()
+
+    with (
+        patch("app.clients.ResponseCache.get", return_value=MagicMock(lookup=AsyncMock(return_value=None), store=AsyncMock())),
+        patch("app.auth.SessionStore.get", return_value=MagicMock(lookup=AsyncMock(return_value=None))),
+        patch("app.auth.ClientPool.get", return_value=MagicMock(invalidate=AsyncMock())),
+        patch("app.clients.pooled_client", _dead_pool),
+    ):
+        r_dead = await graphql_call("UserByRestId", {"userId": "1"}, tok)
+    assert r_dead["http_status"] == 502
+    assert dead_home_calls == 2  # Exactly 2 attempts in warm_session, NOT 6!
+
+    # 3. ResponseCache evicts cached responses for token on 401
+    rc = ResponseCache()
+    await rc.store("UserByRestId", {"userId": "1"}, tok, {"status": "ok", "data": {"data": {"user": {"id": "1"}}}})
+    assert (await rc.lookup("UserByRestId", {"userId": "1"}, tok)) is not None
+    rc.invalidate_token(tok)
+    assert (await rc.lookup("UserByRestId", {"userId": "1"}, tok)) is None
+
+    # 4. Playwright _search_via_browser_impl fails fast (0s, no 20s hang) & evicts ContextPool when page.goto returns HTTP 407
+    fake_page = MagicMock()
+    fake_page.on = MagicMock()
+    fake_page.goto = AsyncMock(return_value=MagicMock(status=407))
+    fake_page.close = AsyncMock()
+    fake_ctx = MagicMock(new_page=AsyncMock(return_value=fake_page))
+    inv_ctx = AsyncMock()
+    with patch(
+        "playwright_search.ContextPool.get",
+        return_value=MagicMock(acquire=AsyncMock(return_value=fake_ctx), invalidate=inv_ctx, release=AsyncMock()),
+    ):
+        pw_407 = await _search_via_browser_impl(tok, "jkt48", "Latest", timeout=20.0)
+    assert pw_407["status"] == "error"
+    assert pw_407["http_status"] == 502
+    inv_ctx.assert_awaited_once_with(tok, all_proxies=False)
+
+    # 5. ContextPool.close_all closes _dropped contexts too
+    cpool = ContextPool()
+    dropped_ctx = MagicMock(close=AsyncMock())
+    active_ctx = MagicMock(close=AsyncMock())
+    cpool._ctxs[tok] = (active_ctx, 1.0)
+    cpool._dropped.add(dropped_ctx)
+    await cpool.close_all()
+    active_ctx.close.assert_awaited_once()
+    dropped_ctx.close.assert_awaited_once()
+    assert len(cpool._dropped) == 0
+
+    # 6. TIDProvider._refresh ignores non-200 browser page.goto (e.g. 403/407) and falls back cleanly
+    import playwright_search as _pws
+    monkeypatch.setattr(_pws, "PLAYWRIGHT_ENABLED", True)
+    tid_page = MagicMock(goto=AsyncMock(return_value=MagicMock(status=407)), close=AsyncMock())
+    tid_ctx = MagicMock(new_page=AsyncMock(return_value=tid_page))
+    tid_inv = AsyncMock()
+    tp = TIDProvider()
+    with (
+        patch("playwright_search.PlaywrightPool.get", return_value=MagicMock(semaphore=asyncio.Semaphore(1))),
+        patch("playwright_search.ContextPool.get", return_value=MagicMock(acquire=AsyncMock(return_value=tid_ctx), invalidate=tid_inv, release=AsyncMock())),
+        patch("tid_provider.ClientTransaction", return_value="FAKE_CT"),
+        patch.object(tp, "_is_stale", return_value=True),
+    ):
+        # Mock curl_cffi fallback inside _refresh by patching AsyncSession
+        fake_cffi = MagicMock()
+        fake_cffi.get = AsyncMock(return_value=MagicMock(status_code=200, text="<html><script src='https://abs.twimg.com/responsive-web/client-web/ondemand.s.1234abcda.js'></script></html>"))
+        fake_cffi.close = AsyncMock()
+        with (
+            patch("curl_cffi.requests.AsyncSession", return_value=fake_cffi),
+            patch("tid_provider._BoundedSession") as mock_bs,
+        ):
+            sess_inst = MagicMock()
+            sess_inst.__enter__.return_value = sess_inst
+            sess_inst.get.return_value = MagicMock(
+                status_code=200,
+                text="https://abs.twimg.com/responsive-web/client-web/ondemand.s.1234abcda.js",
+                content=b"console.log(1)",
+                raise_for_status=MagicMock(),
+            )
+            mock_bs.return_value = sess_inst
+            await tp._refresh(tok)
+    assert tp._ct == "FAKE_CT"
+    tid_inv.assert_awaited_once_with(tok, all_proxies=False)

@@ -35,8 +35,9 @@ async def with_retry(
     while attempt < max_attempts:
         attempt += 1
         last_result = await fn(*args, **kwargs)
+        no_retry = bool(last_result.pop("_no_retry", False)) if isinstance(last_result, dict) else False
 
-        if last_result.get("status") != "error":
+        if last_result.get("status") != "error" or no_retry:
             return last_result
         http_status = last_result.get("http_status")
         if http_status not in RETRYABLE_STATUS:

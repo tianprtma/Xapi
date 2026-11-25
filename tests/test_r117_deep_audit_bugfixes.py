@@ -2221,3 +2221,139 @@ async def test_pass35_redaction_punctuation_numeric_pass_norm_and_router_playwri
         r_dm_dead = await v2_dm_send(participant_id="222", body=DMSendBody(text="hi"), dm_pin=None, x_dm_pin="1234", authorization=f"Bearer {tok}", auth_token=None, raw=0)
     assert r_dm_dead.status_code == 502
     assert e2ee_spy.await_count == 0
+
+
+# ── 40. Pass 37: Captive-portal 200 warm_session guard, TIDProvider _fetch_home_via_client direct fallback, & v2_chat_messages proxy/auth propagation ──
+
+@pytest.mark.asyncio
+async def test_pass37_captive_portal_warm_tid_client_direct_fallback_and_chat_messages(monkeypatch):
+    from contextlib import asynccontextmanager
+    from app.auth import WarmNetworkError, warm_session
+    from app.config import reset_request_proxy, set_request_proxy
+    from app.routers.dm import DMSendBody, v2_chat_messages
+    from tid_provider import TIDProvider
+
+    tok = "a" * 40
+
+    # 1. Proxy captive-portal 200 OK HTML (no twid, no X markers) raises WarmNetworkError(502), NOT InvalidTokenError(401)!
+    captive_client = MagicMock()
+    captive_client.cookies = MagicMock()
+    captive_client.cookies.jar = MagicMock(__iter__=lambda self: iter([]), clear=MagicMock())
+    captive_client.get = AsyncMock(return_value=MagicMock(status_code=200, text="<html><body>Proxy Subscription Expired</body></html>"))
+    cp_inv = AsyncMock()
+    px_tok = set_request_proxy("http://31.6.46.27:12323")
+    try:
+        with (
+            patch("app.auth.SessionStore.get", return_value=MagicMock(lookup=AsyncMock(return_value=None))),
+            patch("app.auth.ClientPool.get", return_value=MagicMock(invalidate=cp_inv)),
+        ):
+            with pytest.raises(WarmNetworkError) as exc_cap:
+                await warm_session(captive_client, tok)
+        assert exc_cap.value.http_status == 502
+        cp_inv.assert_awaited_once_with(tok, all_proxies=False)
+
+        # 2. TIDProvider._fetch_home_via_client falls back to direct when proxy fails (preserving logged-in loading-x-anim SVG!)
+        import playwright_search as _pws
+        monkeypatch.setattr(_pws, "PLAYWRIGHT_ENABLED", False)
+        seen_cffi_proxies = []
+
+        class _FakeCffiSess:
+            def __init__(self, **kw):
+                self._px = kw.get("proxies")
+                seen_cffi_proxies.append(self._px)
+            async def get(self, url):
+                if self._px:
+                    return MagicMock(status_code=407, text="Proxy Auth Required")
+                return MagicMock(status_code=200, text="<html><svg id='loading-x-anim-0'></svg><script src='https://abs.twimg.com/responsive-web/client-web/ondemand.s.1234abcda.js'></script></html>")
+            async def close(self):
+                pass
+
+        tp = TIDProvider()
+        with (
+            patch("curl_cffi.requests.AsyncSession", side_effect=lambda **kw: _FakeCffiSess(**kw)),
+            patch("tid_provider.ClientTransaction", return_value="CT_DIRECT_FALLBACK"),
+            patch("tid_provider._BoundedSession") as mock_bs,
+        ):
+            bs_inst = MagicMock()
+            bs_inst.__enter__.return_value = bs_inst
+            bs_inst.proxies = {}
+            bs_inst.get.return_value = MagicMock(
+                status_code=200,
+                text="https://abs.twimg.com/responsive-web/client-web/ondemand.s.1234abcda.js",
+                content=b"(self.webpackChunk=1)",
+            )
+            mock_bs.return_value = bs_inst
+            await tp._refresh(tok)
+        assert tp._ct == "CT_DIRECT_FALLBACK"
+        assert len(seen_cffi_proxies) == 2
+        assert seen_cffi_proxies[0] == {"http": "http://31.6.46.27:12323", "https": "http://31.6.46.27:12323"}
+        assert seen_cffi_proxies[1] is None
+    finally:
+        reset_request_proxy(px_tok)
+
+    # 3. v2_chat_messages propagates 502/401 on proxy/auth error instead of false 501 Not Implemented
+    @asynccontextmanager
+    async def _warm_err_pool(_t):
+        yield MagicMock()
+
+    with (
+        patch("app.auth.pooled_client", _warm_err_pool),
+        patch("app.auth.warm_session", AsyncMock(side_effect=WarmNetworkError("proxy dead", http_status=502))),
+    ):
+        r_cm_502 = await v2_chat_messages(
+            conversation_id="111-222", body=DMSendBody(text="hi"),
+            dm_pin=None, x_dm_pin=None, authorization=f"Bearer {tok}", auth_token=None, raw=0,
+        )
+    assert r_cm_502.status_code == 502
+
+    # 5) _rest_call_once & _dm_call_once: HTTP 200 HTML captive portal -> 502 error + pool eviction,
+    #    while empty 204 No Content stays status="ok"; /2/trends preserves 429; _JSONFormatter redacts nested/exc extras.
+    import json as _json_mod
+    import logging as _logging_mod
+    from app.clients import _dm_call_once, _rest_call_once
+    from app.observability import _JSONFormatter
+    from app.routers.trends import v2_trends
+
+    class _FakeResp:
+        def __init__(self, status_code: int, text: str):
+            self.status_code = status_code
+            self.text = text
+
+        def json(self):
+            return _json_mod.loads(self.text)
+
+    fake_sess = MagicMock()
+    fake_sess.request = AsyncMock(return_value=_FakeResp(200, "<!DOCTYPE html><html><body>Proxy Captive Portal http://u:secret99@31.6.46.27:12323</body></html>"))
+
+    @asynccontextmanager
+    async def _fake_pool(_t):
+        yield fake_sess
+
+    inv_mock = AsyncMock()
+    with (
+        patch("app.clients.pooled_client", _fake_pool),
+        patch("app.clients.warm_session", AsyncMock(return_value=("ct0_ok", {"twid": "u%3D1"}))),
+        patch("app.clients.ClientPool.invalidate", inv_mock),
+    ):
+        r_html_rest = await _rest_call_once("trends/place.json?id=1", tok, method="GET")
+        r_html_dm = await _dm_call_once("dm/user_updates.json", tok, method="GET")
+        fake_sess.request = AsyncMock(return_value=_FakeResp(204, ""))
+        r_empty_204 = await _rest_call_once("media/metadata/create.json", tok, method="POST", json_body={"media_id": "1"})
+
+    assert r_html_rest["status"] == "error" and r_html_rest["http_status"] == 502
+    assert "secret99" not in r_html_rest.get("raw", "")
+    assert r_html_dm["status"] == "error" and r_html_dm["http_status"] == 502
+    assert "secret99" not in r_html_dm.get("raw", "")
+    assert inv_mock.await_count == 2
+    assert r_empty_204["status"] == "ok" and r_empty_204["data"] == {}
+
+    with patch("app.routers.trends.rest_call", AsyncMock(return_value={"status": "error", "http_status": 429, "error": "Rate limit exceeded"})):
+        r_trends_429 = await v2_trends(woeid=1, authorization=f"Bearer {tok}", auth_token=None, raw=0)
+    assert r_trends_429.status_code == 429
+
+    jfmt = _JSONFormatter()
+    rec = _logging_mod.LogRecord("xapi.test", _logging_mod.WARNING, __file__, 1, "check", (), None)
+    rec.nested = {"err": RuntimeError("tunnel failed http://usr:logsecret88@31.6.46.27:12323")}
+    formatted_log = jfmt.format(rec)
+    assert "logsecret88" not in formatted_log
+    assert "***@31.6.46.27:12323" in formatted_log

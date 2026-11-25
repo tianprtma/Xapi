@@ -38,7 +38,10 @@ if _env_file.is_file():
         if not _line or _line.startswith("#") or "=" not in _line:
             continue
         _k, _v = _line.split("=", 1)
-        _os.environ.setdefault(_k.strip(), _v.strip().strip('"').strip("'"))
+        _v_clean = _v.strip()
+        while len(_v_clean) >= 2 and _v_clean[0] == _v_clean[-1] and _v_clean[0] in ('"', "'"):
+            _v_clean = _v_clean[1:-1]
+        _os.environ.setdefault(_k.strip(), _v_clean)
 
 import logging
 import secrets

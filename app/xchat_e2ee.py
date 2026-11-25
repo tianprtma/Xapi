@@ -387,7 +387,8 @@ async def _ensure_pin_unlocked(page: Any, dm_pin: Optional[str]) -> bool:
         await asyncio.sleep(1.5)
         return True
     except Exception as exc:
-        log.warning("XChat PIN unlock wait timed out: %s", exc)
+        from .config import redact_proxy_creds
+        log.warning("XChat PIN unlock wait timed out: %s", redact_proxy_creds(str(exc)))
         return "/pin/" not in page.url
 
 
@@ -1693,9 +1694,10 @@ async def unlock_and_read_xchat_conversation(
                                         conn, page, context, rows, events
                                     )
                                 except Exception as media_exc:  # noqa: BLE001
+                                    from .config import redact_proxy_creds
                                     log.debug(
                                         "R90: recovery media OPFS gagal (%s) — pending",
-                                        media_exc,
+                                        redact_proxy_creds(str(media_exc)),
                                     )
                                 # R99: media masih pending = file belum terunduh
                                 # ke OPFS. Baca OPFS saja tidak memicu unduhan;
@@ -1760,10 +1762,15 @@ async def unlock_and_read_xchat_conversation(
                                                     conn2.close()
                                                     os.unlink(tmp2)
                                         except Exception as trig_exc:  # noqa: BLE001
+                                            from .config import redact_proxy_creds
+                                            trig_s = redact_proxy_creds(str(trig_exc))
                                             log.debug(
                                                 "R99/R101: trigger unduh media %s gagal (%s)",
-                                                norm_conv_id, trig_exc,
+                                                norm_conv_id, trig_s,
                                             )
+                                            if any(t in trig_s for t in ("ERR_PROXY", "ERR_SOCKS", "ERR_TUNNEL", "_PROXY_", "SUPPORTED_PROXIES")):
+                                                await XChatContextPool.get().invalidate(auth_token)
+                                                break
                                         still = [e.get("id") for e in events if _is_recent_pending_media(e)]
                                         log.info("R99/R101: trigger attempt %d selesai — pending tersisa %d", _attempt + 1, len(still))
                                         if not still:
@@ -1781,7 +1788,8 @@ async def unlock_and_read_xchat_conversation(
                                         if n106:
                                             log.info("R106: %d gambar dipanen untuk %s", n106, norm_conv_id)
                                     except Exception as r106_exc:  # noqa: BLE001
-                                        log.debug("R106: panen media %s gagal (%s)", norm_conv_id, r106_exc)
+                                        from .config import redact_proxy_creds
+                                        log.debug("R106: panen media %s gagal (%s)", norm_conv_id, redact_proxy_creds(str(r106_exc)))
                                 log.info(
                                     "R87: OPFS sqlite memulihkan %d event percakapan %s",
                                     len(events), norm_conv_id,
@@ -2169,7 +2177,7 @@ async def send_xchat_dm_via_browser(
                 }
             unlocked = await _ensure_pin_unlocked(page, dm_pin)
             if not unlocked:
-                return {"status": "error", "error": "XChat PIN unlock failed"}
+                return {"status": "error", "http_status": 502, "error": "XChat PIN unlock failed"}
 
             if norm_conv_id not in page.url:
                 nav_re = await page.goto(url, wait_until="domcontentloaded", timeout=25000)
@@ -2194,7 +2202,7 @@ async def send_xchat_dm_via_browser(
                         }
                     await asyncio.sleep(1.0)
             if norm_conv_id not in page.url:
-                return {"status": "error", "error": f"Browser tidak berada di percakapan {norm_conv_id}"}
+                return {"status": "error", "http_status": 502, "error": f"Browser tidak berada di percakapan {norm_conv_id}"}
 
             await page.wait_for_function(
                 """(sel) => {
@@ -2273,7 +2281,7 @@ async def send_xchat_dm_via_browser(
                 {"sel": DM_COMPOSER_SELECTOR, "msg": text},
             )
             if not inserted:
-                return {"status": "error", "error": "Could not insert text into XChat composer"}
+                return {"status": "error", "http_status": 502, "error": "Could not insert text into XChat composer"}
 
             await asyncio.sleep(0.5)
             await page.keyboard.press("Enter")
@@ -2310,7 +2318,7 @@ async def send_xchat_dm_via_browser(
                 delivered = False
 
             if not delivered:
-                return {"status": "error", "error": "XChat DM send not confirmed (composer still full and message count unchanged)"}
+                return {"status": "error", "http_status": 502, "error": "XChat DM send not confirmed (composer still full and message count unchanged)"}
 
             await asyncio.sleep(0.5)
             return {
@@ -2326,7 +2334,7 @@ async def send_xchat_dm_via_browser(
             if any(t in err_s for t in ("ERR_PROXY", "ERR_SOCKS", "ERR_TUNNEL", "_PROXY_", "SUPPORTED_PROXIES")):
                 await XChatContextPool.get().invalidate(auth_token)
             log.warning("send_xchat_dm_via_browser(%s) failed: %s", norm_conv_id, err_s)
-            return {"status": "error", "error": err_s}
+            return {"status": "error", "http_status": 502, "error": err_s}
         finally:
             if page is not None:
                 try:

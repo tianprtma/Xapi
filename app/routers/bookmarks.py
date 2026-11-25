@@ -111,7 +111,11 @@ async def v2_bookmark(
         method="POST",
     )
     # CF-gated: fallback Playwright UI click (TID di-inject otomatis oleh X client)
-    if result["status"] == "error" and result.get("http_status") == 404:
+    if (
+        result["status"] == "error"
+        and result.get("http_status") == 404
+        and not str(result.get("error") or "").startswith("warm-up failed:")
+    ):
         # Resolve author handle untuk navigate
         author = await tweet_author_handle(body.tweet_id, tok)
         nav = f"https://x.com/{author or 'i/web'}/status/{body.tweet_id}"
@@ -179,7 +183,11 @@ async def v2_unbookmark(
         tok,
         method="POST",
     )
-    if result["status"] == "error" and result.get("http_status") == 404:
+    if (
+        result["status"] == "error"
+        and result.get("http_status") == 404
+        and not str(result.get("error") or "").startswith("warm-up failed:")
+    ):
         author = await tweet_author_handle(tweet_id, tok)
         nav = f"https://x.com/{author or 'i/web'}/status/{tweet_id}"
         result = await click_action_via_browser(

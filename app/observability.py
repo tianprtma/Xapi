@@ -41,6 +41,19 @@ class _JSONFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         from .config import redact_proxy_creds
 
+        def _redact_val(val: Any, depth: int = 0) -> Any:
+            if depth > 4:
+                return redact_proxy_creds(str(val))
+            if isinstance(val, str):
+                return redact_proxy_creds(val)
+            if isinstance(val, BaseException):
+                return redact_proxy_creds(str(val))
+            if isinstance(val, dict):
+                return {k2: _redact_val(v2, depth + 1) for k2, v2 in val.items()}
+            if isinstance(val, (list, tuple)):
+                return [_redact_val(item, depth + 1) for item in val]
+            return val
+
         ts = datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat()
         base: dict[str, Any] = {
             "ts": ts,
@@ -50,7 +63,7 @@ class _JSONFormatter(logging.Formatter):
         }
         for k, v in record.__dict__.items():
             if k not in self._BUILTIN_ATTRS and not k.startswith("_") and k not in base:
-                base[k] = redact_proxy_creds(v) if isinstance(v, str) else v
+                base[k] = _redact_val(v)
         if record.exc_info and record.exc_info[0]:
             import traceback
             base["exc"] = redact_proxy_creds("".join(traceback.format_exception(*record.exc_info)))
@@ -149,7 +162,8 @@ class HealthChecker:
             try:
                 ok, detail = await check()
             except Exception as e:  # noqa: BLE001
-                ok, detail = False, str(e)
+                from .config import redact_proxy_creds
+                ok, detail = False, redact_proxy_creds(str(e))
             results[name] = {"healthy": ok, "detail": detail}
             if not ok:
                 all_ok = False

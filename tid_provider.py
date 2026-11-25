@@ -77,6 +77,7 @@ class TIDProvider:
     async def _refresh(self, auth_token: Optional[str] = None) -> None:
         loop = asyncio.get_event_loop()
         active_proxy: Optional[str] = None
+        proxy_home_failed = False
         if auth_token:
             try:
                 from app.config import proxy_for_token
@@ -140,6 +141,7 @@ class TIDProvider:
             (lock per-token sedang dipegang) → self-deadlock. Pakai session
             sekali-pakai tanpa lock; refresh hanya 1x/jam jadi murah.
             """
+            nonlocal proxy_home_failed
             if not auth_token:
                 return None
             try:
@@ -150,39 +152,56 @@ class TIDProvider:
                     headers_for_token,
                     profile_for_token,
                     proxy_for_token,
+                    redact_proxy_creds,
                 )
 
                 prof = profile_for_token(auth_token)
-                kwargs: dict[str, Any] = dict(
-                    cookies={"auth_token": auth_token, "ct0": gen_ct0()},
-                    headers=headers_for_token(auth_token),
-                    timeout=20.0,
-                    impersonate=prof["impersonate"],
-                    allow_redirects=True,
-                    trust_env=False,
-                )
-                proxy = proxy_for_token(auth_token)
-                if proxy:
-                    kwargs["proxies"] = {"http": proxy, "https": proxy}
-                sess = AsyncSession(**kwargs)
-                try:
-                    resp = await sess.get("https://x.com/home")
-                    if resp.status_code != 200:
-                        log.warning(
-                            "TID home fetch via client: HTTP %s",
-                            resp.status_code,
-                        )
-                        return None
-                    txt = resp.text
-                    if not txt or ("ondemand.s" not in txt and "loading-x-anim" not in txt and "abs.twimg.com" not in txt):
-                        log.warning("TID home fetch via client returned non-X shell HTML — skipping")
-                        return None
-                    return txt
-                finally:
+                proxy = None if proxy_home_failed else proxy_for_token(auth_token)
+                candidates = [proxy, None] if proxy else [None]
+                for use_px in candidates:
+                    kwargs: dict[str, Any] = dict(
+                        cookies={"auth_token": auth_token, "ct0": gen_ct0()},
+                        headers=headers_for_token(auth_token),
+                        timeout=20.0,
+                        impersonate=prof["impersonate"],
+                        allow_redirects=True,
+                        trust_env=False,
+                    )
+                    if use_px:
+                        kwargs["proxies"] = {"http": use_px, "https": use_px}
+                    sess = AsyncSession(**kwargs)
                     try:
-                        await sess.close()
-                    except Exception:  # noqa: BLE001
-                        pass
+                        resp = await sess.get("https://x.com/home")
+                        if resp.status_code != 200:
+                            log.warning(
+                                "TID home fetch via client%s: HTTP %s",
+                                " (proxy)" if use_px else "",
+                                resp.status_code,
+                            )
+                            if use_px:
+                                proxy_home_failed = True
+                                continue
+                            return None
+                        txt = resp.text
+                        if not txt or ("ondemand.s" not in txt and "loading-x-anim" not in txt and "abs.twimg.com" not in txt):
+                            log.warning("TID home fetch via client returned non-X shell HTML — skipping")
+                            if use_px:
+                                proxy_home_failed = True
+                                continue
+                            return None
+                        return txt
+                    except Exception as px_exc:  # noqa: BLE001
+                        log.warning("TID home fetch via client failed: %s", redact_proxy_creds(str(px_exc)))
+                        if use_px:
+                            proxy_home_failed = True
+                            continue
+                        return None
+                    finally:
+                        try:
+                            await sess.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+                return None
             except Exception as e:  # noqa: BLE001
                 from app.config import redact_proxy_creds
                 log.warning("TID home fetch via client failed: %s", redact_proxy_creds(str(e)))
@@ -257,7 +276,7 @@ class TIDProvider:
             if not raw:
                 return False
             head = raw.lstrip()[:32].lower()
-            return not head.startswith((b"<!doctype", b"<html"))
+            return not head.startswith((b"<!doctype", b"<html", b'{"error', b'{"status'))
 
         def _fetch_ondemand_content(sess: requests.Session) -> bytes:
             """Ambil isi JS ondemand.s terkini.

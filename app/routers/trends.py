@@ -100,7 +100,7 @@ async def _trends_impl(
             )
         except Exception:  # noqa: BLE001
             return wrap(result)
-    return wrap(result)
+    return finalize(result, lambda d: {"data": d}, raw=False)
 
 
 @router.get("/2/trends")

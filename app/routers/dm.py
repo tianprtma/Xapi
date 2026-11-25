@@ -179,28 +179,47 @@ async def v2_chat_messages(
         return stub_501(feature="chat_messages", reason=OAUTH2_USER_CTX_REASON)
     tok = extract_bearer(authorization, auth_token)
     pin = resolve_dm_pin(dm_pin, x_dm_pin)
-    me = await resolve_me_id(tok)
     norm_conv_id = conversation_id.replace(":", "-")
-    if me:
-        media_id = body.media_id or ((body.attachments[0] or {}).get("media_id") if body.attachments else None)
-        payload = build_dm_new2_payload(
-            me=me,
-            conv_id=norm_conv_id,
-            recipient_ids=None,
-            text=body.text,
-            media_id=media_id,
-            reply_to=body.reply_to_dm_event_id,
+    me, err_resp = await _resolve_me_or_error(tok, raw=raw, is_write=True)
+    if err_resp is not None:
+        if pin and err_resp.status_code == 403:
+            pw_res = await send_xchat_dm_via_browser(tok, pin, norm_conv_id, body.text)
+            if pw_res.get("status") == "ok":
+                return JSONResponse(status_code=201, content={"data": pw_res.get("data")})
+        return err_resp
+    media_id = body.media_id or ((body.attachments[0] or {}).get("media_id") if body.attachments else None)
+    payload = build_dm_new2_payload(
+        me=me,
+        conv_id=norm_conv_id,
+        recipient_ids=None,
+        text=body.text,
+        media_id=media_id,
+        reply_to=body.reply_to_dm_event_id,
+    )
+    result = await dm_call("dm/new2.json", tok, method="POST", json_body=payload, with_dm_defaults=False)
+    if raw:
+        return wrap(result)
+    if result.get("status") == "ok":
+        send_data = format_dm_send_result(result.get("data") or {})
+        if (send_data.get("data") or {}).get("dm_event_id"):
+            return JSONResponse(status_code=201, content=send_data)
+        if pin:
+            pw_res = await send_xchat_dm_via_browser(tok, pin, norm_conv_id, body.text)
+            if pw_res.get("status") == "ok":
+                return JSONResponse(status_code=201, content={"data": pw_res.get("data")})
+        return write_finalize(result, raw=False)
+    if (
+        pin
+        and result.get("status") != "invalid"
+        and not (
+            str(result.get("error") or "").startswith("warm-up failed:")
+            and result.get("http_status") != 403
         )
-        result = await dm_call("dm/new2.json", tok, method="POST", json_body=payload, with_dm_defaults=False)
-        if result.get("status") == "ok":
-            if raw:
-                return wrap(result)
-            return JSONResponse(status_code=201, content=format_dm_send_result(result.get("data") or {}))
-    if pin:
+    ):
         pw_res = await send_xchat_dm_via_browser(tok, pin, norm_conv_id, body.text)
         if pw_res.get("status") == "ok":
             return JSONResponse(status_code=201, content={"data": pw_res.get("data")})
-    return stub_501(feature="chat_messages", reason=OAUTH2_USER_CTX_REASON)
+    return write_finalize(result, raw=False)
 
 
 @router.post("/2/chat/conversations/{conversation_id}/read")

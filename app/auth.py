@@ -293,6 +293,22 @@ async def warm_session(
     ct0 = server_ct0_value or jar.get("ct0", "")
 
     if not jar.get("twid"):
+        home_txt = getattr(home_resp, "text", None)
+        if (
+            proxy_for_token(auth_token)
+            and not server_ct0_value
+            and isinstance(home_txt, str)
+            and home_txt.strip()
+            and not any(
+                m in home_txt.lower()
+                for m in ("x.com", "twitter", "twimg.com", "ondemand.s", "loading-x-anim")
+            )
+        ):
+            await ClientPool.get().invalidate(auth_token, all_proxies=False)
+            raise WarmNetworkError(
+                f"GET {HOMEPAGE_URL} via proxy returned non-X response (HTTP {final_home_st or 200})",
+                http_status=502,
+            )
         await _evict_invalid_token_state(auth_token)
         raise InvalidTokenError(
             http_status=401,

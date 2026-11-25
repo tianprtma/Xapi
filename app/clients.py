@@ -204,6 +204,7 @@ async def _graphql_call_once(
             try:
                 payload = resp.json()
             except json.JSONDecodeError:
+                await ClientPool.get().invalidate(auth_token, all_proxies=False)
                 return {
                     "status": "error",
                     "http_status": 502,
@@ -342,7 +343,18 @@ async def _rest_call_once(
             try:
                 payload = resp.json()
             except json.JSONDecodeError:
-                payload = {"raw": redact_proxy_creds(resp.text[:1000])}
+                raw_txt = resp.text or ""
+                low_head = raw_txt.lstrip()[:32].lower()
+                if low_head.startswith(("<!doctype", "<html", "<head", "<body")):
+                    await ClientPool.get().invalidate(auth_token, all_proxies=False)
+                    return {
+                        "status": "error",
+                        "http_status": 502,
+                        "error": "non-JSON HTML response from proxy/upstream",
+                        "raw": redact_proxy_creds(raw_txt[:1000]),
+                        "data": None,
+                    }
+                payload = {"raw": redact_proxy_creds(raw_txt[:1000])} if raw_txt.strip() else {}
 
             return {
                 "status": "ok",
@@ -467,10 +479,13 @@ async def _dm_call_once(
                 "data": None,
             }
 
+        is_non_json_html = False
         try:
             payload = resp.json()
         except json.JSONDecodeError:
-            payload = {"raw": redact_proxy_creds(resp.text[:1000])}
+            raw_txt = resp.text or ""
+            is_non_json_html = raw_txt.lstrip()[:32].lower().startswith(("<!doctype", "<html", "<head", "<body"))
+            payload = {"raw": redact_proxy_creds(raw_txt[:1000])} if raw_txt.strip() else {}
 
         if resp.status_code >= 400:
             is_proxy_auth_or_quota = resp.status_code in (402, 407)
@@ -496,6 +511,15 @@ async def _dm_call_once(
                 return err_out
 
         if not need_rewarm:
+            if is_non_json_html:
+                await ClientPool.get().invalidate(auth_token, all_proxies=False)
+                return {
+                    "status": "error",
+                    "http_status": 502,
+                    "error": "non-JSON HTML response from proxy/upstream",
+                    "raw": payload.get("raw", ""),
+                    "data": None,
+                }
             return {
                 "status": "ok",
                 "http_status": resp.status_code,

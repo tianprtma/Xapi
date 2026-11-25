@@ -311,10 +311,23 @@ _REQUEST_PROXY_VAR: contextvars.ContextVar[Optional[str]] = contextvars.ContextV
 
 _PROXY_CREDS_RE = _re.compile(
     r"((?:https?|socks5h?)://)"
-    r"(?:[^\s/:'\"<>]+:(?![0-9]{1,5}/)[^\s'\"<>]*?|[^\s/?#'\"<>]+)@"
+    r"(?:[^\s/:'\"<>]+:(?![0-9]{1,5}/)(?:(?!://)\S)*?|[^\s/?#'\"<>]+)@"
     r"(?=(?:\[[0-9a-fA-F:]+\]|[a-zA-Z0-9.-]+)(?::\d{1,5})?(?:[\s/'\"<>),;\]}]|$))",
     _re.IGNORECASE,
 )
+_PROXY_SHORTHAND_CREDS_RE = _re.compile(
+    r"((?<![A-Za-z0-9._/-])(?:\[[0-9a-fA-F:]+\]|[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+):\d{1,5}):[^\s,'\";\]})]+:[^\s,'\";\]})]+"
+)
+_DISALLOWED_PROXY_HOSTS = frozenset({
+    "localhost",
+    "localhost.localdomain",
+    "metadata",
+    "metadata.goog",
+    "metadata.google.internal",
+    "metadata.azure.internal",
+    "instance-data",
+    "instance-data.ec2.internal",
+})
 _VALID_PROXY_HOST_RE = _re.compile(r"^[a-z0-9.:-]+$")
 _HEX_LABEL_RE = _re.compile(r"^0x[0-9a-f]+$")
 _PCT_HEX_RE = _re.compile(r"%[0-9A-Fa-f]{2}")
@@ -351,6 +364,22 @@ def _encode_userinfo(userinfo: str) -> str:
     return _encode_userinfo_component(userinfo)
 
 
+def _canon_hostport_text(hostport: str) -> str:
+    """Lowercase host, strip trailing dot, and strip leading zeros on numeric port."""
+    if hostport.startswith("["):
+        hb, bsep, tail = hostport.partition("]")
+        if not bsep:
+            return hostport.lower()
+        if tail.startswith(":") and tail[1:].isdigit() and 1 <= int(tail[1:]) <= 65535:
+            return f"{hb.lower()}]:{int(tail[1:])}"
+        return f"{hb.lower()}]{tail}"
+    h_part, csep, p_part = hostport.rpartition(":")
+    if csep and p_part.isdigit() and 1 <= int(p_part) <= 65535:
+        h_clean = h_part.lower().rstrip(".") or h_part.lower()
+        return f"{h_clean}:{int(p_part)}"
+    return hostport.lower().rstrip(".") or hostport.lower()
+
+
 def normalize_proxy_input(raw: str) -> str:
     """Normalisasi input proxy dari CLI / env (`PROXY_LIST`, `--proxy`):
     dukung URL penuh, `direct`/`none`, `user:pass@host:port`, `[ipv6]:port[:user:pass]`,
@@ -370,20 +399,22 @@ def normalize_proxy_input(raw: str) -> str:
             if hostport.endswith("/") and "/" not in hostport[:-1]:
                 hostport = hostport[:-1]
             if userinfo and hostport and "/" not in hostport and "?" not in hostport and "#" not in hostport:
-                return f"{scheme}://{_encode_userinfo(userinfo)}@{hostport}"
+                return f"{scheme}://{_encode_userinfo(userinfo)}@{_canon_hostport_text(hostport)}"
         else:
             if rest.endswith("/") and "/" not in rest[:-1]:
                 rest = rest[:-1]
+            if "/" not in rest and "?" not in rest and "#" not in rest:
+                return f"{scheme}://{_canon_hostport_text(rest)}"
         return f"{scheme}://{rest}"
     if val.startswith("["):
         host_bracket, bsep, tail = val.partition("]")
         if bsep and tail.startswith(":"):
             rest_parts = tail[1:].split(":", 2)
             if len(rest_parts) == 1 and rest_parts[0].isdigit() and 1 <= int(rest_parts[0]) <= 65535:
-                return f"http://{host_bracket}]:{rest_parts[0]}"
+                return f"http://{host_bracket.lower()}]:{int(rest_parts[0])}"
             if len(rest_parts) == 3 and rest_parts[0].isdigit() and 1 <= int(rest_parts[0]) <= 65535:
                 port_s, u_s, p_s = rest_parts
-                return f"http://{_quote(u_s, safe='')}:{_quote(p_s, safe='')}@{host_bracket}]:{port_s}"
+                return f"http://{_quote(u_s, safe='')}:{_quote(p_s, safe='')}@{host_bracket.lower()}]:{int(port_s)}"
         return val
     parts = val.split(":", 3)
     if (
@@ -393,7 +424,8 @@ def normalize_proxy_input(raw: str) -> str:
         and parts[1].isdigit()
         and 1 <= int(parts[1]) <= 65535
     ):
-        return f"http://{_quote(parts[2], safe='')}:{_quote(parts[3], safe='')}@{parts[0]}:{parts[1]}"
+        h_clean = parts[0].lower().rstrip(".") or parts[0].lower()
+        return f"http://{_quote(parts[2], safe='')}:{_quote(parts[3], safe='')}@{h_clean}:{int(parts[1])}"
     if (
         len(parts) == 2
         and parts[0]
@@ -401,25 +433,34 @@ def normalize_proxy_input(raw: str) -> str:
         and parts[1].isdigit()
         and 1 <= int(parts[1]) <= 65535
     ):
-        return f"http://{parts[0]}:{parts[1]}"
+        h_clean = parts[0].lower().rstrip(".") or parts[0].lower()
+        return f"http://{h_clean}:{int(parts[1])}"
     if "@" in val:
         userinfo, sep, hostport = val.rpartition("@")
         if hostport.endswith("/") and "/" not in hostport[:-1]:
             hostport = hostport[:-1]
         if sep and userinfo and hostport and "/" not in hostport and "?" not in hostport and "#" not in hostport:
-            return f"http://{_encode_userinfo(userinfo)}@{hostport}"
+            return f"http://{_encode_userinfo(userinfo)}@{_canon_hostport_text(hostport)}"
     return val
 
 
 def redact_proxy_creds(text: str) -> str:
-    """Mask kredensial (`user:pass@` maupun `token@`) pada URL proxy agar tidak bocor ke log/error."""
-    if not text or "://" not in text:
+    """Mask kredensial (`user:pass@`, `token@`, maupun shorthand `host:port:user:pass`) agar tidak bocor ke log/error."""
+    if not text:
         return text
-    return _PROXY_CREDS_RE.sub(r"\1***@", text)
+    out = _PROXY_CREDS_RE.sub(r"\1***@", text) if "://" in text else text
+    if ":" in out:
+        out = _PROXY_SHORTHAND_CREDS_RE.sub(r"\1:***", out)
+    return out
+
+
+_NAT64_WELL_KNOWN = ipaddress.IPv6Network("64:ff9b::/96")
+_NAT64_LOCAL_USE = ipaddress.IPv6Network("64:ff9b:1::/48")
+_SIIT_IPV4_TRANSLATED = ipaddress.IPv6Network("::ffff:0:0/96")
 
 
 def _is_disallowed_proxy_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    """True bila IP (atau IPv4 tertanam di IPv6 mapped/6to4/teredo) tidak aman untuk proxy."""
+    """True bila IP (atau IPv4 tertanam di IPv6 mapped/6to4/teredo/NAT64/SIIT) tidak aman untuk proxy."""
     if ip.is_loopback or ip.is_link_local or ip.is_unspecified or ip.is_multicast or ip.is_reserved:
         return True
     # RFC 1122 0.0.0.0/8 ("this network") — pada Linux dapat merutekan ke host lokal.
@@ -434,6 +475,10 @@ def _is_disallowed_proxy_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -
             for sub in ip.teredo:
                 if _is_disallowed_proxy_ip(sub):
                     return True
+        if ip in _NAT64_WELL_KNOWN or ip in _NAT64_LOCAL_USE or ip in _SIIT_IPV4_TRANSLATED:
+            embedded_v4 = ipaddress.IPv4Address(ip.packed[12:16])
+            if _is_disallowed_proxy_ip(embedded_v4):
+                return True
     return False
 
 
@@ -466,8 +511,8 @@ def validate_proxy_url(raw: str) -> str:
         raise ValueError("host proxy tidak valid")
     if "%" in host_clean or not _VALID_PROXY_HOST_RE.match(host_clean):
         raise ValueError("host proxy mengandung karakter/encoding tidak valid")
-    if host_clean in ("localhost", "localhost.localdomain") or host_clean.endswith(".localhost"):
-        raise ValueError("host proxy loopback tidak diizinkan")
+    if host_clean in _DISALLOWED_PROXY_HOSTS or host_clean.endswith(".localhost"):
+        raise ValueError("host proxy loopback/metadata internal tidak diizinkan")
     ip_candidate = host_clean
     parsed_ip = None
     try:

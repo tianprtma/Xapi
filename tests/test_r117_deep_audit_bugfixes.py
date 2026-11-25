@@ -1639,3 +1639,35 @@ async def test_pass22_cf_cookie_strip_no_retry_407_response_cache_401_and_browse
             await tp._refresh(tok)
     assert tp._ct == "FAKE_CT"
     tid_inv.assert_awaited_once_with(tok, all_proxies=False)
+
+
+# ── 34. Pass 24: Adversarial fuzzer fixes (shorthand/quote/spaceless redaction, cloud metadata & NAT64 local-use SSRF, host/port canonicalization) ──
+
+def test_pass24_fuzzer_redaction_cloud_metadata_ssrf_and_hostport_canon():
+    from app.config import normalize_proxy_input, redact_proxy_creds, validate_proxy_url
+
+    # 1. Shorthand host:port:user:pass, [ipv6]:port:user:pass, quotes/<> in password, and spaceless multi-URL redaction
+    assert redact_proxy_creds("err 31.6.46.27:08080:user:secretpass ok") == "err 31.6.46.27:08080:*** ok"
+    assert redact_proxy_creds("err [2606:4700::1]:8080:user:secret:pass ok") == "err [2606:4700::1]:8080:*** ok"
+    assert "secret" not in redact_proxy_creds("http://user:s'ec\"re<t>@31.6.46.27:12323")
+    assert redact_proxy_creds("target=http://foo:bar/baz,proxy=http://user:secret@31.6.46.27:12323") == (
+        "target=http://foo:bar/baz,proxy=http://***@31.6.46.27:12323"
+    )
+
+    # 2. Cloud metadata hostnames & RFC 8215 local-use NAT64 / SIIT loopback blocked
+    for bad in (
+        "http://metadata.google.internal:80",
+        "http://metadata.goog:80",
+        "http://metadata.azure.internal:80",
+        "http://instance-data.ec2.internal:80",
+        "http://[64:ff9b:1::127.0.0.1]:8080",
+        "http://[64:ff9b:1::169.254.169.254]:80",
+        "http://[::ffff:0:169.254.169.254]:80",
+    ):
+        with pytest.raises(ValueError):
+            validate_proxy_url(bad)
+
+    # 3. Leading-zero port and uppercase trailing-dot host canonicalized identically
+    assert normalize_proxy_input("31.6.46.27:08080:user:pass") == "http://user:pass@31.6.46.27:8080"
+    assert normalize_proxy_input("[2606:4700::ABCD]:08080:user:pass") == "http://user:pass@[2606:4700::abcd]:8080"
+    assert normalize_proxy_input("http://user:pass@EXAMPLE.COM.:08080/") == "http://user:pass@example.com:8080"

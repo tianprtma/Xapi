@@ -24,6 +24,7 @@ from .config import (
     ALLOWED_ORIGINS,
     ENABLE_RAW,
     MAX_BODY_SIZE,
+    redact_proxy_creds,
     reset_request_proxy,
     set_request_proxy,
     validate_proxy_url,
@@ -401,7 +402,7 @@ class RequestProxyMiddleware:
             import json as _json
             from .errors import build_error
             body = _json.dumps(
-                build_error("VALIDATION_INVALID_PARAM", param="X-Proxy-Url", reason=str(exc))
+                build_error("VALIDATION_INVALID_PARAM", param="X-Proxy-Url", reason=redact_proxy_creds(str(exc)))
             ).encode()
             await send({
                 "type": "http.response.start",
@@ -444,6 +445,6 @@ def install_security_middleware(app: FastAPI) -> None:
             allow_origins=list(ALLOWED_ORIGINS),
             allow_credentials=False,
             allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-            allow_headers=["Authorization", "Content-Type", "X-Admin-Token", "X-Proxy-Url"],
+            allow_headers=["Authorization", "Content-Type", "X-Admin-Token", "X-Proxy-Url", "X-DM-Pin"],
             max_age=600,
         )

@@ -64,7 +64,12 @@ from ..config import (
     UPLOAD_BASE,
     WEB_BEARER,
 )
-from ..playwright_helpers import resolve_screen_name, tweet_author_handle
+from ..playwright_helpers import (
+    pop_last_tweet_author_err,
+    reset_last_tweet_author_err,
+    resolve_screen_name,
+    tweet_author_handle,
+)
 from ..responses import finalize, stub_501, wrap, write_finalize
 
 
@@ -118,7 +123,12 @@ async def v2_bookmark(
         and not is_dead_proxy_error_result(result)
     ):
         # Resolve author handle untuk navigate
+        reset_last_tweet_author_err()
         author = await tweet_author_handle(body.tweet_id, tok)
+        if not author:
+            ta_err = pop_last_tweet_author_err()
+            if ta_err is not None and (ta_err.get("status") == "invalid" or is_dead_proxy_error_result(ta_err)):
+                return write_finalize(ta_err, raw=bool(raw))
         nav = f"https://x.com/{author or 'i/web'}/status/{body.tweet_id}"
         result = await click_action_via_browser(
             tok, nav,
@@ -189,7 +199,12 @@ async def v2_unbookmark(
         and result.get("http_status") == 404
         and not is_dead_proxy_error_result(result)
     ):
+        reset_last_tweet_author_err()
         author = await tweet_author_handle(tweet_id, tok)
+        if not author:
+            ta_err = pop_last_tweet_author_err()
+            if ta_err is not None and (ta_err.get("status") == "invalid" or is_dead_proxy_error_result(ta_err)):
+                return write_finalize(ta_err, raw=bool(raw))
         nav = f"https://x.com/{author or 'i/web'}/status/{tweet_id}"
         result = await click_action_via_browser(
             tok, nav,

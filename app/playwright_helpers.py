@@ -18,6 +18,9 @@ from .config import redact_proxy_creds
 _LAST_RESOLVE_SCREEN_NAME_ERR: contextvars.ContextVar[Optional[dict[str, Any]]] = contextvars.ContextVar(
     "xapi_last_resolve_screen_name_err", default=None
 )
+_LAST_TWEET_AUTHOR_ERR: contextvars.ContextVar[Optional[dict[str, Any]]] = contextvars.ContextVar(
+    "xapi_last_tweet_author_err", default=None
+)
 
 
 def reset_last_resolve_screen_name_err() -> None:
@@ -27,6 +30,16 @@ def reset_last_resolve_screen_name_err() -> None:
 def pop_last_resolve_screen_name_err() -> Optional[dict[str, Any]]:
     err = _LAST_RESOLVE_SCREEN_NAME_ERR.get()
     _LAST_RESOLVE_SCREEN_NAME_ERR.set(None)
+    return err
+
+
+def reset_last_tweet_author_err() -> None:
+    _LAST_TWEET_AUTHOR_ERR.set(None)
+
+
+def pop_last_tweet_author_err() -> Optional[dict[str, Any]]:
+    err = _LAST_TWEET_AUTHOR_ERR.get()
+    _LAST_TWEET_AUTHOR_ERR.set(None)
     return err
 
 
@@ -65,6 +78,7 @@ async def resolve_screen_name(user_id: str, auth_token: str) -> Optional[str]:
 
 async def tweet_author_handle(tweet_id: str, auth_token: str) -> Optional[str]:
     """Resolve author screen_name dari tweet_id via TweetResultByRestId."""
+    _LAST_TWEET_AUTHOR_ERR.set(None)
     try:
         result = await graphql_call(
             "TweetResultByRestId",
@@ -77,6 +91,7 @@ async def tweet_author_handle(tweet_id: str, auth_token: str) -> Optional[str]:
             auth_token,
         )
         if result["status"] != "ok":
+            _LAST_TWEET_AUTHOR_ERR.set(result)
             return None
         tw = (result.get("data") or {}).get("data", {}).get("tweetResult", {}).get("result", {})
         if tw.get("__typename") == "TweetWithVisibilityResults":
@@ -86,5 +101,11 @@ async def tweet_author_handle(tweet_id: str, auth_token: str) -> Optional[str]:
             (core.get("core") or {}).get("screen_name")
             or (core.get("legacy") or {}).get("screen_name")
         )
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        _LAST_TWEET_AUTHOR_ERR.set({
+            "status": "error",
+            "http_status": 502,
+            "error": redact_proxy_creds(f"upstream request failed: {type(exc).__name__}: {exc}"),
+            "data": None,
+        })
         return None

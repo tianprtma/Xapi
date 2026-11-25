@@ -409,7 +409,13 @@ async def v2_unblock(
             )
         else:
             rsn_err = pop_last_resolve_screen_name_err()
-            if rsn_err is not None and rsn_err.get("status") == "invalid":
+            if rsn_err is not None and (
+                rsn_err.get("status") == "invalid"
+                or (
+                    rsn_err.get("http_status") in (502, 503, 504)
+                    and str(rsn_err.get("error") or "").startswith(("browser ", "non-JSON", "upstream non-JSON"))
+                )
+            ):
                 return write_finalize(rsn_err, raw=bool(raw))
     return write_finalize(result, raw=bool(raw))
 

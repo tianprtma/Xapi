@@ -2851,3 +2851,71 @@ async def test_pass46_captive_portal_echo_url_offdomain_nonjson_and_octet_dm_med
     ):
         r_dmm = await v2_dm_media_proxy(dm_id="111", media_id="222", resource_id="img.jpg", authorization=f"Bearer {tok}", auth_token=None)
     assert r_dmm.status_code == 502
+
+
+@pytest.mark.asyncio
+async def test_pass47_xchat_warmup_proxy_abort_captive_200_and_bookmark_secondary_dead_proxy():
+    """Pass 47: XChat `/i/chat` warmup & media-trigger loops fast-abort and evict `XChatContextPool`
+    on TCP/timeout proxy errors (`_is_xchat_proxy_nav_exc`); `_handle_xchat_nav_status` rejects HTTP 200
+    captive-portal HTML without redirect; `v2_bookmark`/`v2_unbookmark` skip Chromium launch when
+    `tweet_author_handle` hits dead proxy/401; and `v2_unblock` surfaces 502 when `resolve_screen_name`
+    hits browser proxy failure."""
+    from app.config import reset_request_proxy, set_request_proxy
+    from app.routers.bookmarks import BookmarkBody, v2_bookmark
+    from app.routers.users import v2_unblock
+    from app.xchat_e2ee import _handle_xchat_nav_status, unlock_and_read_xchat_conversation
+
+    tok = "a" * 40
+    px_tok = set_request_proxy("http://31.6.46.27:12323")
+    try:
+        # 1a. _handle_xchat_nav_status catches 200 non-X captive portal HTML without redirect
+        xpool_inv = AsyncMock()
+        fake_nav_resp = MagicMock(
+            status=200,
+            text=AsyncMock(return_value="<html><body>Hotspot Login Required</body></html>"),
+        )
+        fake_page = MagicMock(url="https://x.com/i/chat")
+        with patch("app.xchat_e2ee.XChatContextPool.get", return_value=MagicMock(invalidate=xpool_inv)):
+            st_cap = await _handle_xchat_nav_status(tok, fake_nav_resp, page=fake_page)
+        assert st_cap == 502
+        xpool_inv.assert_awaited_once_with(tok)
+
+        # 1b. unlock_and_read_xchat_conversation warmup `/i/chat` failing with ERR_CONNECTION_REFUSED
+        # aborts immediately (1 goto call, NOT 2!) and invalidates XChatContextPool!
+        goto_spy = AsyncMock(side_effect=RuntimeError("Page.goto: net::ERR_CONNECTION_REFUSED at https://x.com/i/chat"))
+        fake_conv_page = MagicMock(goto=goto_spy, close=AsyncMock())
+        fake_conv_ctx = MagicMock(_xchat_embed_warmed=False, new_page=AsyncMock(return_value=fake_conv_page))
+        xpool_conv_inv = AsyncMock()
+        with patch(
+            "app.xchat_e2ee.XChatContextPool.get",
+            return_value=MagicMock(acquire=AsyncMock(return_value=fake_conv_ctx), release=AsyncMock(), invalidate=xpool_conv_inv),
+        ):
+            evs = await unlock_and_read_xchat_conversation(tok, "1234", "111-222")
+        assert evs == []
+        assert goto_spy.await_count == 1
+        xpool_conv_inv.assert_awaited_once_with(tok)
+    finally:
+        reset_request_proxy(px_tok)
+
+    # 2. v2_bookmark aborts before click_action_via_browser if tweet_author_handle hits dead proxy
+    pw_click_47 = AsyncMock()
+    gql_seq = AsyncMock(side_effect=[
+        {"status": "error", "http_status": 404, "error": "not found", "data": None},
+        {"status": "error", "http_status": 502, "error": "upstream request failed: ProxyError", "data": None},
+    ])
+    with (
+        patch("app.routers.bookmarks.graphql_call", gql_seq),
+        patch("app.playwright_helpers.graphql_call", gql_seq),
+        patch("app.routers.bookmarks.click_action_via_browser", pw_click_47),
+    ):
+        r_bm47 = await v2_bookmark(body=BookmarkBody(tweet_id="123"), user_id="1", authorization=f"Bearer {tok}", auth_token=None, raw=0)
+    assert r_bm47.status_code == 502
+    assert pw_click_47.await_count == 0
+
+    # 3. v2_unblock surfaces 502 when resolve_screen_name fails with browser proxy error
+    with (
+        patch("app.routers.users.rest_call", AsyncMock(return_value={"status": "error", "http_status": 404, "error": "nf", "data": None})),
+        patch("app.playwright_helpers.fetch_via_browser", AsyncMock(return_value={"status": "error", "http_status": 502, "error": "browser navigation HTTP 502", "data": None})),
+    ):
+        r_ub47 = await v2_unblock(source_user_id="1", target_user_id="2", authorization=f"Bearer {tok}", auth_token=None, raw=0)
+    assert r_ub47.status_code == 502

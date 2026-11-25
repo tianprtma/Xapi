@@ -417,8 +417,10 @@ def _is_xchat_proxy_nav_exc(err_s: str, auth_token: str) -> bool:
 
 
 async def _handle_xchat_nav_status(auth_token: str, nav_resp: Any, *, page: Any = None) -> Optional[int]:
-    """Return HTTP status >= 400 when `page.goto` hit a proxy/WAF/auth error page or
-    captive-portal off-domain redirect, evicting `XChatContextPool` immediately."""
+    """Return HTTP status >= 400 when `page.goto` hit a proxy/WAF/auth error page,
+    non-X HTML captive portal, or off-domain redirect, evicting `XChatContextPool` immediately."""
+    import inspect as _inspect
+
     nav_st = getattr(nav_resp, "status", None) if nav_resp is not None else None
     if isinstance(nav_st, int) and nav_st >= 400:
         if nav_st == 401:
@@ -434,6 +436,28 @@ async def _handle_xchat_nav_status(auth_token: str, nav_resp: Any, *, page: Any 
         if host and host not in ("x.com", "twitter.com") and not host.endswith((".x.com", ".twitter.com")):
             await XChatContextPool.get().invalidate(auth_token)
             return 502
+    if isinstance(nav_st, int) and nav_st == 200 and nav_resp is not None:
+        from .config import proxy_for_token
+        txt_fn = getattr(nav_resp, "text", None)
+        if callable(txt_fn) and proxy_for_token(auth_token):
+            try:
+                cand_txt = txt_fn()
+                if _inspect.isawaitable(cand_txt):
+                    nav_txt = await cand_txt
+                else:
+                    nav_txt = cand_txt
+                if (
+                    isinstance(nav_txt, str)
+                    and nav_txt.lstrip()[:32].lower().startswith(("<!doctype", "<html", "<head", "<body"))
+                    and not any(
+                        m in nav_txt.lower()
+                        for m in ("twimg.com", "ondemand.s", "loading-x-anim", "twitter-site-verification", "__initial_state__", "xchat")
+                    )
+                ):
+                    await XChatContextPool.get().invalidate(auth_token)
+                    return 502
+            except Exception:  # noqa: BLE001
+                pass
     return None
 
 
@@ -1691,7 +1715,7 @@ async def unlock_and_read_xchat_conversation(
                 except Exception as warm_exc:  # noqa: BLE001
                     from .config import redact_proxy_creds
                     w_err = redact_proxy_creds(str(warm_exc))
-                    if any(t in w_err for t in ("ERR_PROXY", "ERR_SOCKS", "ERR_TUNNEL", "_PROXY_", "SUPPORTED_PROXIES")):
+                    if _is_xchat_proxy_nav_exc(w_err, auth_token):
                         raise
                     log.debug("Warmup /i/chat gagal (dilanjutkan): %s", w_err)
 
@@ -1799,7 +1823,7 @@ async def unlock_and_read_xchat_conversation(
                                                 "R99/R101: trigger unduh media %s gagal (%s)",
                                                 norm_conv_id, trig_s,
                                             )
-                                            if any(t in trig_s for t in ("ERR_PROXY", "ERR_SOCKS", "ERR_TUNNEL", "_PROXY_", "SUPPORTED_PROXIES")):
+                                            if _is_xchat_proxy_nav_exc(trig_s, auth_token):
                                                 await XChatContextPool.get().invalidate(auth_token)
                                                 break
                                         still = [e.get("id") for e in events if _is_recent_pending_media(e)]

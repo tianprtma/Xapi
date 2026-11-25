@@ -337,7 +337,11 @@ async def _new_context(browser: Browser, auth_token: str) -> BrowserContext:
     pw_proxy = playwright_proxy_for_token(auth_token)
     if pw_proxy:
         ctx_kwargs["proxy"] = pw_proxy
-    context = await browser.new_context(**ctx_kwargs)
+    try:
+        context = await browser.new_context(**ctx_kwargs)
+    except Exception as exc:  # noqa: BLE001
+        from app.config import redact_proxy_creds
+        raise RuntimeError(redact_proxy_creds(f"browser.new_context failed: {type(exc).__name__}: {exc}")) from exc
     try:
         # Stealth init script: sembunyikan indikator headless Chrome / Playwright
         await context.add_init_script(
@@ -1041,7 +1045,16 @@ async def _click_action_via_browser_impl(
     match_response_substr: Optional[str | list[str]] = None,
     timeout: float = 25.0,
 ) -> dict[str, Any]:
-    context = await ContextPool.get().acquire(auth_token)
+    try:
+        context = await ContextPool.get().acquire(auth_token)
+    except Exception as exc:  # noqa: BLE001
+        from app.config import redact_proxy_creds
+        return {
+            "status": "error",
+            "http_status": 502,
+            "error": redact_proxy_creds(f"browser context unavailable: {type(exc).__name__}: {exc}"),
+            "data": None,
+        }
     page = None
 
     captured: dict[str, Any] = {}
@@ -1070,7 +1083,8 @@ async def _click_action_via_browser_impl(
                 captured_ev.set()
         except Exception:  # noqa: BLE001
             try:
-                body_txt = (await resp.text())[:1000]
+                from app.config import redact_proxy_creds
+                body_txt = redact_proxy_creds((await resp.text())[:1000])
                 if not captured_ev.is_set():
                     captured["raw"] = body_txt
                     captured["status"] = resp.status
@@ -1177,8 +1191,16 @@ async def _action_via_browser_impl(
     content_type: str = "application/json",
     timeout: float = 25.0,
 ) -> dict[str, Any]:
-    from app.config import WEB_BEARER
-    context = await ContextPool.get().acquire(auth_token)
+    from app.config import WEB_BEARER, redact_proxy_creds
+    try:
+        context = await ContextPool.get().acquire(auth_token)
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "status": "error",
+            "http_status": 502,
+            "error": redact_proxy_creds(f"browser context unavailable: {type(exc).__name__}: {exc}"),
+            "data": None,
+        }
     page = None
 
     try:
@@ -1317,7 +1339,16 @@ async def _fetch_via_browser_impl(
     timeout: float = 20.0,
     click_selector: Optional[str] = None,
 ) -> dict[str, Any]:
-    context = await ContextPool.get().acquire(auth_token)
+    try:
+        context = await ContextPool.get().acquire(auth_token)
+    except Exception as exc:  # noqa: BLE001
+        from app.config import redact_proxy_creds
+        return {
+            "status": "error",
+            "http_status": 502,
+            "error": redact_proxy_creds(f"browser context unavailable: {type(exc).__name__}: {exc}"),
+            "data": None,
+        }
     page = None
 
     captured: dict[str, Any] = {}
@@ -1342,7 +1373,8 @@ async def _fetch_via_browser_impl(
                 captured["status"] = resp.status
         except Exception:  # noqa: BLE001
             try:
-                body_txt = (await resp.text())[:2000]
+                from app.config import redact_proxy_creds
+                body_txt = redact_proxy_creds((await resp.text())[:2000])
                 if "data" not in captured and "raw" not in captured:
                     captured["raw"] = body_txt
                     captured["url"] = resp.url
@@ -1467,7 +1499,16 @@ async def _search_via_browser_impl(
     search_type: SearchType = "Latest",
     timeout: float = 20.0,
 ) -> dict[str, Any]:
-    context = await ContextPool.get().acquire(auth_token)
+    try:
+        context = await ContextPool.get().acquire(auth_token)
+    except Exception as exc:  # noqa: BLE001
+        from app.config import redact_proxy_creds
+        return {
+            "status": "error",
+            "http_status": 502,
+            "error": redact_proxy_creds(f"browser context unavailable: {type(exc).__name__}: {exc}"),
+            "data": None,
+        }
     page = None
 
     captured: dict[str, Any] = {}
@@ -1497,7 +1538,8 @@ async def _search_via_browser_impl(
                 captured["status"] = resp.status
         except Exception:  # noqa: BLE001
             try:
-                body_txt = (await resp.text())[:2000]
+                from app.config import redact_proxy_creds
+                body_txt = redact_proxy_creds((await resp.text())[:2000])
                 if "data" not in captured and "raw" not in captured:
                     captured["raw"] = body_txt
                     captured["url"] = resp.url

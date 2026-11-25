@@ -185,7 +185,7 @@ async def search(
         result = {
             "engine": "playwright",
             "status": pw_result["status"],
-            "http_status": pw_result.get("http_status", 200),
+            "http_status": pw_result.get("http_status") or (200 if pw_result.get("status") == "ok" else 502),
             "query": {"q": req.q, "type": req.type},
             "data": pw_result.get("data"),
             "error": pw_result.get("error"),
@@ -204,5 +204,7 @@ async def search(
             content={"status": "error", "error": "Internal Server Error"},
         )
 
+    if result["status"] == "error" and result.get("http_status") == 429:
+        return JSONResponse(status_code=429, content=result)
     code_map = {"ok": 200, "invalid": 401, "error": 502}
     return JSONResponse(status_code=code_map.get(result["status"], 500), content=result)

@@ -438,7 +438,7 @@ async def login_with_auth_token(auth_token: str, *, _rewarm_retry: bool = False)
                 return {
                     "status": "invalid",
                     "http_status": 401,
-                    "error": viewer_resp.text[:500],
+                    "error": redact_proxy_creds(viewer_resp.text[:500]),
                     "cookies": jar,
                     "tokens": {"bearer": WEB_BEARER, "ct0": ct0, "auth_token": auth_token},
                     "user": None,
@@ -461,7 +461,7 @@ async def login_with_auth_token(auth_token: str, *, _rewarm_retry: bool = False)
                 return {
                     "status": "error",
                     "http_status": err_st,
-                    "error": viewer_resp.text[:500],
+                    "error": redact_proxy_creds(viewer_resp.text[:500]),
                     "cookies": jar,
                     "tokens": {"bearer": WEB_BEARER, "ct0": ct0, "auth_token": auth_token},
                     "user": None,

@@ -379,7 +379,7 @@ async def v2_quote_tweets(
     result = {
         "engine": "playwright",
         "status": pw["status"],
-        "http_status": pw.get("http_status", 200),
+        "http_status": pw.get("http_status") or (200 if pw.get("status") == "ok" else 502),
         "data": pw.get("data"),
         "error": pw.get("error"),
     }

@@ -1583,7 +1583,14 @@ async def v2_dm_send(
             if pw_res.get("status") == "ok":
                 return JSONResponse(status_code=201, content={"data": pw_res.get("data")})
         return write_finalize(result, raw=False)
-    if pin:
+    if (
+        pin
+        and result.get("status") != "invalid"
+        and not (
+            str(result.get("error") or "").startswith("warm-up failed:")
+            and result.get("http_status") != 403
+        )
+    ):
         conv_id = dm_conv_id_for(me, participant_id)
         pw_res = await send_xchat_dm_via_browser(tok, pin, conv_id, body.text)
         if pw_res.get("status") == "ok":
@@ -1640,7 +1647,14 @@ async def v2_dm_send_to_conv(
             if pw_res.get("status") == "ok":
                 return JSONResponse(status_code=201, content={"data": pw_res.get("data")})
         return write_finalize(result, raw=False)
-    if pin:
+    if (
+        pin
+        and result.get("status") != "invalid"
+        and not (
+            str(result.get("error") or "").startswith("warm-up failed:")
+            and result.get("http_status") != 403
+        )
+    ):
         pw_res = await send_xchat_dm_via_browser(tok, pin, norm_conv_id, body.text)
         if pw_res.get("status") == "ok":
             return JSONResponse(status_code=201, content={"data": pw_res.get("data")})

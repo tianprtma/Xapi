@@ -68,7 +68,12 @@ from ..config import (
     WEB_BEARER,
     redact_proxy_creds,
 )
-from ..playwright_helpers import resolve_screen_name, tweet_author_handle
+from ..playwright_helpers import (
+    pop_last_resolve_screen_name_err,
+    reset_last_resolve_screen_name_err,
+    resolve_screen_name,
+    tweet_author_handle,
+)
 from ..responses import batch_finalize, finalize, stub_501, wrap, write_finalize
 
 
@@ -314,7 +319,7 @@ async def v2_reposts_of_me(
     result = {
         "engine": "playwright",
         "status": pw["status"],
-        "http_status": pw.get("http_status", 200),
+        "http_status": pw.get("http_status") or (200 if pw.get("status") == "ok" else 502),
         "data": pw.get("data"),
         "error": pw.get("error"),
     }
@@ -490,29 +495,40 @@ async def v2_user_by_id(
             if cached is not None:
                 return JSONResponse(content={"data": cached})
         # Playwright hanya bila diizinkan eksplisit (PLAYWRIGHT_FALLBACK=1)
-        if os.environ.get("PLAYWRIGHT_FALLBACK", "0") == "1":
-            pw = await fetch_via_browser(
-                auth_token=tok,
-                navigate_url=f"https://x.com/i/user/{user_id}",
-                match_path=["/UserByRestId", "/UserByScreenName"],
-            )
-            result = {
-                "status": pw["status"],
-                "http_status": pw.get("http_status", 200),
-                "operation": "UserByRestId",
-                "engine": "playwright",
-                "data": pw.get("data"),
-                "error": pw.get("error"),
-            }
-            return finalize(result, format_user, raw=bool(raw))
+        # dan proxy tidak sedang mati pada tahap warm_session.
+        if (
+            os.environ.get("PLAYWRIGHT_FALLBACK", "0") == "1"
+            and not str(result.get("error") or "").startswith("warm-up failed:")
+        ):
+            try:
+                pw = await fetch_via_browser(
+                    auth_token=tok,
+                    navigate_url=f"https://x.com/i/user/{user_id}",
+                    match_path=["/UserByRestId", "/UserByScreenName"],
+                )
+                if not (pw.get("status") == "error" and result.get("http_status") == 429):
+                    pw_result = {
+                        "status": pw["status"],
+                        "http_status": pw.get("http_status") or (200 if pw.get("status") == "ok" else 502),
+                        "operation": "UserByRestId",
+                        "engine": "playwright",
+                        "data": pw.get("data"),
+                        "error": pw.get("error"),
+                    }
+                    return finalize(pw_result, format_user, raw=bool(raw))
+            except Exception:  # noqa: BLE001
+                pass
         raw_st = result.get("http_status")
         err_st = raw_st if isinstance(raw_st, int) and raw_st >= 400 else 502
+        up_err = redact_proxy_creds(str(result.get("error") or "").strip())[:300]
+        detail_msg = (
+            f"UserByRestId gagal dan tidak ada cache profil: {up_err}"
+            if up_err
+            else "UserByRestId gagal dan tidak ada cache profil"
+        )
         return JSONResponse(
             status_code=err_st,
-            content=format_error(
-                "Upstream Error",
-                "UserByRestId gagal dan tidak ada cache profil",
-                "upstream_error", err_st),
+            content=format_error("Upstream Error", detail_msg, "upstream_error", err_st),
         )
     return finalize(result, format_user, raw=bool(raw))
 
@@ -602,27 +618,37 @@ async def v2_user_followers(
     if pagination_token:
         variables["cursor"] = pagination_token
     result = await graphql_call("Followers", variables, tok)
-    if result["status"] == "ok" or result.get("status") == "invalid" or pagination_token:
+    if (
+        result["status"] == "ok"
+        or result.get("status") == "invalid"
+        or pagination_token
+        or str(result.get("error") or "").startswith("warm-up failed:")
+    ):
         return finalize(result, lambda g: format_tweet_collection(g, item="user"), raw=bool(raw))
     try:
+        reset_last_resolve_screen_name_err()
         handle = await resolve_screen_name(user_id, tok)
         if not handle:
-            if result.get("http_status") and result.get("http_status") != 200:
-                return finalize(result, lambda g: format_tweet_collection(g, item="user"), raw=bool(raw))
-            return JSONResponse(status_code=404, content=format_error("Not Found", "user_id not found", "not_found", 404))
+            rsn_err = pop_last_resolve_screen_name_err()
+            if rsn_err is not None and rsn_err.get("status") == "invalid":
+                return finalize(rsn_err, lambda g: format_tweet_collection(g, item="user"), raw=bool(raw))
+            if rsn_err is None and result.get("http_status") == 404:
+                return JSONResponse(status_code=404, content=format_error("Not Found", "user_id not found", "not_found", 404))
+            return finalize(result, lambda g: format_tweet_collection(g, item="user"), raw=bool(raw))
         pw = await fetch_via_browser(
             auth_token=tok,
             navigate_url=f"https://x.com/{handle}/followers",
             match_path="/Followers",
         )
-        result = {
-            "status": pw["status"],
-            "http_status": pw.get("http_status", 200),
-            "operation": "Followers",
-            "engine": "playwright",
-            "data": pw.get("data"),
-            "error": pw.get("error"),
-        }
+        if not (pw.get("status") == "error" and result.get("http_status") == 429):
+            result = {
+                "status": pw["status"],
+                "http_status": pw.get("http_status") or (200 if pw.get("status") == "ok" else 502),
+                "operation": "Followers",
+                "engine": "playwright",
+                "data": pw.get("data"),
+                "error": pw.get("error"),
+            }
     except Exception:
         pass
     return finalize(result, lambda g: format_tweet_collection(g, item="user"), raw=bool(raw))
@@ -740,8 +766,12 @@ async def v2_mentions(
         )
     if not handle:
         # Resolve via Playwright UserByRestId/UserByScreenName
+        reset_last_resolve_screen_name_err()
         handle = await resolve_screen_name(user_id, tok)
     if not handle:
+        rsn_err = pop_last_resolve_screen_name_err()
+        if rsn_err is not None:
+            return finalize(rsn_err, format_tweet_collection, raw=bool(raw))
         return JSONResponse(
             status_code=400,
             content=format_error("Bad Request", "username unresolved", "bad_request", 400),
@@ -750,7 +780,7 @@ async def v2_mentions(
     result = {
         "engine": "playwright",
         "status": pw["status"],
-        "http_status": pw.get("http_status", 200),
+        "http_status": pw.get("http_status") or (200 if pw.get("status") == "ok" else 502),
         "data": pw.get("data"),
         "error": pw.get("error"),
     }
@@ -870,28 +900,38 @@ async def v2_user_tweets_replies(
     if pagination_token:
         variables["cursor"] = pagination_token
     result = await graphql_call("UserTweetsAndReplies", variables, tok)
-    if result["status"] == "ok" or result.get("status") == "invalid" or pagination_token:
+    if (
+        result["status"] == "ok"
+        or result.get("status") == "invalid"
+        or pagination_token
+        or str(result.get("error") or "").startswith("warm-up failed:")
+    ):
         return finalize(result, format_tweet_collection, raw=bool(raw))
     try:
+        reset_last_resolve_screen_name_err()
         handle = await resolve_screen_name(user_id, tok)
         if not handle:
-            if result.get("http_status") and result.get("http_status") != 200:
-                return finalize(result, format_tweet_collection, raw=bool(raw))
-            return JSONResponse(status_code=404, content=format_error("Not Found", "user_id not found", "not_found", 404))
+            rsn_err = pop_last_resolve_screen_name_err()
+            if rsn_err is not None and rsn_err.get("status") == "invalid":
+                return finalize(rsn_err, format_tweet_collection, raw=bool(raw))
+            if rsn_err is None and result.get("http_status") == 404:
+                return JSONResponse(status_code=404, content=format_error("Not Found", "user_id not found", "not_found", 404))
+            return finalize(result, format_tweet_collection, raw=bool(raw))
         pw = await fetch_via_browser(
             auth_token=tok,
             navigate_url=f"https://x.com/{handle}/with_replies",
             match_path=["/UserTweetsAndReplies", "/UserRepliesTimeline"],
             timeout=30.0,
         )
-        result = {
-            "status": pw["status"],
-            "http_status": pw.get("http_status", 200),
-            "operation": "UserTweetsAndReplies",
-            "engine": "playwright",
-            "data": pw.get("data"),
-            "error": pw.get("error"),
-        }
+        if not (pw.get("status") == "error" and result.get("http_status") == 429):
+            result = {
+                "status": pw["status"],
+                "http_status": pw.get("http_status") or (200 if pw.get("status") == "ok" else 502),
+                "operation": "UserTweetsAndReplies",
+                "engine": "playwright",
+                "data": pw.get("data"),
+                "error": pw.get("error"),
+            }
     except Exception:
         pass
     return finalize(result, format_tweet_collection, raw=bool(raw))

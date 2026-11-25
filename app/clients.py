@@ -193,7 +193,7 @@ async def _graphql_call_once(
                 err_out: dict[str, Any] = {
                     "status": "error",
                     "http_status": out_st,
-                    "error": resp.text[:1000],
+                    "error": redact_proxy_creds(resp.text[:1000]),
                     "data": None,
                 }
                 if is_proxy_auth_or_quota:
@@ -208,7 +208,7 @@ async def _graphql_call_once(
                     "status": "error",
                     "http_status": 502,
                     "error": "non-JSON response",
-                    "raw": resp.text[:1000],
+                    "raw": redact_proxy_creds(resp.text[:1000]),
                     "data": None,
                 }
 
@@ -331,7 +331,7 @@ async def _rest_call_once(
                 err_out = {
                     "status": "error",
                     "http_status": 502 if is_proxy_auth_or_quota else resp.status_code,
-                    "error": resp.text[:1000],
+                    "error": redact_proxy_creds(resp.text[:1000]),
                     "data": None,
                 }
                 if is_proxy_auth_or_quota:
@@ -342,7 +342,7 @@ async def _rest_call_once(
             try:
                 payload = resp.json()
             except json.JSONDecodeError:
-                payload = {"raw": resp.text[:1000]}
+                payload = {"raw": redact_proxy_creds(resp.text[:1000])}
 
             return {
                 "status": "ok",
@@ -470,7 +470,7 @@ async def _dm_call_once(
         try:
             payload = resp.json()
         except json.JSONDecodeError:
-            payload = {"raw": resp.text[:1000]}
+            payload = {"raw": redact_proxy_creds(resp.text[:1000])}
 
         if resp.status_code >= 400:
             is_proxy_auth_or_quota = resp.status_code in (402, 407)
@@ -913,7 +913,7 @@ def _upload_error(resp: Any, stage: str, *, media_id: Optional[str] = None) -> d
     err: dict[str, Any] = {
         "status": "error",
         "http_status": norm_st,
-        "error": resp.text[:1000],
+        "error": redact_proxy_creds(resp.text[:1000]),
         "stage": stage,
         "data": None,
     }

@@ -2104,3 +2104,120 @@ async def test_pass33_dm_dead_proxy_short_circuit_no_fake_200_and_xchat_redirect
     assert send_redir["status"] == "error"
     assert send_redir["http_status"] == 502
     x_inv.assert_awaited_once_with(tok)
+
+
+# ── 39. Pass 35: Redaction after `: `/`.`/`?`, numeric-password schemeless-@ normalization, proxy error-body redaction, & router Playwright fallback guards ──
+
+@pytest.mark.asyncio
+async def test_pass35_redaction_punctuation_numeric_pass_norm_and_router_playwright_guards(monkeypatch):
+    from contextlib import asynccontextmanager
+    from app.clients import _graphql_call_once
+    from app.config import normalize_proxy_input, redact_proxy_creds, validate_proxy_url
+    from app.routers.dm import DMSendBody, v2_dm_send
+    from app.routers.users import v2_mentions, v2_user_by_id, v2_user_followers, v2_user_tweets_replies
+    from playwright_search import fetch_via_browser
+
+    tok = "e" * 40
+
+    # 1. redact_proxy_creds masks credentials followed by `: reason`, `.`, `?`, `#`, single-label host, & trailing dot
+    assert redact_proxy_creds("Proxy http://usr:secret1@31.6.46.27:12323: connection refused.") == (
+        "Proxy http://***@31.6.46.27:12323: connection refused."
+    )
+    assert redact_proxy_creds("Failed http://usr:secret2@31.6.46.27:12323.") == (
+        "Failed http://***@31.6.46.27:12323."
+    )
+    assert redact_proxy_creds("Bad http://usr:secret3@31.6.46.27:12323?foo=1#bar") == (
+        "Failed".replace("Failed", "Bad") + " http://***@31.6.46.27:12323?foo=1#bar"
+    )
+    assert redact_proxy_creds("err usr:secret4@squid:3128 and proxy.example.com.:8080:usr:secret5") == (
+        "err ***@squid:3128 and proxy.example.com.:8080:***"
+    )
+    # Must NOT falsely redact port+query URLs with @handle
+    assert redact_proxy_creds("http://example.com:8080?q=@alice") == "http://example.com:8080?q=@alice"
+
+    # 2. normalize_proxy_input handles `user:12345:secret@host:port`, trailing `/` on schemeless, & nested quotes
+    assert validate_proxy_url(normalize_proxy_input("admin:12345:secret@31.6.46.27:12323")) == (
+        "http://admin:12345%3Asecret@31.6.46.27:12323"
+    )
+    assert normalize_proxy_input("31.6.46.27:12323/") == "http://31.6.46.27:12323"
+    assert normalize_proxy_input("[2606:4700::1]:8080/") == "http://[2606:4700::1]:8080"
+    assert normalize_proxy_input("'\"http://31.6.46.27:12323\"'") == "http://31.6.46.27:12323"
+
+    # 3. Proxy 407 HTML body echoing proxy credentials in _graphql_call_once is redacted
+    class _Proxy407Sess:
+        async def get(self, *a, **kw):
+            return MagicMock(status_code=407, text="<html>Cache Access Denied via http://usr:leakpass@31.6.46.27:12323: denied</html>")
+
+    @asynccontextmanager
+    async def _p407_pool(_t):
+        yield _Proxy407Sess()
+
+    with (
+        patch("app.clients.pooled_client", _p407_pool),
+        patch("app.clients.warm_session", AsyncMock(return_value=("ct0_x", {}))),
+        patch("app.clients.ClientPool.get", return_value=MagicMock(invalidate=AsyncMock())),
+    ):
+        gql_407 = await _graphql_call_once("UserByRestId", {"userId": "1"}, tok)
+    assert gql_407["http_status"] == 502
+    assert "leakpass" not in gql_407["error"]
+    assert "***@31.6.46.27:12323" in gql_407["error"]
+
+    # 4. fetch_via_browser gracefully returns 502 (with redacted error) when ContextPool.acquire raises
+    with patch(
+        "playwright_search.ContextPool.get",
+        return_value=MagicMock(acquire=AsyncMock(side_effect=RuntimeError("Playwright disabled via http://usr:pwsecret@31.6.46.27:12323"))),
+    ):
+        pw_unavail = await fetch_via_browser(tok, "https://x.com/i/user/1", "/UserByRestId")
+    assert pw_unavail["status"] == "error"
+    assert pw_unavail["http_status"] == 502
+    assert "pwsecret" not in pw_unavail["error"]
+
+    # 5. Router Playwright fallbacks: skip on `warm-up failed:`, preserve 429, no false 404/400 on proxy/auth failure
+    monkeypatch.setenv("PLAYWRIGHT_FALLBACK", "1")
+    pw_spy = AsyncMock(return_value={"status": "error", "http_status": 502, "error": "browser timeout"})
+    with (
+        patch("app.routers.users.graphql_call", AsyncMock(return_value={"status": "error", "http_status": 502, "error": "warm-up failed: proxy 407"})),
+        patch("app.routers.users._cached_profile", return_value=None),
+        patch("app.routers.users.fetch_via_browser", pw_spy),
+    ):
+        r_u = await v2_user_by_id("123", authorization=f"Bearer {tok}", auth_token=None, raw=0)
+        r_f = await v2_user_followers("123", max_results=10, pagination_token=None, authorization=f"Bearer {tok}", auth_token=None, raw=0)
+        r_r = await v2_user_tweets_replies("123", max_results=10, pagination_token=None, authorization=f"Bearer {tok}", auth_token=None, raw=0)
+    assert r_u.status_code == 502
+    assert r_f.status_code == 502
+    assert r_r.status_code == 502
+    assert pw_spy.await_count == 0
+
+    # Non-JSON / http_status=200 upstream error on Followers must return 502, NOT false 404!
+    with (
+        patch("app.routers.users.graphql_call", AsyncMock(return_value={"status": "error", "http_status": 200, "error": "non-JSON response"})),
+        patch("app.routers.users.resolve_screen_name", AsyncMock(return_value=None)),
+    ):
+        r_f_nonjson = await v2_user_followers("123", max_results=10, pagination_token=None, authorization=f"Bearer {tok}", auth_token=None, raw=0)
+    assert r_f_nonjson.status_code == 502
+
+    # v2_mentions propagates 502 / 401 when resolve_screen_name fails due to proxy / auth instead of false 400!
+    with patch(
+        "app.playwright_helpers.fetch_via_browser",
+        AsyncMock(return_value={"status": "error", "http_status": 502, "error": "browser navigation HTTP 407"}),
+    ):
+        r_m_502 = await v2_mentions("123", max_results=10, pagination_token=None, username=None, authorization=f"Bearer {tok}", auth_token=None, raw=0)
+    assert r_m_502.status_code == 502
+
+    with patch(
+        "app.playwright_helpers.fetch_via_browser",
+        AsyncMock(return_value={"status": "invalid", "http_status": 401, "error": "browser navigation HTTP 401"}),
+    ):
+        r_m_401 = await v2_mentions("123", max_results=10, pagination_token=None, username=None, authorization=f"Bearer {tok}", auth_token=None, raw=0)
+    assert r_m_401.status_code == 401
+
+    # v2_dm_send with X-DM-Pin skips browser launch when dm_call failed with dead-proxy 502 warmup
+    e2ee_spy = AsyncMock()
+    with (
+        patch("app.routers.dm.resolve_me_id", AsyncMock(return_value="111")),
+        patch("app.routers.dm.dm_call", AsyncMock(return_value={"status": "error", "http_status": 502, "error": "warm-up failed: proxy dead"})),
+        patch("app.routers.dm.send_xchat_dm_via_browser", e2ee_spy),
+    ):
+        r_dm_dead = await v2_dm_send(participant_id="222", body=DMSendBody(text="hi"), dm_pin=None, x_dm_pin="1234", authorization=f"Bearer {tok}", auth_token=None, raw=0)
+    assert r_dm_dead.status_code == 502
+    assert e2ee_spy.await_count == 0

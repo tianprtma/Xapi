@@ -311,15 +311,15 @@ _REQUEST_PROXY_VAR: contextvars.ContextVar[Optional[str]] = contextvars.ContextV
 
 _PROXY_CREDS_RE = _re.compile(
     r"((?:https?|socks5h?)://)"
-    r"(?:[^\s/:'\"<>]+:(?![0-9]{1,5}/)(?:(?!://)\S)*?|[^\s/?#'\"<>]+)@"
-    r"(?=(?:\[[0-9a-fA-F:]+\]|[a-zA-Z0-9.-]+)(?::\d{1,5})?(?:[\s/'\"<>),;\]}]|$))",
+    r"(?:[^\s/?#:'\"<>]+:(?![0-9]{1,5}[/?#])(?:(?!://)\S)*?|[^\s/?#'\"<>]+)@"
+    r"(?=(?:\[[0-9a-fA-F:]+\]|[a-zA-Z0-9.-]+)(?::\d{1,5})?(?:[\s/'\"<>),;\]}.!?#]|:(?!\d)|$))",
     _re.IGNORECASE,
 )
 _PROXY_SHORTHAND_CREDS_RE = _re.compile(
-    r"((?<![A-Za-z0-9._/-])(?:\[[0-9a-fA-F:]+\]|[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+):\d{1,5}):[^\s,'\";\]})]+:[^\s,'\";\]})]+"
+    r"((?<![A-Za-z0-9._/-])(?:\[[0-9a-fA-F:]+\]|[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+\.?):\d{1,5}):[^\s,'\";\]})]+:[^\s,'\";\]})]+"
 )
 _PROXY_SCHEMELESS_AT_RE = _re.compile(
-    r"(?:(?<=[\s'\"(<\[,;={])|^)[^\s/:'\"<>@=]+:(?!//)(?:(?!://)[^\s'\"<>])+@(?=(?:\[[0-9a-fA-F:]+\]|[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+):\d{1,5}(?:[\s/'\"<>),;\]}]|$))"
+    r"(?:(?<=[\s'\"(<\[,;={])|^)[^\s/:'\"<>@=]+:(?!//)(?:(?!://)[^\s'\"<>])+@(?=(?:\[[0-9a-fA-F:]+\]|[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.?):\d{1,5}(?:[\s/'\"<>),;\]}.!?#]|:(?!\d)|$))"
 )
 _DISALLOWED_PROXY_HOSTS = frozenset({
     "localhost",
@@ -393,20 +393,46 @@ def _canon_hostport_text(hostport: str) -> str:
     return hostport.lower().rstrip(".") or hostport.lower()
 
 
+_MULTI_LABEL_HOST_RE = _re.compile(r"^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+\.?$")
+
+
+def _has_valid_port_suffix(hostport: str) -> bool:
+    hp = hostport[:-1] if (hostport.endswith("/") and "/" not in hostport[:-1]) else hostport
+    if hp.startswith("["):
+        hb, bsep, tail = hp.partition("]")
+        if not (bsep and tail.startswith(":") and tail[1:].isdigit() and 1 <= int(tail[1:]) <= 65535):
+            return False
+        try:
+            ipaddress.IPv6Address(hb[1:])
+            return True
+        except ValueError:
+            return False
+    h_p, csep, p_p = hp.rpartition(":")
+    return bool(
+        csep
+        and h_p
+        and _MULTI_LABEL_HOST_RE.match(h_p)
+        and p_p.isdigit()
+        and 1 <= int(p_p) <= 65535
+    )
+
+
 def normalize_proxy_input(raw: str) -> str:
     """Normalisasi input proxy dari CLI / env (`PROXY_LIST`, `--proxy`):
     dukung URL penuh, `direct`/`none`, `user:pass@host:port`, `[ipv6]:port[:user:pass]`,
     serta shorthand provider `host:port:user:pass` / `host:port`."""
     from urllib.parse import quote as _quote
 
-    val = (raw or "").strip().strip('"').strip("'").strip()
+    val = (raw or "").strip()
+    while len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+        val = val[1:-1].strip()
     if not val:
         return ""
     if val.lower() in ("direct", "none"):
         return val.lower()
-    if "://" in val:
-        scheme, rest = val.split("://", 1)
-        scheme = scheme.lower()
+    sch_cand, has_sch, rest = val.partition("://")
+    if has_sch and sch_cand and sch_cand[0].isalpha() and all(c.isalnum() or c in "+.-" for c in sch_cand):
+        scheme = sch_cand.lower()
         if "@" in rest:
             userinfo, _, hostport = rest.rpartition("@")
             if hostport.endswith("/") and "/" not in hostport[:-1]:
@@ -424,15 +450,22 @@ def normalize_proxy_input(raw: str) -> str:
         if bsep and tail.startswith(":"):
             v6_fmt = _canon_ipv6_bracket(host_bracket)
             rest_parts = tail[1:].split(":", 2)
-            if len(rest_parts) == 1 and rest_parts[0].isdigit() and 1 <= int(rest_parts[0]) <= 65535:
-                return f"http://{v6_fmt}:{int(rest_parts[0])}"
+            p0 = rest_parts[0][:-1] if (len(rest_parts) == 1 and rest_parts[0].endswith("/")) else rest_parts[0]
+            if len(rest_parts) == 1 and p0.isdigit() and 1 <= int(p0) <= 65535:
+                return f"http://{v6_fmt}:{int(p0)}"
             if len(rest_parts) == 3 and rest_parts[0].isdigit() and 1 <= int(rest_parts[0]) <= 65535:
                 port_s, u_s, p_s = rest_parts
                 return f"http://{_quote(u_s, safe='')}:{_quote(p_s, safe='')}@{v6_fmt}:{int(port_s)}"
         return val
     parts = val.split(":", 3)
+    is_at_hostport = (
+        "@" in val
+        and "." not in parts[0]
+        and _has_valid_port_suffix(val.rpartition("@")[2])
+    )
     if (
-        len(parts) == 4
+        not is_at_hostport
+        and len(parts) == 4
         and parts[0]
         and all(c not in parts[0] for c in "/@#?")
         and parts[1].isdigit()
@@ -440,15 +473,16 @@ def normalize_proxy_input(raw: str) -> str:
     ):
         h_clean = parts[0].lower().rstrip(".") or parts[0].lower()
         return f"http://{_quote(parts[2], safe='')}:{_quote(parts[3], safe='')}@{h_clean}:{int(parts[1])}"
+    p2_port = parts[1][:-1] if (len(parts) == 2 and parts[1].endswith("/")) else (parts[1] if len(parts) == 2 else "")
     if (
         len(parts) == 2
         and parts[0]
         and all(c not in parts[0] for c in "/@#?")
-        and parts[1].isdigit()
-        and 1 <= int(parts[1]) <= 65535
+        and p2_port.isdigit()
+        and 1 <= int(p2_port) <= 65535
     ):
         h_clean = parts[0].lower().rstrip(".") or parts[0].lower()
-        return f"http://{h_clean}:{int(parts[1])}"
+        return f"http://{h_clean}:{int(p2_port)}"
     if "@" in val:
         userinfo, sep, hostport = val.rpartition("@")
         if hostport.endswith("/") and "/" not in hostport[:-1]:

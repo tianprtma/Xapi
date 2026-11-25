@@ -100,7 +100,18 @@ async def _download_ton(tok: str, url: str):
                     continue
                 return None, redact_proxy_creds(f"{type(exc).__name__}: {exc}")
             if resp.status_code == 200:
-                return resp.content, (resp.headers.get("content-type") or "").lower()
+                ctype_raw = (resp.headers.get("content-type") or "").lower()
+                ctype_base = ctype_raw.split(";", 1)[0].strip()
+                head_low = (resp.content or b"").lstrip()[:32].lower()
+                if ctype_base in ("text/html", "application/xhtml+xml", "application/json", "text/xml", "application/xml") or (
+                    ctype_base.startswith("text/") and head_low.startswith((b"<!doctype", b"<html", b"<head", b"<body", b"{"))
+                ):
+                    await SessionStore.get().invalidate(tok, all_proxies=False)
+                    await ClientPool.get().invalidate(tok, all_proxies=False)
+                    if _attempt == 0:
+                        continue
+                    return None, "HTTP 502: non-media HTML/JSON response from proxy/upstream"
+                return resp.content, ctype_raw
             if resp.status_code in (401, 403):
                 all_p = resp.status_code == 401
                 if all_p:

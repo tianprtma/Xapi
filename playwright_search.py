@@ -649,6 +649,25 @@ class XChatContextPool:
             cls._instance = cls()
         return cls._instance
 
+    async def _drain_close(self, close_key: str, close_ctx: BrowserContext) -> None:
+        """Close popped persistent context outside `_lock` while holding `_closing_count`
+        so even `CancelledError` mid-close cannot race Chromium's `SingletonLock`."""
+        try:
+            await close_ctx.close()
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            async with self._lock:
+                self._ctx_keys.pop(id(close_ctx), None)
+                rem = max(0, self._closing_count.get(close_key, 0) - 1)
+                if rem == 0:
+                    self._closing_count.pop(close_key, None)
+                    ev = self._idle_events.pop(close_key, None)
+                    if ev is not None:
+                        ev.set()
+                else:
+                    self._closing_count[close_key] = rem
+
     async def acquire(self, auth_token: str) -> BrowserContext:
         from app.config import gen_ct0, playwright_proxy_for_token, profile_for_token, proxy_for_token
 
@@ -662,6 +681,9 @@ class XChatContextPool:
         while True:
             wait_ev: Optional[asyncio.Event] = None
             is_proxy_switch_waiter = False
+            close_before_retry: Optional[tuple[str, BrowserContext]] = None
+            evicted_to_close: list[tuple[str, BrowserContext]] = []
+            ret_ctx: Optional[BrowserContext] = None
             async with self._lock:
                 # ct0 STABIL per profil — baca/tulis di dalam lock agar concurrent
                 # first-time acquire tidak menulis ct0 yang saling bentrok.
@@ -695,11 +717,8 @@ class XChatContextPool:
                         self._ctxs.pop(key, None)
                         self._ctx_proxy.pop(key, None)
                         self._ctx_use.pop(id(ctx), None)
-                        self._ctx_keys.pop(id(ctx), None)
-                        try:
-                            await ctx.close()
-                        except Exception:  # noqa: BLE001
-                            pass
+                        self._closing_count[key] = self._closing_count.get(key, 0) + 1
+                        close_before_retry = (key, ctx)
                         ctx = None
                 elif (
                     ctx is not None
@@ -711,7 +730,7 @@ class XChatContextPool:
                     if wait_ev is None or wait_ev.is_set():
                         wait_ev = asyncio.Event()
                         self._idle_events[key] = wait_ev
-                if wait_ev is None:
+                if wait_ev is None and close_before_retry is None:
                     if ctx is not None:
                         # health check: context yang sudah mati melempar di .pages / add_cookies
                         try:
@@ -732,13 +751,10 @@ class XChatContextPool:
                                     self._idle_events[key] = wait_ev
                             else:
                                 self._ctx_use.pop(id(ctx), None)
-                                self._ctx_keys.pop(id(ctx), None)
-                                try:
-                                    await ctx.close()
-                                except Exception:  # noqa: BLE001
-                                    pass
+                                self._closing_count[key] = self._closing_count.get(key, 0) + 1
+                                close_before_retry = (key, ctx)
                                 ctx = None
-                if wait_ev is None:
+                if wait_ev is None and close_before_retry is None:
                     prof = profile_for_token(auth_token)
                     is_win = "Windows" in prof["sec_ch_ua_platform"]
                     profile_dir.mkdir(parents=True, exist_ok=True)
@@ -821,10 +837,8 @@ class XChatContextPool:
                     except BaseException:
                         # Tutup persistent context bila init gagal/cancel agar proses
                         # Chromium dan SingletonLock tidak bocor permanen.
-                        try:
-                            await ctx.close()
-                        except Exception:  # noqa: BLE001
-                            pass
+                        self._closing_count[key] = self._closing_count.get(key, 0) + 1
+                        asyncio.create_task(self._drain_close(key, ctx))
                         raise
 
                     self._ctxs[key] = ctx
@@ -843,14 +857,21 @@ class XChatContextPool:
                         old = self._ctxs.pop(evict_key)
                         self._ctx_proxy.pop(evict_key, None)
                         self._ctx_use.pop(id(old), None)
-                        self._ctx_keys.pop(id(old), None)
                         self._dropped.discard(old)
-                        try:
-                            await old.close()
-                        except Exception:  # noqa: BLE001
-                            pass
+                        self._closing_count[evict_key] = self._closing_count.get(evict_key, 0) + 1
+                        evicted_to_close.append((evict_key, old))
 
-                    return ctx
+                    ret_ctx = ctx
+
+            if evicted_to_close:
+                for ek, ectx in evicted_to_close:
+                    await asyncio.shield(asyncio.create_task(self._drain_close(ek, ectx)))
+            if ret_ctx is not None:
+                return ret_ctx
+            if close_before_retry is not None:
+                ck, cctx = close_before_retry
+                await asyncio.shield(asyncio.create_task(self._drain_close(ck, cctx)))
+                continue
 
             try:
                 remaining = deadline - asyncio.get_running_loop().time()
@@ -1149,6 +1170,16 @@ async def _click_action_via_browser_impl(
                 "data": None,
             }
 
+        if "data" not in captured and str(captured.get("raw") or "").lstrip()[:32].lower().startswith(("<!doctype", "<html", "<head", "<body")):
+            await ContextPool.get().invalidate(auth_token, all_proxies=False)
+            return {
+                "status": "error",
+                "http_status": 502,
+                "error": "non-JSON HTML response from proxy/upstream",
+                "raw": captured.get("raw"),
+                "data": None,
+            }
+
         return {
             "status": "ok",
             "http_status": captured.get("status", 200),
@@ -1270,6 +1301,17 @@ async def _action_via_browser_impl(
 
         status_code = result.get("status", 0)
         payload = result.get("body")
+        if isinstance(payload, str):
+            payload = redact_proxy_creds(payload[:2000])
+
+        if not isinstance(status_code, int) or status_code <= 0:
+            await ContextPool.get().invalidate(auth_token, all_proxies=False)
+            return {
+                "status": "error",
+                "http_status": 502,
+                "error": payload or "browser fetch returned invalid HTTP status",
+                "data": None,
+            }
 
         if status_code >= 400:
             if status_code == 401:
@@ -1281,6 +1323,16 @@ async def _action_via_browser_impl(
                 "status": "invalid" if status_code == 401 else "error",
                 "http_status": 502 if status_code in (402, 407) else status_code,
                 "error": payload,
+                "data": None,
+            }
+
+        if isinstance(payload, str) and payload.lstrip()[:32].lower().startswith(("<!doctype", "<html", "<head", "<body")):
+            await ContextPool.get().invalidate(auth_token, all_proxies=False)
+            return {
+                "status": "error",
+                "http_status": 502,
+                "error": "non-JSON HTML response from proxy/upstream",
+                "raw": payload,
                 "data": None,
             }
 
@@ -1415,7 +1467,7 @@ async def _fetch_via_browser_impl(
             if raw_st == 401:
                 from app.response_cache import ResponseCache
                 ResponseCache.get().invalidate_token(auth_token)
-            if isinstance(raw_st, int) and raw_st in (401, 403, 402, 407):
+            if (isinstance(raw_st, int) and raw_st in (401, 403, 402, 407)) or "raw" in captured:
                 await ContextPool.get().invalidate(auth_token, all_proxies=(raw_st == 401))
             norm_raw_st = (
                 502
@@ -1579,7 +1631,7 @@ async def _search_via_browser_impl(
             if raw_st == 401:
                 from app.response_cache import ResponseCache
                 ResponseCache.get().invalidate_token(auth_token)
-            if isinstance(raw_st, int) and raw_st in (401, 403, 402, 407):
+            if (isinstance(raw_st, int) and raw_st in (401, 403, 402, 407)) or "raw" in captured:
                 await ContextPool.get().invalidate(auth_token, all_proxies=(raw_st == 401))
             norm_raw_st = (
                 502

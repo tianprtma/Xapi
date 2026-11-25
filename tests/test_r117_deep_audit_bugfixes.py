@@ -2357,3 +2357,116 @@ async def test_pass37_captive_portal_warm_tid_client_direct_fallback_and_chat_me
     formatted_log = jfmt.format(rec)
     assert "logsecret88" not in formatted_log
     assert "***@31.6.46.27:12323" in formatted_log
+
+    # 6) Pass 40: v2_dm_media_proxy rejects HTTP 200 HTML captive portal & retries cleanly;
+    #    v2_dm_send_to_conv skips XChat browser launch on dead-proxy 502;
+    #    XChatContextPool._drain_close holds _closing_count across CancelledError;
+    #    _action_via_browser_impl redacts creds & rejects 200 HTML captive portal.
+    from app.routers.dm import v2_dm_media_proxy, v2_dm_send_to_conv
+    from playwright_search import XChatContextPool, _action_via_browser_impl
+
+    ton_media_calls = 0
+
+    class _TonCaptiveSess:
+        def __init__(self):
+            self.cookies = MagicMock()
+
+        async def get(self, url, headers=None):
+            nonlocal ton_media_calls
+            ton_media_calls += 1
+            if ton_media_calls == 1:
+                return MagicMock(
+                    status_code=200,
+                    content=b"<!DOCTYPE html><html><body>Captive Portal</body></html>",
+                    headers={"content-type": "text/html; charset=utf-8"},
+                )
+            return MagicMock(status_code=200, content=b"\xff\xd8\xff\xe0REALJPEG", headers={"content-type": "image/jpeg"})
+
+    @asynccontextmanager
+    async def _ton_captive_pool(_t):
+        yield _TonCaptiveSess()
+
+    with (
+        patch("app.client_pool.pooled_client", _ton_captive_pool),
+        patch("app.routers.dm.warm_session", AsyncMock(return_value=("ct0_m", {"twid": "u%3D1"}))),
+    ):
+        r_media_ok = await v2_dm_media_proxy(
+            dm_id="111", media_id="222", resource_id="img.jpg",
+            authorization=f"Bearer {tok}", auth_token=None,
+        )
+    assert r_media_ok.status_code == 200
+    assert r_media_ok.body == b"\xff\xd8\xff\xe0REALJPEG"
+    assert ton_media_calls == 2
+
+    pw_send_spy = AsyncMock()
+    with (
+        patch("app.auth.pooled_client", _warm_err_pool),
+        patch("app.auth.warm_session", AsyncMock(side_effect=WarmNetworkError("proxy dead", http_status=502))),
+        patch("app.routers.dm.send_xchat_dm_via_browser", pw_send_spy),
+    ):
+        r_conv_502 = await v2_dm_send_to_conv(
+            conversation_id="111-222", body=DMSendBody(text="hi"), dm_pin=None,
+            x_dm_pin="1234", authorization=f"Bearer {tok}", auth_token=None, raw=0,
+        )
+    assert r_conv_502.status_code == 502
+    assert pw_send_spy.await_count == 0
+
+    # XChatContextPool._drain_close keeps _closing_count > 0 even if acquire() is cancelled mid-close
+    xpool_c = XChatContextPool()
+    close_gate = asyncio.Event()
+    close_started = asyncio.Event()
+
+    async def _gated_close():
+        close_started.set()
+        await close_gate.wait()
+
+    import hashlib as _hl40
+    xkey = _hl40.sha256(f"xchat:{tok}".encode()).hexdigest()[:16]
+    old_xctx = MagicMock(pages=[], close=AsyncMock(side_effect=_gated_close))
+    new_xctx = MagicMock(pages=[], add_init_script=AsyncMock(), add_cookies=AsyncMock(), close=AsyncMock())
+    xpool_c._ctxs[xkey] = old_xctx
+    xpool_c._ctx_proxy[xkey] = "http://old.proxy.example:8080"
+    xpool_c._ctx_use[id(old_xctx)] = 0
+
+    fake_drv = MagicMock()
+    fake_drv.chromium.launch_persistent_context = AsyncMock(return_value=new_xctx)
+    with (
+        patch("app.config.proxy_for_token", return_value="http://new.proxy.example:8080"),
+        patch("app.config.playwright_proxy_for_token", return_value={"server": "http://new.proxy.example:8080"}),
+        patch("playwright_search.PlaywrightPool.get", return_value=MagicMock(driver=AsyncMock(return_value=fake_drv))),
+        patch("playwright_search._apply_session_cookies", AsyncMock()),
+    ):
+        acq_task1 = asyncio.create_task(xpool_c.acquire(tok))
+        await close_started.wait()
+        assert xpool_c._closing_count.get(xkey) == 1
+        acq_task1.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await acq_task1
+        # Still closing in background -> _closing_count must STILL be 1!
+        assert xpool_c._closing_count.get(xkey) == 1
+        acq_task2 = asyncio.create_task(xpool_c.acquire(tok))
+        await asyncio.sleep(0.02)
+        assert fake_drv.chromium.launch_persistent_context.await_count == 0
+        close_gate.set()
+        got_xctx = await acq_task2
+        assert got_xctx is new_xctx
+        assert xpool_c._closing_count.get(xkey, 0) == 0
+
+    # _action_via_browser_impl redacts creds & rejects 200 HTML captive portal
+    fake_page = MagicMock()
+    fake_page.goto = AsyncMock(return_value=MagicMock(status=200))
+    fake_page.evaluate = AsyncMock(return_value={
+        "status": 200,
+        "body": "<html><body>Proxy error http://usr:actsecret@31.6.46.27:12323</body></html>",
+    })
+    fake_page.close = AsyncMock()
+    fake_bctx = MagicMock(new_page=AsyncMock(return_value=fake_page), cookies=AsyncMock(return_value=[]))
+    cp_inv_spy = AsyncMock()
+    with (
+        patch("playwright_search.ContextPool.get", return_value=MagicMock(acquire=AsyncMock(return_value=fake_bctx), release=AsyncMock(), invalidate=cp_inv_spy)),
+        patch("playwright_search.asyncio.sleep", AsyncMock()),
+    ):
+        r_act_html = await _action_via_browser_impl(tok, "https://x.com/i/api/1.1/blocks/destroy.json")
+    assert r_act_html["status"] == "error" and r_act_html["http_status"] == 502
+    assert "actsecret" not in r_act_html.get("raw", "")
+    assert cp_inv_spy.await_count == 1

@@ -1486,6 +1486,24 @@ async def v2_dm_media_proxy(
                 )
             if resp.status_code == 200:
                 content_type = resp.headers.get("content-type") or "application/octet-stream"
+                ctype_low = content_type.split(";", 1)[0].strip().lower()
+                head_low = (resp.content or b"").lstrip()[:32].lower()
+                if ctype_low in ("text/html", "application/xhtml+xml", "application/json", "text/xml", "application/xml") or (
+                    ctype_low.startswith("text/") and head_low.startswith((b"<!doctype", b"<html", b"<head", b"<body", b"{"))
+                ):
+                    await SessionStore.get().invalidate(tok, all_proxies=False)
+                    await ClientPool.get().invalidate(tok, all_proxies=False)
+                    if _attempt == 0:
+                        continue
+                    return JSONResponse(
+                        status_code=502,
+                        content=format_error(
+                            "Media Fetch Error",
+                            "Upstream ton.x.com via proxy returned non-media HTML/JSON response",
+                            "upstream_error",
+                            502,
+                        ),
+                    )
                 return Response(content=resp.content, media_type=content_type)
             if resp.status_code in (401, 403):
                 all_p = resp.status_code == 401
@@ -1637,7 +1655,7 @@ async def v2_dm_send_to_conv(
     norm_conv_id = conversation_id.replace(":", "-")
     me, err_resp = await _resolve_me_or_error(tok, raw=raw, is_write=True)
     if err_resp is not None:
-        if pin and err_resp.status_code != 401:
+        if pin and err_resp.status_code == 403:
             pw_res = await send_xchat_dm_via_browser(tok, pin, norm_conv_id, body.text)
             if pw_res.get("status") == "ok":
                 return JSONResponse(status_code=201, content={"data": pw_res.get("data")})
@@ -1732,7 +1750,11 @@ async def v2_dm_block(
     # X web sudah memensiunkan disable.json granular (balas 279 "conversation
     # doesn't exist" meski conversation valid) — fallback ke account-level
     # block yang sama dengan route /2/users/{id}/blocking.
-    if result["status"] == "error" and result.get("http_status") == 404:
+    if (
+        result["status"] == "error"
+        and result.get("http_status") == 404
+        and not str(result.get("error") or "").startswith("warm-up failed:")
+    ):
         result = await rest_call("blocks/create.json", tok, data={"user_id": user_id})
         if result["status"] == "ok":
             return JSONResponse(status_code=200, content={"data": {"blocking": True, "user_id": user_id}})
@@ -1768,7 +1790,11 @@ async def v2_dm_unblock(
     )
     # Mirror fallback dm/block: X memensiunkan endpoint granular — pakai
     # account-level unblock.
-    if result["status"] == "error" and result.get("http_status") == 404:
+    if (
+        result["status"] == "error"
+        and result.get("http_status") == 404
+        and not str(result.get("error") or "").startswith("warm-up failed:")
+    ):
         result = await rest_call("blocks/destroy.json", tok, data={"user_id": user_id})
         if result["status"] == "ok":
             return JSONResponse(status_code=200, content={"data": {"blocking": False, "user_id": user_id}})
@@ -1792,7 +1818,11 @@ async def _accept_dm_conversation(conv_id: str, tok: str, raw: int) -> JSONRespo
         data={"request_id": secrets.token_hex(16)},
         with_dm_defaults=False,
     )
-    if result["status"] != "ok" and result.get("http_status") == 404:
+    if (
+        result["status"] != "ok"
+        and result.get("http_status") == 404
+        and not str(result.get("error") or "").startswith("warm-up failed:")
+    ):
         result = await dm_call(
             "dm/conversation/accept.json",
             tok,

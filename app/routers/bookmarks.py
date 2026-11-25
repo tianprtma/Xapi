@@ -49,6 +49,7 @@ from ..clients import (
     dm_call,
     dm_conv_id_for,
     graphql_call,
+    is_dead_proxy_error_result,
     media_upload,
     rest_call,
 )
@@ -114,7 +115,7 @@ async def v2_bookmark(
     if (
         result["status"] == "error"
         and result.get("http_status") == 404
-        and not str(result.get("error") or "").startswith("warm-up failed:")
+        and not is_dead_proxy_error_result(result)
     ):
         # Resolve author handle untuk navigate
         author = await tweet_author_handle(body.tweet_id, tok)
@@ -186,7 +187,7 @@ async def v2_unbookmark(
     if (
         result["status"] == "error"
         and result.get("http_status") == 404
-        and not str(result.get("error") or "").startswith("warm-up failed:")
+        and not is_dead_proxy_error_result(result)
     ):
         author = await tweet_author_handle(tweet_id, tok)
         nav = f"https://x.com/{author or 'i/web'}/status/{tweet_id}"

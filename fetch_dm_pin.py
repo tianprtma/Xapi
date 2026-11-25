@@ -19,8 +19,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
+import re as _re_env
 import sys
 from pathlib import Path
 
@@ -34,8 +36,11 @@ if _ENV_FILE.is_file():
             continue
         _k, _v = _line.split("=", 1)
         _v_clean = _v.strip()
+        _quoted = len(_v_clean) >= 2 and _v_clean[0] == _v_clean[-1] and _v_clean[0] in ('"', "'")
         while len(_v_clean) >= 2 and _v_clean[0] == _v_clean[-1] and _v_clean[0] in ('"', "'"):
             _v_clean = _v_clean[1:-1]
+        if not _quoted:
+            _v_clean = _re_env.split(r"\s+#", _v_clean, maxsplit=1)[0].strip()
         os.environ.setdefault(_k.strip(), _v_clean)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -48,6 +53,7 @@ from app.config import (  # noqa: E402
     redact_proxy_creds,
     reset_request_proxy,
     set_request_proxy,
+    split_proxy_list,
     validate_proxy_url,
 )
 from app.response_cache import ResponseCache  # noqa: E402
@@ -202,7 +208,15 @@ async def main() -> int:
     proxy_ctx_tok = None
     if (args.proxy or "").strip():
         try:
-            proxy_ctx_tok = set_request_proxy(validate_proxy_url(normalize_proxy_input(args.proxy)))
+            proxy_entries = [normalize_proxy_input(p) for p in split_proxy_list(args.proxy)]
+            proxy_entries = [p for p in proxy_entries if p]
+            if proxy_entries:
+                chosen_px = (
+                    proxy_entries[0]
+                    if len(proxy_entries) == 1
+                    else proxy_entries[int(hashlib.sha256(tok.encode("utf-8")).hexdigest(), 16) % len(proxy_entries)]
+                )
+                proxy_ctx_tok = set_request_proxy(validate_proxy_url(chosen_px))
         except ValueError as exc:
             print(f"ERROR: --proxy tidak valid: {redact_proxy_creds(str(exc))}", file=sys.stderr)
             return 2

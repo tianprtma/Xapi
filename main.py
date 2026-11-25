@@ -29,6 +29,7 @@ from __future__ import annotations
 # (terbukti: PROXY_LIST terpasang di .env tapi semua request keluar direct
 # dari IP VPS -> rate limit). setdefault: env asli (systemd/shell) menang.
 import os as _os
+import re as _re_env
 from pathlib import Path as _Path
 
 _env_file = _Path(__file__).resolve().parent / ".env"
@@ -39,8 +40,11 @@ if _env_file.is_file():
             continue
         _k, _v = _line.split("=", 1)
         _v_clean = _v.strip()
+        _quoted = len(_v_clean) >= 2 and _v_clean[0] == _v_clean[-1] and _v_clean[0] in ('"', "'")
         while len(_v_clean) >= 2 and _v_clean[0] == _v_clean[-1] and _v_clean[0] in ('"', "'"):
             _v_clean = _v_clean[1:-1]
+        if not _quoted:
+            _v_clean = _re_env.split(r"\s+#", _v_clean, maxsplit=1)[0].strip()
         _os.environ.setdefault(_k.strip(), _v_clean)
 
 import logging

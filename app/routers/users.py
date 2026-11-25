@@ -396,7 +396,7 @@ async def v2_unblock(
     if (
         result["status"] == "error"
         and result.get("http_status") == 404
-        and not str(result.get("error") or "").startswith("warm-up failed:")
+        and not is_dead_proxy_error_result(result)
     ):
         reset_last_resolve_screen_name_err()
         handle = await resolve_screen_name(target_user_id, tok)

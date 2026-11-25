@@ -1763,7 +1763,7 @@ async def v2_dm_block(
     if (
         result["status"] == "error"
         and result.get("http_status") == 404
-        and not str(result.get("error") or "").startswith("warm-up failed:")
+        and not _is_dead_proxy_err(result)
     ):
         result = await rest_call("blocks/create.json", tok, data={"user_id": user_id})
         if result["status"] == "ok":
@@ -1803,7 +1803,7 @@ async def v2_dm_unblock(
     if (
         result["status"] == "error"
         and result.get("http_status") == 404
-        and not str(result.get("error") or "").startswith("warm-up failed:")
+        and not _is_dead_proxy_err(result)
     ):
         result = await rest_call("blocks/destroy.json", tok, data={"user_id": user_id})
         if result["status"] == "ok":
@@ -1831,7 +1831,7 @@ async def _accept_dm_conversation(conv_id: str, tok: str, raw: int) -> JSONRespo
     if (
         result["status"] != "ok"
         and result.get("http_status") == 404
-        and not str(result.get("error") or "").startswith("warm-up failed:")
+        and not _is_dead_proxy_err(result)
     ):
         result = await dm_call(
             "dm/conversation/accept.json",

@@ -301,6 +301,10 @@ XCHAT_BOT_USER_ID: str = os.environ.get("XCHAT_BOT_USER_ID", "").strip()
 # (menfessllm, jkt48history, dll.) mengatur proxy sendiri di `.env` masing-masing.
 # 0 = tolak header `X-Proxy-Url` (rekomendasi jika Xapi diekspos ke publik).
 ALLOW_REQUEST_PROXY: bool = os.environ.get("ALLOW_REQUEST_PROXY", "1").strip().lower() not in ("0", "false", "no")
+# Default tolak IP proxy privat/LAN/non-global (RFC 1918, CGNAT 100.64/10, ULA fc00::/7)
+# untuk mencegah SSRF ke layanan internal VPS/Docker/LAN via header `X-Proxy-Url`.
+# Set `ALLOW_PRIVATE_PROXY_IPS=1` bila sengaja memakai proxy Squid/SOCKS di LAN privat.
+ALLOW_PRIVATE_PROXY_IPS: bool = os.environ.get("ALLOW_PRIVATE_PROXY_IPS", "0").strip().lower() in ("1", "true", "yes")
 
 _DIRECT_PROXY_SENTINEL = "__direct__"
 _ALLOWED_PROXY_SCHEMES = frozenset({"http", "https", "socks5", "socks5h"})
@@ -438,6 +442,153 @@ def _canon_hostport_text(hostport: str) -> str:
 
 
 _MULTI_LABEL_HOST_RE = _re.compile(r"^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+\.?$")
+_SINGLE_OR_MULTI_HOST_RE = _re.compile(r"^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.?$")
+
+
+def _has_valid_any_hostport(hostport: str) -> bool:
+    hp = hostport.strip().strip("'\"")
+    if hp.endswith("/") and "/" not in hp[:-1]:
+        hp = hp[:-1]
+    if hp.startswith("["):
+        hb, bsep, tail = hp.partition("]")
+        if not (bsep and tail.startswith(":") and tail[1:].isdigit() and 1 <= int(tail[1:]) <= 65535):
+            return False
+        try:
+            ipaddress.IPv6Address(hb[1:])
+            return True
+        except ValueError:
+            return False
+    h_p, csep, p_p = hp.rpartition(":")
+    return bool(
+        csep
+        and h_p
+        and _SINGLE_OR_MULTI_HOST_RE.match(h_p)
+        and p_p.isdigit()
+        and 1 <= int(p_p) <= 65535
+    )
+
+
+def _is_standalone_proxy_token(token: str) -> bool:
+    v = token.strip().strip("'\"")
+    if not v:
+        return False
+    if v.lower() in ("direct", "none"):
+        return True
+    sch, has_sch, rest = v.partition("://")
+    if has_sch and sch and sch[0].isalpha() and all(c.isalnum() or c in "+.-" for c in sch):
+        if "@" in rest:
+            _, _, hp = rest.rpartition("@")
+            return _has_valid_any_hostport(hp) or bool(_SINGLE_OR_MULTI_HOST_RE.match(hp.rstrip("/")))
+        r_clean = rest[:-1] if (rest.endswith("/") and "/" not in rest[:-1]) else rest
+        if ":" in r_clean and not r_clean.startswith("["):
+            return _has_valid_any_hostport(r_clean)
+        if r_clean.startswith("["):
+            _, bsep, tail = r_clean.partition("]")
+            if not bsep:
+                return False
+            if not tail:
+                return True
+            return tail.startswith(":") and tail[1:].isdigit() and 1 <= int(tail[1:]) <= 65535
+        return bool(_SINGLE_OR_MULTI_HOST_RE.match(r_clean))
+    if "@" in v:
+        _, _, hp = v.rpartition("@")
+        return _has_valid_any_hostport(hp)
+    if v.startswith("["):
+        _, bsep, tail = v.partition("]")
+        if not (bsep and tail.startswith(":")):
+            return False
+        rp = tail[1:].split(":", 2)
+        p0 = rp[0].rstrip("/") if len(rp) == 1 else rp[0]
+        return p0.isdigit() and 1 <= int(p0) <= 65535 and len(rp) in (1, 3)
+    parts = v.split(":", 3)
+    if len(parts) in (2, 4) and parts[0] and _SINGLE_OR_MULTI_HOST_RE.match(parts[0]):
+        p1 = parts[1].rstrip("/") if len(parts) == 2 else parts[1]
+        return p1.isdigit() and 1 <= int(p1) <= 65535
+    return False
+
+
+def _is_shorthand_with_creds(token: str) -> bool:
+    v = token.strip().strip("'\"")
+    if "://" in v or "@" in v:
+        return False
+    if v.startswith("["):
+        _, bsep, tail = v.partition("]")
+        if bsep and tail.startswith(":"):
+            rp = tail[1:].split(":", 2)
+            return len(rp) == 3 and rp[0].isdigit() and 1 <= int(rp[0]) <= 65535
+        return False
+    parts = v.split(":", 3)
+    return (
+        len(parts) == 4
+        and bool(parts[0])
+        and _SINGLE_OR_MULTI_HOST_RE.match(parts[0]) is not None
+        and parts[1].isdigit()
+        and 1 <= int(parts[1]) <= 65535
+    )
+
+
+def _find_at_hostport_end(raw_parts: list[str], start_idx: int, allow_bare_host: bool = False) -> int:
+    for j in range(start_idx, len(raw_parts)):
+        pj = raw_parts[j].strip()
+        if "://" in pj:
+            break
+        if "@" in pj:
+            _, _, hp = pj.rpartition("@")
+            if _has_valid_any_hostport(hp) or (
+                allow_bare_host and _SINGLE_OR_MULTI_HOST_RE.match(hp.strip("'\"/ "))
+            ):
+                return j
+            break
+        if pj and _is_standalone_proxy_token(pj):
+            break
+    return -1
+
+
+def split_proxy_list(raw: str) -> list[str]:
+    """Pecah daftar proxy dipisah koma tanpa memotong koma literal di dalam password."""
+    if not raw or not raw.strip():
+        return []
+    raw_parts = raw.split(",")
+    if len(raw_parts) == 1:
+        s0 = raw_parts[0].strip()
+        return [s0] if s0 else []
+    merged: list[str] = []
+    i = 0
+    n = len(raw_parts)
+    while i < n:
+        cur = raw_parts[i]
+        while i + 1 < n:
+            nxt = raw_parts[i + 1]
+            cur_s = cur.strip()
+            nxt_s = nxt.strip()
+            if not cur_s:
+                break
+            if cur_s[0] in ("'", '"') and (len(cur_s) == 1 or cur_s[-1] != cur_s[0]):
+                cur = cur + "," + nxt
+                i += 1
+                continue
+            if ":" in cur_s and not _is_standalone_proxy_token(cur_s):
+                found_k = _find_at_hostport_end(raw_parts, i + 1, allow_bare_host="://" in cur_s)
+                if found_k != -1:
+                    cur = ",".join([cur, *raw_parts[i + 1 : found_k + 1]])
+                    i = found_k
+                    continue
+            if (
+                nxt_s
+                and _is_shorthand_with_creds(cur_s)
+                and "://" not in nxt_s
+                and "@" not in nxt_s
+                and not _is_standalone_proxy_token(nxt_s)
+                and not (":" in nxt_s and _find_at_hostport_end(raw_parts, i + 2) != -1)
+            ):
+                cur = cur + "," + nxt
+                i += 1
+                continue
+            break
+        if cur.strip():
+            merged.append(cur.strip())
+        i += 1
+    return merged
 
 
 def _has_valid_port_suffix(hostport: str) -> bool:
@@ -551,17 +702,38 @@ def redact_proxy_creds(text: str) -> str:
 _NAT64_WELL_KNOWN = ipaddress.IPv6Network("64:ff9b::/96")
 _NAT64_LOCAL_USE = ipaddress.IPv6Network("64:ff9b:1::/48")
 _SIIT_IPV4_TRANSLATED = ipaddress.IPv6Network("::ffff:0:0/96")
+# Cloud IMDS non-169.254 & blok khusus IETF/benchmarking/dokumentasi yang selalu ditolak
+# (di Python 3.9 `192.0.0.192` Oracle IMDS berstatus `is_global=True`, dan `100.100.100.200`
+# Alibaba IMDS berada di CGNAT `100.64.0.0/10` dengan `is_private=False` & `is_reserved=False`).
+_SPECIAL_DISALLOWED_PROXY_V4_NETS = (
+    ipaddress.IPv4Network("100.100.100.200/32"),  # Alibaba Cloud IMDS
+    ipaddress.IPv4Network("192.0.0.0/24"),        # IETF Protocol Assignments + Oracle Cloud IMDS (192.0.0.192)
+    ipaddress.IPv4Network("198.18.0.0/15"),       # RFC 2544 network benchmark
+    ipaddress.IPv4Network("192.0.2.0/24"),        # RFC 5737 TEST-NET-1
+    ipaddress.IPv4Network("198.51.100.0/24"),     # RFC 5737 TEST-NET-2
+    ipaddress.IPv4Network("203.0.113.0/24"),      # RFC 5737 TEST-NET-3
+)
+_SPECIAL_DISALLOWED_PROXY_V6_NETS = (
+    ipaddress.IPv6Network("fd00:ec2::254/128"),   # AWS EC2 IPv6 IMDSv2
+    ipaddress.IPv6Network("2001:db8::/32"),       # RFC 3849 documentation
+    ipaddress.IPv6Network("100::/64"),            # RFC 6666 discard-only
+)
 
 
 def _is_disallowed_proxy_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     """True bila IP (atau IPv4 tertanam di IPv6 mapped/6to4/teredo/NAT64/SIIT) tidak aman untuk proxy."""
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        return _is_disallowed_proxy_ip(ip.ipv4_mapped)
     if ip.is_loopback or ip.is_link_local or ip.is_unspecified or ip.is_multicast or ip.is_reserved:
         return True
-    # RFC 1122 0.0.0.0/8 ("this network") — pada Linux dapat merutekan ke host lokal.
-    if isinstance(ip, ipaddress.IPv4Address) and ip.packed[0] == 0:
-        return True
-    if isinstance(ip, ipaddress.IPv6Address):
-        if ip.ipv4_mapped is not None and _is_disallowed_proxy_ip(ip.ipv4_mapped):
+    if isinstance(ip, ipaddress.IPv4Address):
+        # RFC 1122 0.0.0.0/8 ("this network") — pada Linux dapat merutekan ke host lokal.
+        if ip.packed[0] == 0:
+            return True
+        if any(ip in net for net in _SPECIAL_DISALLOWED_PROXY_V4_NETS):
+            return True
+    elif isinstance(ip, ipaddress.IPv6Address):
+        if any(ip in net for net in _SPECIAL_DISALLOWED_PROXY_V6_NETS):
             return True
         if ip.sixtofour is not None and _is_disallowed_proxy_ip(ip.sixtofour):
             return True
@@ -573,6 +745,8 @@ def _is_disallowed_proxy_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -
             embedded_v4 = ipaddress.IPv4Address(ip.packed[12:16])
             if _is_disallowed_proxy_ip(embedded_v4):
                 return True
+    if not ALLOW_PRIVATE_PROXY_IPS and (ip.is_private or not ip.is_global):
+        return True
     return False
 
 
@@ -632,7 +806,7 @@ def validate_proxy_url(raw: str) -> str:
         host_fmt = host_clean
     userinfo, sep, hostport = parsed.netloc.rpartition("@")
     if sep:
-        if not userinfo or userinfo == ":":
+        if not userinfo or userinfo.startswith(":") or userinfo.endswith(":"):
             raise ValueError("kredensial userinfo proxy kosong")
         # Tolak `;` mentah (divergensi urlparse Python <3.12 vs 3.12+), quote, `<>`, `[]`, `@`,
         # serta `%` yang bukan `%XX` valid; seragamkan hex `%XX` menjadi huruf besar.
@@ -688,7 +862,7 @@ def _canon_static_proxy(raw: str) -> str:
 # Deterministik per auth_token. Kosong = no proxy (direct).
 _proxy_raw = os.environ.get("PROXY_LIST", "").strip()
 PROXY_LIST: tuple[str, ...] = tuple(
-    c for p in _proxy_raw.split(",") if (c := _canon_static_proxy(p))
+    c for p in split_proxy_list(_proxy_raw) if (c := _canon_static_proxy(p))
 ) if _proxy_raw else tuple()
 
 

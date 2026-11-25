@@ -2637,3 +2637,101 @@ async def test_pass37_captive_portal_warm_tid_client_direct_fallback_and_chat_me
     )
     json_clean_44 = jfmt.format(rec_clean_44)
     assert "getMessage" not in json_clean_44 and "sec44" not in json_clean_44
+
+
+@pytest.mark.asyncio
+async def test_pass45_ssrf_cloud_imds_private_proxy_comma_password_and_router_fallbacks(monkeypatch):
+    """Pass 45: block Cloud IMDS (Alibaba 100.100.100.200, Oracle 192.0.0.192, AWS IPv6 fd00:ec2::254)
+    & private/CGNAT/ULA IPs unless ALLOW_PRIVATE_PROXY_IPS=1; reject broken userinfo colons (`usr:@` / `:pass@`);
+    preserve commas inside proxy passwords via `split_proxy_list`; and prevent dead-proxy fallbacks on
+    bookmarks/unblock/dm_block/dm_accept."""
+    import app.config as cfg
+    from app.config import normalize_proxy_input, split_proxy_list, validate_proxy_url
+    from app.routers.bookmarks import BookmarkBody, v2_bookmark, v2_unbookmark
+    from app.routers.dm import _accept_dm_conversation, v2_dm_block
+    from app.routers.users import v2_unblock
+
+    # 1. Cloud IMDS & non-global/private SSRF blocked by default
+    for ssrf_px in (
+        "http://100.100.100.200:80",          # Alibaba Cloud IMDS (CGNAT 100.64/10)
+        "http://192.0.0.192:80",              # Oracle Cloud IMDS (is_global=True in Python 3.9!)
+        "http://[fd00:ec2::254]:80",          # AWS EC2 IPv6 IMDSv2
+        "http://192.168.10.19:8001",          # LAN / local service SSRF
+        "http://172.17.0.1:2375",             # Docker bridge SSRF
+        "http://10.0.0.1:8080",               # RFC 1918
+        "http://100.64.1.2:8080",             # CGNAT
+        "http://198.18.0.1:8080",             # RFC 2544
+        "http://198.51.100.10:8080",          # TEST-NET-2
+        "http://[2001:db8::1]:8080",          # RFC 3849
+        "http://[::ffff:192.168.10.19]:8001", # IPv4-mapped private IP
+        "http://[2002:c0a8:0a13::1]:8001",    # 6to4-wrapped private IP
+    ):
+        with pytest.raises(ValueError):
+            validate_proxy_url(ssrf_px)
+
+    # IPv4-mapped public IP remains valid (and canonicalizes RFC 5952 hex); ALLOW_PRIVATE_PROXY_IPS=1 allows LAN Squid while still blocking IMDS!
+    assert validate_proxy_url("http://[::ffff:31.6.46.27]:12323") == "http://[::ffff:1f06:2e1b]:12323"
+    assert validate_proxy_url("http://[::ffff:1f06:2e1b]:12323") == "http://[::ffff:1f06:2e1b]:12323"
+    monkeypatch.setattr(cfg, "ALLOW_PRIVATE_PROXY_IPS", True)
+    assert validate_proxy_url("http://192.168.10.50:3128") == "http://192.168.10.50:3128"
+    for always_bad in ("http://100.100.100.200:80", "http://192.0.0.192:80", "http://[fd00:ec2::254]:80", "http://127.0.0.1:3128"):
+        with pytest.raises(ValueError):
+            validate_proxy_url(always_bad)
+    monkeypatch.setattr(cfg, "ALLOW_PRIVATE_PROXY_IPS", False)
+
+    # 2. Broken half-empty userinfo rejected while single-token auth preserved
+    assert validate_proxy_url("http://mytoken@31.6.46.27:12323") == "http://mytoken@31.6.46.27:12323"
+    for broken_ui in ("http://usr:@31.6.46.27:12323", "http://:pass@31.6.46.27:12323", "http://:@31.6.46.27:12323"):
+        with pytest.raises(ValueError):
+            validate_proxy_url(broken_ui)
+
+    # 3. Comma-in-password preserved across split_proxy_list + normalize + validate
+    split_res = split_proxy_list("http://u:a,b,c@31.6.46.27:12323,31.6.46.27:12323:u2:pa,ss,u3:x,y@1.2.3.4:8080")
+    assert split_res == [
+        "http://u:a,b,c@31.6.46.27:12323",
+        "31.6.46.27:12323:u2:pa,ss",
+        "u3:x,y@1.2.3.4:8080",
+    ]
+    assert [validate_proxy_url(normalize_proxy_input(x)) for x in split_res] == [
+        "http://u:a%2Cb%2Cc@31.6.46.27:12323",
+        "http://u2:pa%2Css@31.6.46.27:12323",
+        "http://u3:x%2Cy@1.2.3.4:8080",
+    ]
+
+    # 4. Dead-proxy 404 (e.g. Squid/Nginx proxy error page) does NOT cascade into browser/secondary calls
+    tok = "a" * 40
+    dead_404 = {"status": "error", "http_status": 404, "error": "upstream request failed: ProxyError", "data": None}
+    pw_click_spy = AsyncMock()
+    rest_spy = AsyncMock()
+    dm_spy = AsyncMock(side_effect=[dead_404, {"status": "ok", "http_status": 200, "data": {}}])
+
+    with (
+        patch("app.routers.bookmarks.graphql_call", AsyncMock(return_value=dead_404)),
+        patch("app.routers.bookmarks.click_action_via_browser", pw_click_spy),
+    ):
+        r_bm = await v2_bookmark(body=BookmarkBody(tweet_id="123"), user_id="1", authorization=f"Bearer {tok}", auth_token=None, raw=0)
+        r_unbm = await v2_unbookmark(user_id="1", tweet_id="123", authorization=f"Bearer {tok}", auth_token=None, raw=0)
+    assert r_bm.status_code == 404 and r_unbm.status_code == 404
+    assert pw_click_spy.await_count == 0
+
+    with (
+        patch("app.routers.users.rest_call", AsyncMock(return_value=dead_404)),
+        patch("app.routers.users.click_action_via_browser", pw_click_spy),
+    ):
+        r_unblk = await v2_unblock(source_user_id="1", target_user_id="2", authorization=f"Bearer {tok}", auth_token=None, raw=0)
+    assert r_unblk.status_code == 404
+    assert pw_click_spy.await_count == 0
+
+    with (
+        patch("app.routers.dm._resolve_me_or_error", AsyncMock(return_value=("1", None))),
+        patch("app.routers.dm.dm_call", AsyncMock(return_value=dead_404)),
+        patch("app.routers.dm.rest_call", rest_spy),
+    ):
+        r_dmblk = await v2_dm_block(user_id="2", authorization=f"Bearer {tok}", auth_token=None, raw=0)
+    assert r_dmblk.status_code == 404
+    assert rest_spy.await_count == 0
+
+    with patch("app.routers.dm.dm_call", dm_spy):
+        r_acc = await _accept_dm_conversation("1-2", tok, 0)
+    assert r_acc.status_code == 404
+    assert dm_spy.await_count == 1

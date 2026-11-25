@@ -1728,3 +1728,144 @@ async def test_pass26_xchat_nav_407_eviction_schemeless_at_redaction_and_tid_cap
         mock_bs.return_value = sess_inst
         await tp._refresh(tok)
     assert tp._ct == "CT_AFTER_CAPTIVE"
+
+
+# ── 36. Pass 28: DM resolve_me_id WarmNetworkError (no false 401), strict userinfo `;`/quote validation, & fetch_dm_pin._download_ton ──
+
+@pytest.mark.asyncio
+async def test_pass28_dm_resolve_me_warm_error_no_false_401_userinfo_semicolon_and_ton_cli():
+    from contextlib import asynccontextmanager
+    from app.auth import InvalidTokenError, WarmNetworkError
+    from app.config import normalize_proxy_input, validate_proxy_url
+    from app.response_cache import ResponseCache
+    from app.routers.dm import DMSendBody, v2_dm_block, v2_dm_send, v2_dm_send_to_conv, v2_dm_with_user_events
+    import fetch_dm_pin
+
+    tok = "d" * 40
+
+    # 1. Strict RFC 3986 userinfo charset rejects raw `;` (Python <3.12 vs 3.12+ divergence), quotes, and `<>`,
+    #    while normalize_proxy_input encodes them cleanly and canonicalizes %XX hex + uncompressed IPv6.
+    for bad_ui in (
+        "http://user:p;ass@31.6.46.27:12323",
+        "http://user:p'ass@31.6.46.27:12323",
+        'http://user:p"ass@31.6.46.27:12323',
+        "http://user:p<ass>@31.6.46.27:12323",
+    ):
+        with pytest.raises(ValueError):
+            validate_proxy_url(bad_ui)
+    assert validate_proxy_url(normalize_proxy_input("http://user:p;ass@31.6.46.27:12323")) == (
+        "http://user:p%3Bass@31.6.46.27:12323"
+    )
+    assert validate_proxy_url("http://user:p%3ass@31.6.46.27:12323") == "http://user:p%3Ass@31.6.46.27:12323"
+    assert normalize_proxy_input("[2606:4700:0:0::ABCD]:08080:user:pass") == "http://user:pass@[2606:4700::abcd]:8080"
+
+    # 2. Proxy WarmNetworkError inside resolve_me_id MUST return 502/429 (NEVER false 401 Unauthorized!) across DM routes
+    @asynccontextmanager
+    async def _warm_err_pool(_t):
+        yield MagicMock()
+
+    with (
+        patch("app.auth.pooled_client", _warm_err_pool),
+        patch("app.auth.warm_session", AsyncMock(side_effect=WarmNetworkError("proxy 407 auth failed", http_status=502))),
+    ):
+        r_send = await v2_dm_send(participant_id="222", body=DMSendBody(text="hi"), dm_pin=None, x_dm_pin=None, authorization=f"Bearer {tok}", auth_token=None, raw=0)
+        r_hist = await v2_dm_with_user_events(
+            participant_id="222", max_results=10, pagination_token=None, event_types=None,
+            dm_event_fields=None, expansions=None, media_fields=None, user_fields=None,
+            tweet_fields=None, mode="auto", dm_pin=None, x_dm_pin=None,
+            authorization=f"Bearer {tok}", auth_token=None, raw=0,
+        )
+        r_blk = await v2_dm_block(user_id="222", authorization=f"Bearer {tok}", auth_token=None, raw=0)
+    assert r_send.status_code == 502
+    assert r_hist.status_code == 502
+    assert r_blk.status_code == 502
+
+    with (
+        patch("app.auth.pooled_client", _warm_err_pool),
+        patch("app.auth.warm_session", AsyncMock(side_effect=WarmNetworkError("rate limited", http_status=429))),
+    ):
+        r_429 = await v2_dm_with_user_events(
+            participant_id="222", max_results=10, pagination_token=None, event_types=None,
+            dm_event_fields=None, expansions=None, media_fields=None, user_fields=None,
+            tweet_fields=None, mode="auto", dm_pin=None, x_dm_pin=None,
+            authorization=f"Bearer {tok}", auth_token=None, raw=0,
+        )
+    assert r_429.status_code == 429
+
+    # 2b. v2_dm_send_to_conv falls back to send_xchat_dm_via_browser when dm_pin is present and resolve_me_id hits WarmNetworkError
+    with (
+        patch("app.auth.pooled_client", _warm_err_pool),
+        patch("app.auth.warm_session", AsyncMock(side_effect=WarmNetworkError("CF 403 on proxy", http_status=403))),
+        patch("app.routers.dm.send_xchat_dm_via_browser", AsyncMock(return_value={"status": "ok", "data": {"dm_event_id": "e2ee_1"}})),
+    ):
+        r_conv_e2ee = await v2_dm_send_to_conv(
+            conversation_id="111-222", body=DMSendBody(text="hi"), dm_pin=None,
+            x_dm_pin="1234", authorization=f"Bearer {tok}", auth_token=None, raw=0,
+        )
+    assert r_conv_e2ee.status_code == 201
+
+    # 2c. Genuine InvalidTokenError still returns 401 AND evicts ResponseCache
+    rc = ResponseCache.get()
+    await rc.store("UserByRestId", {"userId": "99"}, tok, {"status": "ok", "data": {"data": {"user": {"id": "99"}}}})
+    with (
+        patch("app.auth.pooled_client", _warm_err_pool),
+        patch("app.auth.warm_session", AsyncMock(side_effect=InvalidTokenError(401, "expired", {}, ""))),
+    ):
+        r_401 = await v2_dm_block(user_id="222", authorization=f"Bearer {tok}", auth_token=None, raw=0)
+    assert r_401.status_code == 401
+    assert (await rc.lookup("UserByRestId", {"userId": "99"}, tok)) is None
+
+    # 3. fetch_dm_pin._download_ton auto-rewarms on cached 403 & redacts proxy credentials on transport failure
+    ton_calls = 0
+
+    class _CliTonSess:
+        def __init__(self):
+            self.cookies = MagicMock()
+        async def get(self, url, headers=None):
+            nonlocal ton_calls
+            ton_calls += 1
+            if ton_calls == 1:
+                return MagicMock(status_code=403, headers={})
+            return MagicMock(status_code=200, content=b"IMGBYTES", headers={"content-type": "image/png"})
+
+    @asynccontextmanager
+    async def _cli_ton_pool(_t):
+        yield _CliTonSess()
+
+    cli_lks = 0
+    async def _cli_lk(_t):
+        nonlocal cli_lks
+        cli_lks += 1
+        return ("ct0_c", {}) if cli_lks == 1 else None
+
+    with (
+        patch.object(fetch_dm_pin.SessionStore, "get", return_value=MagicMock(lookup=_cli_lk, invalidate=AsyncMock())),
+        patch.object(fetch_dm_pin.ClientPool, "get", return_value=MagicMock(invalidate=AsyncMock())),
+        patch.object(fetch_dm_pin, "pooled_client", _cli_ton_pool),
+        patch.object(fetch_dm_pin, "warm_session", AsyncMock(side_effect=[("ct0_c", {"twid": "u%3D1"}), ("ct0_f", {"twid": "u%3D1"})])),
+    ):
+        data_ok, mime_ok = await fetch_dm_pin._download_ton(tok, "https://ton.x.com/1.1/ton/data/dm/1/2/a.png")
+    assert data_ok == b"IMGBYTES"
+    assert mime_ok == "image/png"
+    assert ton_calls == 2
+
+    class _CliErrSess:
+        def __init__(self):
+            self.cookies = MagicMock()
+        async def get(self, url, headers=None):
+            raise ConnectionError("connect via http://usr:topsecret@31.6.46.27:12323 failed")
+
+    @asynccontextmanager
+    async def _cli_err_pool(_t):
+        yield _CliErrSess()
+
+    with (
+        patch.object(fetch_dm_pin.SessionStore, "get", return_value=MagicMock(lookup=AsyncMock(return_value=None), invalidate=AsyncMock())),
+        patch.object(fetch_dm_pin.ClientPool, "get", return_value=MagicMock(invalidate=AsyncMock())),
+        patch.object(fetch_dm_pin, "pooled_client", _cli_err_pool),
+        patch.object(fetch_dm_pin, "warm_session", AsyncMock(return_value=("ct0_f", {}))),
+    ):
+        data_err, reason_err = await fetch_dm_pin._download_ton(tok, "https://ton.x.com/1.1/ton/data/dm/1/2/a.png")
+    assert data_err is None
+    assert "topsecret" not in reason_err
+    assert "***@31.6.46.27:12323" in reason_err

@@ -6,6 +6,8 @@ Session di-cache (SessionStore) supaya tidak round-trip tiap request.
 
 from __future__ import annotations
 
+import contextvars
+import inspect
 import json
 import re
 from typing import Any, Optional
@@ -58,6 +60,34 @@ class WarmNetworkError(Exception):
         self.message = message
         self.http_status = http_status
         self.no_retry = no_retry
+
+
+_LAST_RESOLVE_ME_WARM_ERR: contextvars.ContextVar[Optional[WarmNetworkError]] = contextvars.ContextVar(
+    "xapi_last_resolve_me_warm_err", default=None
+)
+
+
+def get_last_resolve_me_warm_error() -> Optional[WarmNetworkError]:
+    return _LAST_RESOLVE_ME_WARM_ERR.get()
+
+
+def clear_last_resolve_me_warm_error() -> None:
+    _LAST_RESOLVE_ME_WARM_ERR.set(None)
+
+
+async def _evict_invalid_token_state(auth_token: str) -> None:
+    from .response_cache import ResponseCache
+    ResponseCache.get().invalidate_token(auth_token)
+    store = SessionStore.get()
+    if hasattr(store, "invalidate"):
+        inv_s = store.invalidate(auth_token, all_proxies=True)
+        if inspect.isawaitable(inv_s):
+            await inv_s
+    cp = ClientPool.get()
+    if hasattr(cp, "invalidate"):
+        inv_c = cp.invalidate(auth_token, all_proxies=True)
+        if inspect.isawaitable(inv_c):
+            await inv_c
 
 
 # ──────────────────────────── Helpers ────────────────────────────
@@ -263,6 +293,7 @@ async def warm_session(
     ct0 = server_ct0_value or jar.get("ct0", "")
 
     if not jar.get("twid"):
+        await _evict_invalid_token_state(auth_token)
         raise InvalidTokenError(
             http_status=401,
             message="auth_token expired atau tidak valid (server tidak set cookie 'twid')",
@@ -305,6 +336,7 @@ async def login_with_auth_token(auth_token: str, *, _rewarm_retry: bool = False)
         try:
             ct0, _ = await warm_session(client, auth_token)
         except InvalidTokenError as e:
+            await _evict_invalid_token_state(auth_token)
             return {
                 "status": "invalid",
                 "http_status": e.http_status,
@@ -451,10 +483,15 @@ async def login_with_auth_token(auth_token: str, *, _rewarm_retry: bool = False)
 
 async def resolve_me_id(auth_token: str) -> Optional[str]:
     """Resolve current user_id dari cookie twid (no Viewer call)."""
+    _LAST_RESOLVE_ME_WARM_ERR.set(None)
     async with pooled_client(auth_token) as client:
         try:
             await warm_session(client, auth_token)
-        except (InvalidTokenError, WarmNetworkError):
+        except InvalidTokenError:
+            await _evict_invalid_token_state(auth_token)
+            return None
+        except WarmNetworkError as e:
+            _LAST_RESOLVE_ME_WARM_ERR.set(e)
             return None
         jar = {c.name: c.value for c in client.cookies.jar}
         return extract_user_id_from_twid(jar.get("twid"))

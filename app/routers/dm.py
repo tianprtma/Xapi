@@ -44,8 +44,10 @@ from tid_provider import TIDProvider
 
 from ..auth import (
     InvalidTokenError,
+    clear_last_resolve_me_warm_error,
     extract_bearer,
     extract_user_id_from_twid,
+    get_last_resolve_me_warm_error,
     login_with_auth_token,
     make_client,
     resolve_me_id,
@@ -114,6 +116,39 @@ async def v2_chat_keys(conversation_id: str = PathParam(..., pattern=r"^\d+$")) 
 @router.post("/2/chat/conversations/{conversation_id}/members")
 async def v2_chat_members(conversation_id: str = PathParam(..., pattern=r"^\d+$")) -> JSONResponse:
     return stub_501(feature="chat_members", reason=OAUTH2_USER_CTX_REASON)
+
+
+async def _resolve_me_or_error(
+    tok: str,
+    *,
+    raw: int = 0,
+    is_write: bool = True,
+    unauth_detail: str = "auth_token invalid/expired",
+) -> tuple[Optional[str], Optional[JSONResponse]]:
+    """Resolve `me` tanpa menyalahartikan `WarmNetworkError` (proxy timeout/407/403/502)
+    sebagai `401 Unauthorized` palsu yang dapat mengkarantina token sehat."""
+    clear_last_resolve_me_warm_error()
+    me = await resolve_me_id(tok)
+    if me:
+        clear_last_resolve_me_warm_error()
+        return me, None
+    warm_err = get_last_resolve_me_warm_error()
+    clear_last_resolve_me_warm_error()
+    if warm_err is not None:
+        raw_st = getattr(warm_err, "http_status", 502)
+        st = raw_st if isinstance(raw_st, int) and raw_st >= 400 else 502
+        err_msg = f"warm-up failed: {warm_err.message}"
+        if raw:
+            return None, wrap({"status": "error", "http_status": st, "error": err_msg, "data": None})
+        out_st = (429 if st == 429 else 502) if not is_write else (st if st in (403, 429) else 502)
+        return None, JSONResponse(
+            status_code=out_st,
+            content=format_error("Upstream Error", err_msg, "upstream_error", out_st),
+        )
+    return None, JSONResponse(
+        status_code=401,
+        content=format_error("Unauthorized", unauth_detail, "unauthorized", 401),
+    )
 
 
 @router.post("/2/chat/conversations/{conversation_id}/messages")
@@ -1265,12 +1300,14 @@ async def v2_dm_with_user_events(
     """
     tok = extract_bearer(authorization, auth_token)
     pin = resolve_dm_pin(dm_pin, x_dm_pin)
-    me = await resolve_me_id(tok)
-    if not me:
-        return JSONResponse(
-            status_code=401,
-            content=format_error("Unauthorized", "Cannot resolve owner user_id from auth_token", "unauthorized", 401),
-        )
+    me, err_resp = await _resolve_me_or_error(
+        tok,
+        raw=raw,
+        is_write=False,
+        unauth_detail="Cannot resolve owner user_id from auth_token",
+    )
+    if err_resp is not None:
+        return err_resp
     conv_id = dm_conv_id_for(me, participant_id)
     gql_conv_id = conv_id.replace("-", ":")
     result: dict[str, Any] = {}
@@ -1360,6 +1397,10 @@ async def v2_dm_media_proxy(
             try:
                 ct0, cookies = await warm_session(client, tok)
             except InvalidTokenError as e:
+                from ..response_cache import ResponseCache
+                ResponseCache.get().invalidate_token(tok)
+                await SessionStore.get().invalidate(tok, all_proxies=True)
+                await ClientPool.get().invalidate(tok, all_proxies=True)
                 return JSONResponse(
                     status_code=401,
                     content=format_error("Unauthorized", e.message, "unauthorized", 401),
@@ -1432,12 +1473,9 @@ async def v2_dm_conv_create(
             status_code=400,
             content=format_error("Bad Request", "message.text required", "bad_request", 400),
         )
-    me = await resolve_me_id(tok)
-    if not me:
-        return JSONResponse(
-            status_code=401,
-            content=format_error("Unauthorized", "auth_token invalid/expired", "unauthorized", 401),
-        )
+    me, err_resp = await _resolve_me_or_error(tok, raw=raw, is_write=True)
+    if err_resp is not None:
+        return err_resp
 
     payload = build_dm_new2_payload(
         me=me,
@@ -1477,12 +1515,9 @@ async def v2_dm_send(
     """
     tok = extract_bearer(authorization, auth_token)
     pin = resolve_dm_pin(dm_pin, x_dm_pin)
-    me = await resolve_me_id(tok)
-    if not me:
-        return JSONResponse(
-            status_code=401,
-            content=format_error("Unauthorized", "auth_token invalid/expired", "unauthorized", 401),
-        )
+    me, err_resp = await _resolve_me_or_error(tok, raw=raw, is_write=True)
+    if err_resp is not None:
+        return err_resp
     media_id = body.media_id
     if not media_id and body.attachments:
         media_id = (body.attachments[0] or {}).get("media_id")
@@ -1537,16 +1572,17 @@ async def v2_dm_send_to_conv(
     """
     tok = extract_bearer(authorization, auth_token)
     pin = resolve_dm_pin(dm_pin, x_dm_pin)
-    me = await resolve_me_id(tok)
-    if not me:
-        return JSONResponse(
-            status_code=401,
-            content=format_error("Unauthorized", "auth_token invalid/expired", "unauthorized", 401),
-        )
+    norm_conv_id = conversation_id.replace(":", "-")
+    me, err_resp = await _resolve_me_or_error(tok, raw=raw, is_write=True)
+    if err_resp is not None:
+        if pin and err_resp.status_code != 401:
+            pw_res = await send_xchat_dm_via_browser(tok, pin, norm_conv_id, body.text)
+            if pw_res.get("status") == "ok":
+                return JSONResponse(status_code=201, content={"data": pw_res.get("data")})
+        return err_resp
     media_id = body.media_id
     if not media_id and body.attachments:
         media_id = (body.attachments[0] or {}).get("media_id")
-    norm_conv_id = conversation_id.replace(":", "-")
     payload = build_dm_new2_payload(
         me=me,
         conv_id=norm_conv_id,
@@ -1613,12 +1649,9 @@ async def v2_dm_block(
     Backend: REST 1.1 dm/conversation/disable.json (action=block).
     """
     tok = extract_bearer(authorization, auth_token)
-    me = await resolve_me_id(tok)
-    if not me:
-        return JSONResponse(
-            status_code=401,
-            content=format_error("Unauthorized", "auth_token invalid/expired", "unauthorized", 401),
-        )
+    me, err_resp = await _resolve_me_or_error(tok, raw=raw, is_write=True)
+    if err_resp is not None:
+        return err_resp
     conv_id = dm_conv_id_for(me, user_id)
     result = await dm_call(
         "dm/conversation/disable.json",
@@ -1653,12 +1686,9 @@ async def v2_dm_unblock(
     Backend: REST 1.1 dm/conversation/accept.json
     """
     tok = extract_bearer(authorization, auth_token)
-    me = await resolve_me_id(tok)
-    if not me:
-        return JSONResponse(
-            status_code=401,
-            content=format_error("Unauthorized", "auth_token invalid/expired", "unauthorized", 401),
-        )
+    me, err_resp = await _resolve_me_or_error(tok, raw=raw, is_write=True)
+    if err_resp is not None:
+        return err_resp
     conv_id = dm_conv_id_for(me, user_id)
     result = await dm_call(
         "dm/conversation/accept.json",
@@ -1760,12 +1790,9 @@ async def v2_dm_with_user_accept(
     — Approve / terima DM message request dari user tertentu (`participant_id`).
     """
     tok = extract_bearer(authorization, auth_token)
-    me = await resolve_me_id(tok)
-    if not me:
-        return JSONResponse(
-            status_code=401,
-            content=format_error("Unauthorized", "auth_token invalid/expired", "unauthorized", 401),
-        )
+    me, err_resp = await _resolve_me_or_error(tok, raw=raw, is_write=True)
+    if err_resp is not None:
+        return err_resp
     conv_id = dm_conv_id_for(me, participant_id)
     return await _accept_dm_conversation(conv_id, tok, raw)
 
@@ -1802,11 +1829,8 @@ async def v2_dm_with_user_delete(
     — Reject / hapus DM message request atau percakapan 1-on-1 dengan user tertentu (`participant_id`).
     """
     tok = extract_bearer(authorization, auth_token)
-    me = await resolve_me_id(tok)
-    if not me:
-        return JSONResponse(
-            status_code=401,
-            content=format_error("Unauthorized", "auth_token invalid/expired", "unauthorized", 401),
-        )
+    me, err_resp = await _resolve_me_or_error(tok, raw=raw, is_write=True)
+    if err_resp is not None:
+        return err_resp
     conv_id = dm_conv_id_for(me, participant_id)
     return await _delete_dm_conversation(conv_id, tok, raw)

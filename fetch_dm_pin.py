@@ -37,10 +37,18 @@ if _ENV_FILE.is_file():
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from app.auth import api_headers, login_with_auth_token, resolve_me_id, warm_session  # noqa: E402
-from app.client_pool import pooled_client  # noqa: E402
+from app.auth import InvalidTokenError, WarmNetworkError, api_headers, login_with_auth_token, resolve_me_id, warm_session  # noqa: E402
+from app.client_pool import ClientPool, pooled_client  # noqa: E402
 from app.clients import dm_call, graphql_call  # noqa: E402
-from app.config import normalize_proxy_input, reset_request_proxy, set_request_proxy, validate_proxy_url  # noqa: E402
+from app.config import (  # noqa: E402
+    normalize_proxy_input,
+    redact_proxy_creds,
+    reset_request_proxy,
+    set_request_proxy,
+    validate_proxy_url,
+)
+from app.response_cache import ResponseCache  # noqa: E402
+from session_cache import SessionStore  # noqa: E402
 from app.xchat_e2ee import (  # noqa: E402
     get_cached_e2ee_media,
     resolve_dm_pin,
@@ -62,15 +70,48 @@ _MIME_EXT = {
 
 async def _download_ton(tok: str, url: str):
     """Unduh media ton.x.com memakai session ber-cookie (pola sama dengan
-    proxy endpoint di app/routers/dm.py)."""
-    async with pooled_client(tok) as client:
-        ct0, _ = await warm_session(client, tok)
-        hdrs = api_headers(ct0, tok)
-        hdrs.pop("content-type", None)
-        resp = await client.get(url, headers=hdrs)
-        if resp.status_code == 200:
-            return resp.content, (resp.headers.get("content-type") or "").lower()
-        return None, f"HTTP {resp.status_code}"
+    proxy endpoint di app/routers/dm.py, lengkap dengan 1x auto-rewarm proxy berotasi)."""
+    resp = None
+    for _attempt in range(2):
+        had_cached_session = (await SessionStore.get().lookup(tok)) is not None
+        async with pooled_client(tok) as client:
+            try:
+                ct0, cookies = await warm_session(client, tok)
+            except InvalidTokenError as e:
+                ResponseCache.get().invalidate_token(tok)
+                await SessionStore.get().invalidate(tok, all_proxies=True)
+                await ClientPool.get().invalidate(tok, all_proxies=True)
+                return None, redact_proxy_creds(f"HTTP 401: {e.message}")
+            except WarmNetworkError as e:
+                return None, redact_proxy_creds(f"warm-up failed: {e.message}")
+            for k, v in (cookies or {}).items():
+                client.cookies.set(k, v, domain=".x.com")
+                client.cookies.set(k, v, domain=".twitter.com")
+            hdrs = {**api_headers(ct0, tok), "referer": "https://x.com/messages"}
+            hdrs.pop("content-type", None)
+            try:
+                resp = await client.get(url, headers=hdrs)
+            except Exception as exc:  # noqa: BLE001
+                await ClientPool.get().invalidate(tok, all_proxies=False)
+                if _attempt == 0:
+                    continue
+                return None, redact_proxy_creds(f"{type(exc).__name__}: {exc}")
+            if resp.status_code == 200:
+                return resp.content, (resp.headers.get("content-type") or "").lower()
+            if resp.status_code in (401, 403):
+                all_p = resp.status_code == 401
+                if all_p:
+                    ResponseCache.get().invalidate_token(tok)
+                await SessionStore.get().invalidate(tok, all_proxies=all_p)
+                await ClientPool.get().invalidate(tok, all_proxies=all_p)
+                if _attempt == 0 and had_cached_session:
+                    continue
+            elif resp.status_code in (402, 407, 502, 503, 504):
+                await ClientPool.get().invalidate(tok, all_proxies=False)
+                if _attempt == 0 and resp.status_code in (502, 503, 504):
+                    continue
+            break
+    return None, f"HTTP {resp.status_code if resp is not None else 502}"
 
 
 async def _save_media(events, conv_id: str, out_dir: Path, tok: str) -> list[str]:

@@ -335,6 +335,7 @@ _VALID_PROXY_HOST_RE = _re.compile(r"^[a-z0-9.:-]+$")
 _HEX_LABEL_RE = _re.compile(r"^0x[0-9a-f]+$")
 _PCT_HEX_RE = _re.compile(r"%[0-9A-Fa-f]{2}")
 _BAD_PCT_RE = _re.compile(r"%(?![0-9A-Fa-f]{2})")
+_VALID_USERINFO_RE = _re.compile(r"^[A-Za-z0-9._~%!$&()*+,:=-]+$")
 _SAFE_USERINFO_CHARS = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
 )
@@ -348,7 +349,7 @@ def _encode_userinfo_component(raw_part: str) -> str:
     while i < n:
         ch = raw_part[i]
         if ch == "%" and i + 2 < n and _PCT_HEX_RE.match(raw_part, i):
-            out.append(raw_part[i : i + 3])
+            out.append(raw_part[i : i + 3].upper())
             i += 3
             continue
         if ch in _SAFE_USERINFO_CHARS:
@@ -367,15 +368,24 @@ def _encode_userinfo(userinfo: str) -> str:
     return _encode_userinfo_component(userinfo)
 
 
+def _canon_ipv6_bracket(hb: str) -> str:
+    raw_v6 = hb[1:] if hb.startswith("[") else hb
+    try:
+        return f"[{ipaddress.IPv6Address(raw_v6)}]"
+    except ValueError:
+        return f"{hb.lower()}]"
+
+
 def _canon_hostport_text(hostport: str) -> str:
-    """Lowercase host, strip trailing dot, and strip leading zeros on numeric port."""
+    """Lowercase host, compress IPv6, strip trailing dot, and strip leading zeros on numeric port."""
     if hostport.startswith("["):
         hb, bsep, tail = hostport.partition("]")
         if not bsep:
             return hostport.lower()
+        v6_fmt = _canon_ipv6_bracket(hb)
         if tail.startswith(":") and tail[1:].isdigit() and 1 <= int(tail[1:]) <= 65535:
-            return f"{hb.lower()}]:{int(tail[1:])}"
-        return f"{hb.lower()}]{tail}"
+            return f"{v6_fmt}:{int(tail[1:])}"
+        return f"{v6_fmt}{tail}"
     h_part, csep, p_part = hostport.rpartition(":")
     if csep and p_part.isdigit() and 1 <= int(p_part) <= 65535:
         h_clean = h_part.lower().rstrip(".") or h_part.lower()
@@ -412,12 +422,13 @@ def normalize_proxy_input(raw: str) -> str:
     if val.startswith("["):
         host_bracket, bsep, tail = val.partition("]")
         if bsep and tail.startswith(":"):
+            v6_fmt = _canon_ipv6_bracket(host_bracket)
             rest_parts = tail[1:].split(":", 2)
             if len(rest_parts) == 1 and rest_parts[0].isdigit() and 1 <= int(rest_parts[0]) <= 65535:
-                return f"http://{host_bracket.lower()}]:{int(rest_parts[0])}"
+                return f"http://{v6_fmt}:{int(rest_parts[0])}"
             if len(rest_parts) == 3 and rest_parts[0].isdigit() and 1 <= int(rest_parts[0]) <= 65535:
                 port_s, u_s, p_s = rest_parts
-                return f"http://{_quote(u_s, safe='')}:{_quote(p_s, safe='')}@{host_bracket.lower()}]:{int(port_s)}"
+                return f"http://{_quote(u_s, safe='')}:{_quote(p_s, safe='')}@{v6_fmt}:{int(port_s)}"
         return val
     parts = val.split(":", 3)
     if (
@@ -545,8 +556,11 @@ def validate_proxy_url(raw: str) -> str:
     if sep:
         if not userinfo or userinfo == ":":
             raise ValueError("kredensial userinfo proxy kosong")
-        if "@" in userinfo or "[" in userinfo or "]" in userinfo or _BAD_PCT_RE.search(userinfo):
+        # Tolak `;` mentah (divergensi urlparse Python <3.12 vs 3.12+), quote, `<>`, `[]`, `@`,
+        # serta `%` yang bukan `%XX` valid; seragamkan hex `%XX` menjadi huruf besar.
+        if not _VALID_USERINFO_RE.match(userinfo) or _BAD_PCT_RE.search(userinfo):
             raise ValueError("userinfo proxy mengandung karakter/encoding tak valid")
+        userinfo = _PCT_HEX_RE.sub(lambda m: m.group(0).upper(), userinfo)
     # Ekstrak raw port secara ketat (hanya digit ASCII, tolak `+8080` atau `:`)
     if hostport.startswith("["):
         if not isinstance(parsed_ip, ipaddress.IPv6Address):

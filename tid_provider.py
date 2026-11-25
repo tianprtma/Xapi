@@ -90,12 +90,32 @@ class TIDProvider:
                     sess.trust_env = False
                     if use_proxy:
                         sess.proxies = {"http": use_proxy, "https": use_proxy}
+                        _orig_req = getattr(sess, "request", None)
+                        if callable(_orig_req):
+                            def _checked_req(*a: Any, **kw: Any) -> Any:
+                                r = _orig_req(*a, **kw)
+                                st = getattr(r, "status_code", 200)
+                                if isinstance(st, int) and st >= 400:
+                                    raise RuntimeError(f"proxy home HTTP {st}")
+                                return r
+                            sess.request = _checked_req  # type: ignore[method-assign]
                     sess.headers["User-Agent"] = (
                         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                         "AppleWebKit/537.36 (KHTML, like Gecko) "
                         "Chrome/124.0.0.0 Safari/537.36"
                     )
-                    return str(handle_x_migration(sess))
+                    html_str = str(handle_x_migration(sess))
+                    if use_proxy and (
+                        not html_str
+                        or (
+                            "ondemand.s" not in html_str
+                            and "loading-x-anim" not in html_str
+                            and "abs.twimg.com" not in html_str
+                            and "twitter-site-verification" not in html_str
+                        )
+                    ):
+                        raise RuntimeError("proxy home returned non-X HTML")
+                    return html_str
             if proxy:
                 try:
                     return _run(proxy)
@@ -233,6 +253,12 @@ class TIDProvider:
         )
         home = bs4.BeautifulSoup(home_html, "html.parser")
 
+        def _is_valid_js(raw: bytes) -> bool:
+            if not raw:
+                return False
+            head = raw.lstrip()[:32].lower()
+            return not head.startswith((b"<!doctype", b"<html"))
+
         def _fetch_ondemand_content(sess: requests.Session) -> bytes:
             """Ambil isi JS ondemand.s terkini.
 
@@ -247,7 +273,7 @@ class TIDProvider:
                 ondemand_url = None
             if ondemand_url:
                 resp = sess.get(ondemand_url, timeout=10)
-                if resp.status_code == 200 and resp.content:
+                if resp.status_code == 200 and _is_valid_js(resp.content):
                     return resp.content
             for idx_url in SCRIPT_INDEX_URLS:
                 try:
@@ -258,7 +284,7 @@ class TIDProvider:
                     if not match:
                         continue
                     resp = sess.get(match.group(0), timeout=10)
-                    if resp.status_code == 200 and resp.content:
+                    if resp.status_code == 200 and _is_valid_js(resp.content):
                         log.info(
                             "TID ondemand.s dari script index: %s",
                             match.group(0).rsplit("/", 1)[-1],
@@ -270,7 +296,7 @@ class TIDProvider:
             raise RuntimeError("ondemand.s tidak dapat ditemukan")
 
         def _do(proxy: Optional[str] = None) -> ClientTransaction:
-            def _fetch_with(use_proxy: Optional[str]) -> bytes:
+            def _build_with(use_proxy: Optional[str]) -> ClientTransaction:
                 with _BoundedSession() as sess:
                     sess.trust_env = False
                     if use_proxy:
@@ -280,22 +306,20 @@ class TIDProvider:
                         "AppleWebKit/537.36 (KHTML, like Gecko) "
                         "Chrome/124.0.0.0 Safari/537.36"
                     )
-                    return _fetch_ondemand_content(sess)
+                    content = _fetch_ondemand_content(sess)
+                    ondemand = bs4.BeautifulSoup(content, "html.parser")
+                    return ClientTransaction(home, ondemand)
 
-            content: Optional[bytes] = None
             if proxy:
                 try:
-                    content = _fetch_with(proxy)
+                    return _build_with(proxy)
                 except Exception as exc:  # noqa: BLE001
                     from app.config import redact_proxy_creds
                     log.warning(
                         "TID ondemand fetch via proxy failed (%s) — fallback direct",
                         redact_proxy_creds(str(exc)),
                     )
-            if content is None:
-                content = _fetch_with(None)
-            ondemand = bs4.BeautifulSoup(content, "html.parser")
-            return ClientTransaction(home, ondemand)
+            return _build_with(None)
 
         self._ct = await loop.run_in_executor(None, lambda: _do(active_proxy))
         self._loaded_at = time.time()

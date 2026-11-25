@@ -633,6 +633,7 @@ class XChatContextPool:
         self._ctx_use: dict[int, int] = {}   # id(ctx) -> jumlah holder
         self._ctx_keys: dict[int, str] = {}  # id(ctx) -> key (untuk drain close_all)
         self._ctx_proxy: dict[str, Optional[str]] = {}  # key -> proxy URL aktif
+        self._proxy_switch_waiters: dict[str, int] = {}  # key -> waiter ganti proxy (anti starvation)
         self._closing_count: dict[str, int] = {}  # key -> context yg sedang drain/close (anti SingletonLock race)
         self._idle_events: dict[str, asyncio.Event] = {}  # key -> notif saat context idle/closed
         self._dropped: set = set()           # dihapus saat masih dipakai
@@ -656,6 +657,7 @@ class XChatContextPool:
         deadline = asyncio.get_running_loop().time() + 30.0
         while True:
             wait_ev: Optional[asyncio.Event] = None
+            is_proxy_switch_waiter = False
             async with self._lock:
                 # ct0 STABIL per profil — baca/tulis di dalam lock agar concurrent
                 # first-time acquire tidak menulis ct0 yang saling bentrok.
@@ -683,6 +685,8 @@ class XChatContextPool:
                         if wait_ev is None or wait_ev.is_set():
                             wait_ev = asyncio.Event()
                             self._idle_events[key] = wait_ev
+                        self._proxy_switch_waiters[key] = self._proxy_switch_waiters.get(key, 0) + 1
+                        is_proxy_switch_waiter = True
                     else:
                         self._ctxs.pop(key, None)
                         self._ctx_proxy.pop(key, None)
@@ -693,6 +697,16 @@ class XChatContextPool:
                         except Exception:  # noqa: BLE001
                             pass
                         ctx = None
+                elif (
+                    ctx is not None
+                    and self._ctx_use.get(id(ctx), 0) > 0
+                    and self._proxy_switch_waiters.get(key, 0) > 0
+                ):
+                    # Jangan biarkan arus request proxy lama membuat waiter ganti-proxy kelaparan.
+                    wait_ev = self._idle_events.get(key)
+                    if wait_ev is None or wait_ev.is_set():
+                        wait_ev = asyncio.Event()
+                        self._idle_events[key] = wait_ev
                 if wait_ev is None:
                     if ctx is not None:
                         # health check: context yang sudah mati melempar di .pages / add_cookies
@@ -834,17 +848,26 @@ class XChatContextPool:
 
                     return ctx
 
-            remaining = deadline - asyncio.get_running_loop().time()
-            if remaining <= 0:
-                raise RuntimeError(
-                    "XChat context sedang dipakai dengan proxy berbeda dan belum idle"
-                )
             try:
-                await asyncio.wait_for(wait_ev.wait(), timeout=remaining)
-            except asyncio.TimeoutError as exc:
-                raise RuntimeError(
-                    "XChat context sedang dipakai dengan proxy berbeda dan belum idle"
-                ) from exc
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise RuntimeError(
+                        "XChat context sedang dipakai dengan proxy berbeda dan belum idle"
+                    )
+                try:
+                    await asyncio.wait_for(wait_ev.wait(), timeout=remaining)
+                except asyncio.TimeoutError as exc:
+                    raise RuntimeError(
+                        "XChat context sedang dipakai dengan proxy berbeda dan belum idle"
+                    ) from exc
+            finally:
+                if is_proxy_switch_waiter:
+                    async with self._lock:
+                        rem_w = max(0, self._proxy_switch_waiters.get(key, 0) - 1)
+                        if rem_w == 0:
+                            self._proxy_switch_waiters.pop(key, None)
+                        else:
+                            self._proxy_switch_waiters[key] = rem_w
 
     async def release(self, auth_token: str, ctx: BrowserContext) -> None:
         key = hashlib.sha256(f"xchat:{auth_token}".encode()).hexdigest()[:16]
@@ -1096,7 +1119,7 @@ async def _click_action_via_browser_impl(
             pass
 
         if "data" not in captured and "raw" not in captured:
-            return {"status": "error", "error": "no response captured", "data": None}
+            return {"status": "error", "http_status": 502, "error": "no response captured", "data": None}
 
         if captured.get("status", 0) >= 400:
             cap_st = int(captured.get("status") or 502)
@@ -1227,6 +1250,9 @@ async def _action_via_browser_impl(
         payload = result.get("body")
 
         if status_code >= 400:
+            if status_code == 401:
+                from app.response_cache import ResponseCache
+                ResponseCache.get().invalidate_token(auth_token)
             if status_code in (401, 403, 402, 407):
                 await ContextPool.get().invalidate(auth_token, all_proxies=(status_code == 401))
             return {
@@ -1354,6 +1380,9 @@ async def _fetch_via_browser_impl(
 
         if "data" not in captured:
             raw_st = captured.get("status")
+            if raw_st == 401:
+                from app.response_cache import ResponseCache
+                ResponseCache.get().invalidate_token(auth_token)
             if isinstance(raw_st, int) and raw_st in (401, 403, 402, 407):
                 await ContextPool.get().invalidate(auth_token, all_proxies=(raw_st == 401))
             norm_raw_st = (
@@ -1370,7 +1399,7 @@ async def _fetch_via_browser_impl(
                 "status": "invalid" if raw_st == 401 else "error",
                 "error": err_msg,
                 "captured_url": captured.get("url"),
-                "http_status": norm_raw_st if "raw" in captured else raw_st,
+                "http_status": norm_raw_st,
                 "raw": captured.get("raw"),
                 "data": None,
             }
@@ -1505,6 +1534,9 @@ async def _search_via_browser_impl(
 
         if "data" not in captured:
             raw_st = captured.get("status")
+            if raw_st == 401:
+                from app.response_cache import ResponseCache
+                ResponseCache.get().invalidate_token(auth_token)
             if isinstance(raw_st, int) and raw_st in (401, 403, 402, 407):
                 await ContextPool.get().invalidate(auth_token, all_proxies=(raw_st == 401))
             norm_raw_st = (
@@ -1521,7 +1553,7 @@ async def _search_via_browser_impl(
                 "status": "invalid" if raw_st == 401 else "error",
                 "error": err_msg,
                 "captured_url": captured.get("url"),
-                "http_status": norm_raw_st if "raw" in captured else raw_st,
+                "http_status": norm_raw_st,
                 "raw": captured.get("raw"),
                 "data": None,
             }

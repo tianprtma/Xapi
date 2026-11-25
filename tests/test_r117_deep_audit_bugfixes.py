@@ -1869,3 +1869,175 @@ async def test_pass28_dm_resolve_me_warm_error_no_false_401_userinfo_semicolon_a
     assert data_err is None
     assert "topsecret" not in reason_err
     assert "***@31.6.46.27:12323" in reason_err
+
+
+# ── 37. Pass 31: TID handle_x_migration 407/captive fallback, SearchTimeline POST rewarm, media_upload post-exempt rewarm, & Playwright 401/search fallback ──
+
+@pytest.mark.asyncio
+async def test_pass31_tid_migration_407_fallback_search_post_rewarm_upload_rewarm_and_pw_401(monkeypatch):
+    from contextlib import asynccontextmanager
+    from app.clients import graphql_call, media_upload
+    from app.config import reset_request_proxy, set_request_proxy, validate_proxy_url
+    from app.response_cache import ResponseCache
+    from app.routers.tweets import v2_tweets_search_recent
+    from playwright_search import _action_via_browser_impl
+    from tid_provider import TIDProvider
+    import playwright_search as _pws
+
+    tok = "e" * 40
+
+    # 1. TIDProvider._refresh detects HTTP 407 / captive HTML inside handle_x_migration via proxy and falls back to direct
+    monkeypatch.setattr(_pws, "PLAYWRIGHT_ENABLED", False)
+    tp = TIDProvider()
+    ctx_tok = set_request_proxy(validate_proxy_url("http://usr:secret@31.6.46.27:12323"))
+    try:
+        dead_cffi = MagicMock(get=AsyncMock(return_value=MagicMock(status_code=407, text="Proxy Auth")), close=AsyncMock())
+        bs_proxies_seen = []
+
+        def _make_bs():
+            inst = MagicMock()
+            inst.__enter__.return_value = inst
+            inst.proxies = {}
+            def _req(*a, **kw):
+                bs_proxies_seen.append(dict(inst.proxies))
+                if inst.proxies:
+                    return MagicMock(status_code=407, content=b"<html>Proxy Auth Required</html>")
+                return MagicMock(status_code=200, content=b"<html><svg id='loading-x-anim-0'></svg></html>")
+            inst.request = _req
+            def _get(url, **kw):
+                if inst.proxies:
+                    return MagicMock(status_code=200, content=b"<html>Captive Portal</html>", text="")
+                return MagicMock(
+                    status_code=200,
+                    text="https://abs.twimg.com/responsive-web/client-web/ondemand.s.1234abcda.js",
+                    content=b"console.log('real js')",
+                )
+            inst.get = _get
+            return inst
+
+        with (
+            patch("curl_cffi.requests.AsyncSession", return_value=dead_cffi),
+            patch("tid_provider._BoundedSession", side_effect=_make_bs),
+            patch("tid_provider.ClientTransaction", return_value="CT_DIRECT_OK"),
+        ):
+            await tp._refresh(tok)
+        assert tp._ct == "CT_DIRECT_OK"
+        assert any(p for p in bs_proxies_seen) and any(not p for p in bs_proxies_seen)
+    finally:
+        reset_request_proxy(ctx_tok)
+
+    # 2. SearchTimeline (POST read-only query) performs 1x rotating-proxy auto-rewarm on cached 403
+    st_calls = 0
+
+    class _SearchRotSess:
+        async def post(self, url, headers=None, json=None):
+            nonlocal st_calls
+            st_calls += 1
+            if st_calls == 1:
+                return MagicMock(status_code=403, text="CF IP changed")
+            return MagicMock(status_code=200, json=lambda: {"data": {"search_by_raw_query": {"search_timeline": {"timeline": {"instructions": []}}}}})
+
+    @asynccontextmanager
+    async def _search_pool(_t):
+        yield _SearchRotSess()
+
+    st_lks = 0
+    async def _st_lk(_t):
+        nonlocal st_lks
+        st_lks += 1
+        return ("ct0_c", {}) if st_lks == 1 else None
+
+    with (
+        patch("app.clients.ResponseCache.get", return_value=MagicMock(lookup=AsyncMock(return_value=None), store=AsyncMock())),
+        patch("app.clients.SessionStore.get", return_value=MagicMock(lookup=_st_lk, invalidate=AsyncMock())),
+        patch("app.clients.ClientPool.get", return_value=MagicMock(invalidate=AsyncMock())),
+        patch("app.clients.pooled_client", _search_pool),
+        patch("app.clients.warm_session", AsyncMock(side_effect=[("ct0_c", {}), ("ct0_f", {})])),
+        patch("app.clients.TIDProvider.get", return_value=MagicMock(generate=AsyncMock(return_value="tid"))),
+    ):
+        r_search = await graphql_call("SearchTimeline", {"rawQuery": "jkt48", "count": 5, "product": "Latest"}, tok, method="POST")
+    assert r_search["status"] == "ok"
+    assert st_calls == 2
+
+    # 3. media_upload rewarms proxy session on INIT 403 even when SessionStore was populated during initial warm before MEDIA_PROXY_EXEMPT direct fallback
+    ctx_tok2 = set_request_proxy(validate_proxy_url("http://31.6.46.27:12323"))
+    try:
+        up_lks = 0
+        async def _up_lk(_t):
+            nonlocal up_lks
+            up_lks += 1
+            # 1st lookup (before initial warm) -> None; 2nd lookup (before proxy INIT attempt 0) -> cached!
+            return None if up_lks == 1 else ("ct0_warm1", {"twid": "u%3D1"})
+
+        proxy_init_calls = 0
+
+        class _UpProxySess:
+            timeout = 20.0
+            def __init__(self):
+                self.cookies = MagicMock()
+                self.cookies.jar = []
+            async def post(self, url, headers=None, data=None, multipart=None):
+                nonlocal proxy_init_calls
+                cmd = (data or {}).get("command")
+                if cmd == "INIT":
+                    proxy_init_calls += 1
+                    if proxy_init_calls == 1:
+                        return MagicMock(status_code=403, text="CF rotating IP mismatch")
+                    return MagicMock(status_code=200, json=lambda: {"media_id_string": "777"})
+                if cmd == "APPEND":
+                    return MagicMock(status_code=204, text="")
+                return MagicMock(status_code=200, json=lambda: {"media_id_string": "777"})
+
+        @asynccontextmanager
+        async def _up_pool(_t):
+            yield _UpProxySess()
+
+        fake_direct = MagicMock(
+            post=AsyncMock(return_value=MagicMock(status_code=403, text="Direct blocked")),
+            close=AsyncMock(),
+        )
+        with (
+            patch("app.clients.SessionStore.get", return_value=MagicMock(lookup=_up_lk, invalidate=AsyncMock())),
+            patch("app.clients.ClientPool.get", return_value=MagicMock(invalidate=AsyncMock())),
+            patch("app.clients.pooled_client", _up_pool),
+            patch("app.clients._direct_session", return_value=fake_direct),
+            patch("app.clients.warm_session", AsyncMock(side_effect=[("ct0_1", {}), ("ct0_1", {}), ("ct0_2", {})])),
+        ):
+            up_res = await media_upload(tok, b"PNGDATA", "image/png")
+        assert up_res["status"] == "ok"
+        assert proxy_init_calls == 2
+    finally:
+        reset_request_proxy(ctx_tok2)
+
+    # 4. _action_via_browser_impl evicts ResponseCache on 401, and v2_tweets_search_recent skips Playwright on proxy warm-up failure & preserves 429
+    rc = ResponseCache.get()
+    await rc.store("UserByRestId", {"userId": "88"}, tok, {"status": "ok", "data": {"data": {"user": {"id": "88"}}}})
+    act_page = MagicMock(
+        goto=AsyncMock(return_value=MagicMock(status=200)),
+        evaluate=AsyncMock(return_value={"status": 401, "body": {"errors": [{"code": 89}]}}),
+        close=AsyncMock(),
+    )
+    act_ctx = MagicMock(new_page=AsyncMock(return_value=act_page), cookies=AsyncMock(return_value=[]))
+    with (
+        patch("playwright_search.ContextPool.get", return_value=MagicMock(acquire=AsyncMock(return_value=act_ctx), invalidate=AsyncMock(), release=AsyncMock())),
+        patch("playwright_search.asyncio.sleep", AsyncMock()),
+    ):
+        act_res = await _action_via_browser_impl(tok, "https://x.com/i/api/1.1/blocks/destroy.json")
+    assert act_res["status"] == "invalid"
+    assert (await rc.lookup("UserByRestId", {"userId": "88"}, tok)) is None
+
+    pw_spy = AsyncMock(return_value={"status": "error", "http_status": 502, "error": "timeout"})
+    with (
+        patch("app.routers.tweets.graphql_call", AsyncMock(return_value={"status": "error", "http_status": 502, "error": "warm-up failed: proxy dead"})),
+        patch("app.routers.tweets.search_via_browser", pw_spy),
+    ):
+        resp_dead = await v2_tweets_search_recent(query="test", max_results=10, next_token=None, type="Latest", authorization=f"Bearer {tok}", auth_token=None, raw=0)
+    assert resp_dead.status_code == 502
+    assert pw_spy.await_count == 0
+
+    with (
+        patch("app.routers.tweets.graphql_call", AsyncMock(return_value={"status": "error", "http_status": 429, "error": "rate limit"})),
+        patch("app.routers.tweets.search_via_browser", pw_spy),
+    ):
+        resp_429 = await v2_tweets_search_recent(query="test", max_results=10, next_token=None, type="Latest", authorization=f"Bearer {tok}", auth_token=None, raw=0)
+    assert resp_429.status_code == 429

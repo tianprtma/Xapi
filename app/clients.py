@@ -98,6 +98,11 @@ async def graphql_call(
     return result
 
 
+# Read-only GraphQL queries yang memakai method="POST" (idempoten, aman untuk 1x
+# auto-rewarm saat proxy berotasi mengganti IP sehingga cookie __cf_bm basi).
+_IDEMPOTENT_POST_GQL_OPS = frozenset({"SearchTimeline"})
+
+
 async def _graphql_call_once(
     operation: str,
     variables: dict[str, Any],
@@ -113,7 +118,7 @@ async def _graphql_call_once(
 
     url = f"{GRAPHQL_BASE}/{meta['queryId']}/{operation}"
     had_cached_session = False
-    if method == "GET" and not _rewarm_retry:
+    if (method == "GET" or operation in _IDEMPOTENT_POST_GQL_OPS) and not _rewarm_retry:
         _lk = getattr(SessionStore.get(), "lookup", None)
         if callable(_lk):
             _cand = _lk(auth_token)
@@ -634,6 +639,9 @@ async def media_upload(
             ct0, _ = await warm_session(direct0, auth_token)
             jar = {c.name: c.value for c in direct0.cookies.jar}
         except InvalidTokenError as e:
+            ResponseCache.get().invalidate_token(auth_token)
+            await SessionStore.get().invalidate(auth_token, all_proxies=True)
+            await ClientPool.get().invalidate(auth_token, all_proxies=True)
             return {
                 "status": "invalid",
                 "http_status": e.http_status,
@@ -696,6 +704,12 @@ async def media_upload(
 
     for _up_attempt in range(2):
         need_up_rewarm = False
+        if _up_attempt == 0 and not had_cached_proxy_session:
+            _lk_retry = getattr(SessionStore.get(), "lookup", None)
+            if callable(_lk_retry):
+                _cand_retry = _lk_retry(auth_token)
+                if asyncio.iscoroutine(_cand_retry):
+                    had_cached_proxy_session = (await _cand_retry) is not None
         async with pooled_client(auth_token) as client:
             try:
                 pooled_ct0, _ = await warm_session(client, auth_token)

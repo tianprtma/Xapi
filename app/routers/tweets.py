@@ -240,15 +240,21 @@ async def v2_tweets_search_recent(
         fmt = format_tweet_collection if type != "People" else (lambda g: format_tweet_collection(g, item="user"))
         return finalize(result, fmt, raw=bool(raw))
     fmt = format_tweet_collection if type != "People" else (lambda g: format_tweet_collection(g, item="user"))
-    if gql.get("status") == "invalid" or next_token:
+    if (
+        gql.get("status") == "invalid"
+        or next_token
+        or str(gql.get("error") or "").startswith("warm-up failed:")
+    ):
         return finalize(gql, fmt, raw=bool(raw))
     # fallback Playwright bila GraphQL gagal (rate limit / challenge)
     try:
         pw = await search_via_browser(auth_token=tok, q=query, search_type=type)
+        if pw.get("status") == "error" and gql.get("http_status") == 429:
+            return finalize(gql, fmt, raw=bool(raw))
         result = {
             "engine": "playwright",
             "status": pw["status"],
-            "http_status": pw.get("http_status", 200),
+            "http_status": pw.get("http_status") or 502,
             "data": pw.get("data"),
             "error": pw.get("error"),
         }

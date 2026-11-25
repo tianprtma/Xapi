@@ -97,11 +97,14 @@ async def login(
     else:
         code = 401
     # Strip sensitive cookies jar — only return user profile + minimal tokens
-    safe = {
+    safe: dict[str, Any] = {
         "status": result["status"],
         "user": result.get("user"),
         "tokens": result.get("tokens", {}),
     }
+    if result.get("error"):
+        from ..config import redact_proxy_creds
+        safe["error"] = redact_proxy_creds(str(result["error"]))
     return JSONResponse(status_code=code, content=safe)
 
 

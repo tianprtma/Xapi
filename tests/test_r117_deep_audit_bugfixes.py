@@ -2470,3 +2470,26 @@ async def test_pass37_captive_portal_warm_tid_client_direct_fallback_and_chat_me
     assert r_act_html["status"] == "error" and r_act_html["http_status"] == 502
     assert "actsecret" not in r_act_html.get("raw", "")
     assert cp_inv_spy.await_count == 1
+
+    # 7) Pass 41: _is_fatal_proxy_or_auth_err stops cascading DM calls on post-warmup `upstream request failed:`,
+    #    and v2_chat_conversations skips launching XChat browser when proxy tunnel is dead (502).
+    from app.routers.dm import v2_chat_conversations
+    dm_spy_41 = AsyncMock()
+    inbox_pw_spy = AsyncMock()
+    with (
+        patch("app.routers.dm.graphql_call", AsyncMock(return_value={
+            "status": "error",
+            "http_status": 502,
+            "error": "upstream request failed: ProxyError: tunnel refused",
+            "data": None,
+        })),
+        patch("app.routers.dm.dm_call", dm_spy_41),
+        patch("app.routers.dm.unlock_and_read_xchat_inbox", inbox_pw_spy),
+    ):
+        r_convs_502 = await v2_chat_conversations(
+            max_results=20, pagination_token=None, mode="auto",
+            dm_pin=None, x_dm_pin="1234", authorization=f"Bearer {tok}", auth_token=None, raw=0,
+        )
+    assert r_convs_502.status_code == 502
+    assert dm_spy_41.await_count == 0
+    assert inbox_pw_spy.await_count == 0

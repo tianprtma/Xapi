@@ -392,7 +392,12 @@ async def v2_unblock(
         data={"user_id": target_user_id},
     )
     # CF-gated: fallback Playwright UI click (TID di-inject otomatis)
-    if result["status"] == "error" and result.get("http_status") == 404:
+    if (
+        result["status"] == "error"
+        and result.get("http_status") == 404
+        and not str(result.get("error") or "").startswith("warm-up failed:")
+    ):
+        reset_last_resolve_screen_name_err()
         handle = await resolve_screen_name(target_user_id, tok)
         if handle:
             result = await click_action_via_browser(
@@ -401,6 +406,10 @@ async def v2_unblock(
                 confirm_selector='[data-testid="confirmationSheetConfirm"]',
                 match_response_substr="blocks/destroy",
             )
+        else:
+            rsn_err = pop_last_resolve_screen_name_err()
+            if rsn_err is not None and rsn_err.get("status") == "invalid":
+                return write_finalize(rsn_err, raw=bool(raw))
     return write_finalize(result, raw=bool(raw))
 
 

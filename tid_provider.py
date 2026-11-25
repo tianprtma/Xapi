@@ -255,7 +255,10 @@ class TIDProvider:
                             await ContextPool.get().invalidate(auth_token, all_proxies=False)
                             raise
                         finally:
-                            await page.close()
+                            try:
+                                await page.close()
+                            except Exception:  # noqa: BLE001
+                                pass
                     finally:
                         await ContextPool.get().release(auth_token, ctx)
             except Exception as e:  # noqa: BLE001
@@ -292,17 +295,23 @@ class TIDProvider:
                 ondemand_url = None
             if ondemand_url:
                 resp = sess.get(ondemand_url, timeout=10)
+                if resp.status_code in (402, 407):
+                    raise RuntimeError(f"proxy ondemand HTTP {resp.status_code}")
                 if resp.status_code == 200 and _is_valid_js(resp.content):
                     return resp.content
             for idx_url in SCRIPT_INDEX_URLS:
                 try:
                     idx = sess.get(idx_url, timeout=10)
+                    if idx.status_code in (402, 407):
+                        raise RuntimeError(f"proxy script index HTTP {idx.status_code}")
                     if idx.status_code != 200:
                         continue
                     match = ONDEMAND_URL_RE.search(idx.text)
                     if not match:
                         continue
                     resp = sess.get(match.group(0), timeout=10)
+                    if resp.status_code in (402, 407):
+                        raise RuntimeError(f"proxy ondemand HTTP {resp.status_code}")
                     if resp.status_code == 200 and _is_valid_js(resp.content):
                         log.info(
                             "TID ondemand.s dari script index: %s",

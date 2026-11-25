@@ -120,16 +120,30 @@ async def v2_chat_members(conversation_id: str = PathParam(..., pattern=r"^\d+$"
 
 def _is_fatal_proxy_or_auth_err(res: Any) -> bool:
     """True bila panggilan pertama sudah membuktikan `auth_token` invalid (401)
-    atau `warm_session` gagal di tingkat proxy/jaringan (`warm-up failed:`),
-    sehingga fallback beruntun ke endpoint lain hanya akan menggandakan hang."""
+    atau kegagalan di tingkat proxy/jaringan (`warm-up failed:`, `upstream request failed:`,
+    `non-JSON`, atau 402/407 `_no_retry`), sehingga fallback beruntun ke endpoint lain
+    hanya akan menggandakan hang."""
     if not isinstance(res, dict):
         return False
     if res.get("status") == "invalid":
         return True
-    return (
-        res.get("status") == "error"
-        and str(res.get("error") or "").startswith("warm-up failed:")
-    )
+    if res.get("status") != "error":
+        return False
+    if res.get("_no_retry"):
+        return True
+    err_s = str(res.get("error") or "")
+    return err_s.startswith(("warm-up failed:", "upstream request failed:", "non-JSON"))
+
+
+def _is_dead_proxy_err(res: Any) -> bool:
+    """True bila error berasal dari kegagalan koneksi/auth proxy (bukan 403 CF challenge),
+    sehingga peluncuran browser XChat E2EE di atas proxy yang sama pasti gagal."""
+    if not isinstance(res, dict) or res.get("status") != "error":
+        return False
+    if res.get("http_status") == 403:
+        return False
+    err_s = str(res.get("error") or "")
+    return bool(res.get("_no_retry")) or err_s.startswith(("warm-up failed:", "upstream request failed:"))
 
 
 async def _resolve_me_or_error(
@@ -791,7 +805,7 @@ async def v2_chat_conversations(
     # Sidebar XChat (browser, +PIN) adalah satu-satunya sumber yang memuat
     # percakapan E2EE yang TIDAK pernah muncul di inbox GraphQL. Selama PIN
     # diberikan, penelepon sudah menanggung biaya browser — selalu gabungkan.
-    needs_e2ee = bool(pin)
+    needs_e2ee = bool(pin) and not _is_dead_proxy_err(result)
     if needs_e2ee and pin:
         me = await resolve_me_id(tok)
         inbox_items = await unlock_and_read_xchat_inbox(tok, pin, my_user_id=me, max_results=max_results)
@@ -1312,7 +1326,7 @@ async def v2_dm_conv_events(
         expansions=expansions,
         max_results=max_results,
     )
-    if pin:
+    if pin and not _is_dead_proxy_err(result):
         formatted = await _enrich_conv_events_with_e2ee(formatted, tok, pin, conv_id, max_results=max_results)
     if (
         result.get("status") == "error"
@@ -1396,7 +1410,7 @@ async def v2_dm_with_user_events(
         expansions=expansions,
         max_results=max_results,
     )
-    if pin:
+    if pin and not _is_dead_proxy_err(result):
         formatted = await _enrich_conv_events_with_e2ee(formatted, tok, pin, conv_id, max_results=max_results)
     if (
         result.get("status") == "error"

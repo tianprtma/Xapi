@@ -2493,3 +2493,27 @@ async def test_pass37_captive_portal_warm_tid_client_direct_fallback_and_chat_me
     assert r_convs_502.status_code == 502
     assert dm_spy_41.await_count == 0
     assert inbox_pw_spy.await_count == 0
+
+    # 8) Pass 42: off-domain captive-portal HTTP 200 redirect on page.goto evicts ContextPool & XChatContextPool immediately,
+    #    and redact_proxy_creds covers socks/socks4/socks4a without swallowing comma-separated URL lists.
+    from app.config import redact_proxy_creds
+    from app.xchat_e2ee import _handle_xchat_nav_status
+    from playwright_search import _check_nav_response_error
+
+    assert redact_proxy_creds("http://example.com,http://usr:sec42@31.6.46.27:12323") == "http://example.com,http://***@31.6.46.27:12323"
+    assert redact_proxy_creds("socks4://usr:sec42b@31.6.46.27:1080") == "socks4://***@31.6.46.27:1080"
+    assert redact_proxy_creds("PROXY_LIST=usr:sec42c@31.6.46.27:12323,u2:sec42d@1.2.3.4:8080") == "PROXY_LIST=***@31.6.46.27:12323,***@1.2.3.4:8080"
+
+    cp_inv_42 = AsyncMock()
+    xc_inv_42 = AsyncMock()
+    captive_page = MagicMock(url="http://captive.isp.example/login?redir=x.com")
+    with (
+        patch("playwright_search.ContextPool.get", return_value=MagicMock(invalidate=cp_inv_42)),
+        patch("app.xchat_e2ee.XChatContextPool.get", return_value=MagicMock(invalidate=xc_inv_42)),
+    ):
+        nav_err_42 = await _check_nav_response_error(tok, MagicMock(status=200), page=captive_page)
+        xc_st_42 = await _handle_xchat_nav_status(tok, MagicMock(status=200), page=captive_page)
+    assert nav_err_42 is not None and nav_err_42["http_status"] == 502
+    assert xc_st_42 == 502
+    cp_inv_42.assert_awaited_once_with(tok, all_proxies=False)
+    xc_inv_42.assert_awaited_once_with(tok)

@@ -1039,23 +1039,35 @@ async def _click_coalesced(
         )
 
 
-async def _check_nav_response_error(auth_token: str, nav_resp: Any) -> Optional[dict[str, Any]]:
-    """Jika navigasi utama `page.goto()` langsung dibalas HTTP >= 400 oleh proxy/WAF/X,
-    evict ContextPool segera tanpa menunggu timeout 20 detik."""
+async def _check_nav_response_error(auth_token: str, nav_resp: Any, *, page: Any = None) -> Optional[dict[str, Any]]:
+    """Jika navigasi utama `page.goto()` langsung dibalas HTTP >= 400 oleh proxy/WAF/X
+    atau diarahkan keluar domain X oleh captive-portal proxy, evict ContextPool segera."""
     nav_st = getattr(nav_resp, "status", None) if nav_resp is not None else None
-    if not isinstance(nav_st, int) or nav_st < 400:
-        return None
-    if nav_st == 401:
-        from app.response_cache import ResponseCache
-        ResponseCache.get().invalidate_token(auth_token)
-    if nav_st in (401, 403, 402, 407) or nav_st >= 500:
-        await ContextPool.get().invalidate(auth_token, all_proxies=(nav_st == 401))
-    return {
-        "status": "invalid" if nav_st == 401 else "error",
-        "http_status": 502 if nav_st in (402, 407) else nav_st,
-        "error": f"browser navigation HTTP {nav_st}",
-        "data": None,
-    }
+    if isinstance(nav_st, int) and nav_st >= 400:
+        if nav_st == 401:
+            from app.response_cache import ResponseCache
+            ResponseCache.get().invalidate_token(auth_token)
+        if nav_st in (401, 403, 402, 407) or nav_st >= 500:
+            await ContextPool.get().invalidate(auth_token, all_proxies=(nav_st == 401))
+        return {
+            "status": "invalid" if nav_st == 401 else "error",
+            "http_status": 502 if nav_st in (402, 407) else nav_st,
+            "error": f"browser navigation HTTP {nav_st}",
+            "data": None,
+        }
+    page_url = getattr(page, "url", None) if page is not None else None
+    if isinstance(page_url, str) and page_url.startswith(("http://", "https://")):
+        from urllib.parse import urlparse as _up
+        host = (_up(page_url).hostname or "").lower().rstrip(".")
+        if host and host not in ("x.com", "twitter.com") and not host.endswith((".x.com", ".twitter.com")):
+            await ContextPool.get().invalidate(auth_token, all_proxies=False)
+            return {
+                "status": "error",
+                "http_status": 502,
+                "error": "browser navigation redirected off-domain by proxy/captive-portal",
+                "data": None,
+            }
+    return None
 
 
 async def _click_action_via_browser_impl(
@@ -1127,7 +1139,7 @@ async def _click_action_via_browser_impl(
                 "error": redact_proxy_creds(f"browser navigation failed: {type(exc).__name__}: {exc}"),
                 "data": None,
             }
-        nav_err = await _check_nav_response_error(auth_token, nav_resp)
+        nav_err = await _check_nav_response_error(auth_token, nav_resp, page=page)
         if nav_err is not None:
             return nav_err
         await asyncio.sleep(2)
@@ -1248,7 +1260,7 @@ async def _action_via_browser_impl(
                 "error": redact_proxy_creds(f"browser navigation failed: {type(exc).__name__}: {exc}"),
                 "data": None,
             }
-        nav_err = await _check_nav_response_error(auth_token, nav_resp)
+        nav_err = await _check_nav_response_error(auth_token, nav_resp, page=page)
         if nav_err is not None:
             return nav_err
         # Tunggu sampai bundle ready (TID generator init)
@@ -1448,7 +1460,7 @@ async def _fetch_via_browser_impl(
                 "error": redact_proxy_creds(f"browser navigation failed: {type(exc).__name__}: {exc}"),
                 "data": None,
             }
-        nav_err = await _check_nav_response_error(auth_token, nav_resp)
+        nav_err = await _check_nav_response_error(auth_token, nav_resp, page=page)
         if nav_err is not None and "data" not in captured and "raw" not in captured:
             return nav_err
 
@@ -1617,7 +1629,7 @@ async def _search_via_browser_impl(
                 "error": redact_proxy_creds(f"browser navigation failed: {type(exc).__name__}: {exc}"),
                 "data": None,
             }
-        nav_err = await _check_nav_response_error(auth_token, nav_resp)
+        nav_err = await _check_nav_response_error(auth_token, nav_resp, page=page)
         if nav_err is not None and "data" not in captured and "raw" not in captured:
             return nav_err
 

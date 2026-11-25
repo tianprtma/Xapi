@@ -392,18 +392,25 @@ async def _ensure_pin_unlocked(page: Any, dm_pin: Optional[str]) -> bool:
         return "/pin/" not in page.url
 
 
-async def _handle_xchat_nav_status(auth_token: str, nav_resp: Any) -> Optional[int]:
-    """Return HTTP status >= 400 when `page.goto` hit a proxy/WAF/auth error page,
-    evicting `XChatContextPool` immediately so poisoned contexts never linger."""
+async def _handle_xchat_nav_status(auth_token: str, nav_resp: Any, *, page: Any = None) -> Optional[int]:
+    """Return HTTP status >= 400 when `page.goto` hit a proxy/WAF/auth error page or
+    captive-portal off-domain redirect, evicting `XChatContextPool` immediately."""
     nav_st = getattr(nav_resp, "status", None) if nav_resp is not None else None
-    if not isinstance(nav_st, int) or nav_st < 400:
-        return None
-    if nav_st == 401:
-        from .response_cache import ResponseCache
-        ResponseCache.get().invalidate_token(auth_token)
-    if nav_st in (401, 402, 403, 407) or nav_st >= 500:
-        await XChatContextPool.get().invalidate(auth_token)
-    return nav_st
+    if isinstance(nav_st, int) and nav_st >= 400:
+        if nav_st == 401:
+            from .response_cache import ResponseCache
+            ResponseCache.get().invalidate_token(auth_token)
+        if nav_st in (401, 402, 403, 407) or nav_st >= 500:
+            await XChatContextPool.get().invalidate(auth_token)
+        return nav_st
+    page_url = getattr(page, "url", None) if page is not None else None
+    if isinstance(page_url, str) and page_url.startswith(("http://", "https://")):
+        from urllib.parse import urlparse as _up
+        host = (_up(page_url).hostname or "").lower().rstrip(".")
+        if host and host not in ("x.com", "twitter.com") and not host.endswith((".x.com", ".twitter.com")):
+            await XChatContextPool.get().invalidate(auth_token)
+            return 502
+    return None
 
 
 async def unlock_and_read_xchat_inbox(
@@ -424,7 +431,7 @@ async def unlock_and_read_xchat_inbox(
             context = await XChatContextPool.get().acquire(auth_token)
             page = await context.new_page()
             nav_resp = await page.goto("https://x.com/i/chat", wait_until="domcontentloaded", timeout=30000)
-            bad_nav = await _handle_xchat_nav_status(auth_token, nav_resp)
+            bad_nav = await _handle_xchat_nav_status(auth_token, nav_resp, page=page)
             if bad_nav is not None:
                 log.warning("unlock_and_read_xchat_inbox navigation HTTP %s", bad_nav)
                 return []
@@ -1627,7 +1634,7 @@ async def unlock_and_read_xchat_conversation(
                         wait_until="domcontentloaded",
                         timeout=25000,
                     )
-                    bad_warm = await _handle_xchat_nav_status(auth_token, warm_resp)
+                    bad_warm = await _handle_xchat_nav_status(auth_token, warm_resp, page=page)
                     if bad_warm is not None:
                         log.warning("unlock_and_read_xchat_conversation(%s) warmup HTTP %s", norm_conv_id, bad_warm)
                         return []
@@ -1733,7 +1740,7 @@ async def unlock_and_read_xchat_conversation(
                                                 f"https://x.com/i/chat/{norm_conv_id}",
                                                 wait_until="domcontentloaded", timeout=25000,
                                             )
-                                            if (await _handle_xchat_nav_status(auth_token, nav_trig)) is not None:
+                                            if (await _handle_xchat_nav_status(auth_token, nav_trig, page=page)) is not None:
                                                 break
                                             await _ensure_pin_unlocked(page, dm_pin)
                                             for _i in range(8):
@@ -1808,7 +1815,7 @@ async def unlock_and_read_xchat_conversation(
 
             url = f"https://x.com/i/chat/{norm_conv_id}"
             nav_resp = await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            bad_nav = await _handle_xchat_nav_status(auth_token, nav_resp)
+            bad_nav = await _handle_xchat_nav_status(auth_token, nav_resp, page=page)
             if bad_nav is not None:
                 log.warning("unlock_and_read_xchat_conversation(%s) navigation HTTP %s", norm_conv_id, bad_nav)
                 return []
@@ -1819,7 +1826,7 @@ async def unlock_and_read_xchat_conversation(
             # If PIN redirect sent us to /i/chat main list, navigate to the specific conversation
             if norm_conv_id not in page.url:
                 nav_re = await page.goto(url, wait_until="domcontentloaded", timeout=25000)
-                if (await _handle_xchat_nav_status(auth_token, nav_re)) is not None:
+                if (await _handle_xchat_nav_status(auth_token, nav_re, page=page)) is not None:
                     return []
             # Guard anti salah-percakapan: setelah redirect PIN, URL WAJIB menunjuk
             # ke percakapan yang diminta. Kalau masih meleset (tab terbuka
@@ -1828,7 +1835,7 @@ async def unlock_and_read_xchat_conversation(
             for _gu in range(2):
                 if norm_conv_id not in page.url:
                     nav_gu = await page.goto(url, wait_until="domcontentloaded", timeout=25000)
-                    if (await _handle_xchat_nav_status(auth_token, nav_gu)) is not None:
+                    if (await _handle_xchat_nav_status(auth_token, nav_gu, page=page)) is not None:
                         return []
                     await asyncio.sleep(1.0)
             if norm_conv_id not in page.url:
@@ -2168,7 +2175,7 @@ async def send_xchat_dm_via_browser(
             page = await context.new_page()
             url = f"https://x.com/i/chat/{norm_conv_id}"
             nav_resp = await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            bad_nav = await _handle_xchat_nav_status(auth_token, nav_resp)
+            bad_nav = await _handle_xchat_nav_status(auth_token, nav_resp, page=page)
             if bad_nav is not None:
                 return {
                     "status": "invalid" if bad_nav == 401 else "error",
@@ -2181,7 +2188,7 @@ async def send_xchat_dm_via_browser(
 
             if norm_conv_id not in page.url:
                 nav_re = await page.goto(url, wait_until="domcontentloaded", timeout=25000)
-                bad_re = await _handle_xchat_nav_status(auth_token, nav_re)
+                bad_re = await _handle_xchat_nav_status(auth_token, nav_re, page=page)
                 if bad_re is not None:
                     return {
                         "status": "invalid" if bad_re == 401 else "error",
@@ -2193,7 +2200,7 @@ async def send_xchat_dm_via_browser(
             for _gu in range(2):
                 if norm_conv_id not in page.url:
                     nav_gu = await page.goto(url, wait_until="domcontentloaded", timeout=25000)
-                    bad_gu = await _handle_xchat_nav_status(auth_token, nav_gu)
+                    bad_gu = await _handle_xchat_nav_status(auth_token, nav_gu, page=page)
                     if bad_gu is not None:
                         return {
                             "status": "invalid" if bad_gu == 401 else "error",

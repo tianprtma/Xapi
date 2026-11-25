@@ -58,6 +58,7 @@ from ..clients import (
     dm_call,
     dm_conv_id_for,
     graphql_call,
+    is_dead_proxy_error_result,
     media_upload,
     rest_call,
 )
@@ -136,19 +137,9 @@ def _is_fatal_proxy_or_auth_err(res: Any) -> bool:
 
 
 def _is_dead_proxy_err(res: Any) -> bool:
-    """True bila error berasal dari kegagalan koneksi/auth proxy (bukan 403 CF challenge),
+    """True bila error berasal dari kegagalan koneksi/auth/captive-portal proxy (bukan 403 CF challenge),
     sehingga peluncuran browser XChat E2EE di atas proxy yang sama pasti gagal."""
-    if not isinstance(res, dict) or res.get("status") != "error":
-        return False
-    if res.get("http_status") == 403:
-        return False
-    err_s = str(res.get("error") or "")
-    return bool(res.get("_no_retry")) or err_s.startswith((
-        "warm-up failed:",
-        "upstream request failed:",
-        "rejected by proxy/upstream",
-        "non-JSON",
-    ))
+    return is_dead_proxy_error_result(res)
 
 
 async def _resolve_me_or_error(
@@ -1504,8 +1495,10 @@ async def v2_dm_media_proxy(
                 content_type = resp.headers.get("content-type") or "application/octet-stream"
                 ctype_low = content_type.split(";", 1)[0].strip().lower()
                 head_low = (resp.content or b"").lstrip()[:32].lower()
-                if ctype_low in ("text/html", "application/xhtml+xml", "application/json", "text/xml", "application/xml") or (
-                    ctype_low.startswith("text/") and head_low.startswith((b"<!doctype", b"<html", b"<head", b"<body", b"{"))
+                if (
+                    ctype_low in ("text/html", "application/xhtml+xml", "application/json", "text/xml", "application/xml")
+                    or head_low.startswith((b"<!doctype", b"<html", b"<head", b"<body", b"<?xml"))
+                    or (ctype_low.startswith("text/") and head_low.startswith(b"{"))
                 ):
                     await SessionStore.get().invalidate(tok, all_proxies=False)
                     await ClientPool.get().invalidate(tok, all_proxies=False)

@@ -76,18 +76,27 @@ def fanout_semaphore() -> _asyncio.Semaphore:
 
 
 def is_dead_proxy_error_result(res: Any) -> bool:
-    """True bila error berasal dari kegagalan koneksi/auth/kuota proxy (bukan 403 CF challenge),
-    sehingga peluncuran fallback browser/endpoint di atas proxy yang sama pasti gagal."""
+    """True bila error berasal dari kegagalan koneksi/auth/kuota/captive-portal proxy
+    (bukan 403 CF challenge), sehingga peluncuran fallback browser/endpoint di atas proxy
+    yang sama pasti gagal."""
     if not isinstance(res, dict) or res.get("status") != "error":
         return False
-    if res.get("http_status") == 403:
+    st = res.get("http_status")
+    if st == 403:
         return False
     err_s = str(res.get("error") or "")
-    return bool(res.get("_no_retry")) or err_s.startswith((
+    if bool(res.get("_no_retry")) or err_s.startswith((
         "warm-up failed:",
         "upstream request failed:",
         "rejected by proxy/upstream",
-    ))
+        "non-JSON",
+    )):
+        return True
+    if st in (502, 503, 504):
+        low = err_s.lower()
+        if any(m in low for m in ("<!doctype", "<html", "502 bad gateway", "503 service", "504 gateway", "squid", "proxy")):
+            return True
+    return False
 
 
 async def graphql_call(
@@ -225,6 +234,7 @@ async def _graphql_call_once(
             try:
                 payload = resp.json()
             except json.JSONDecodeError:
+                await SessionStore.get().invalidate(auth_token, all_proxies=False)
                 await ClientPool.get().invalidate(auth_token, all_proxies=False)
                 return {
                     "status": "error",
@@ -373,6 +383,7 @@ async def _rest_call_once(
                 raw_txt = resp.text or ""
                 low_head = raw_txt.lstrip()[:32].lower()
                 if low_head.startswith(("<!doctype", "<html", "<head", "<body")):
+                    await SessionStore.get().invalidate(auth_token, all_proxies=False)
                     await ClientPool.get().invalidate(auth_token, all_proxies=False)
                     return {
                         "status": "error",
@@ -543,6 +554,7 @@ async def _dm_call_once(
 
         if not need_rewarm:
             if is_non_json_html:
+                await SessionStore.get().invalidate(auth_token, all_proxies=False)
                 await ClientPool.get().invalidate(auth_token, all_proxies=False)
                 return {
                     "status": "error",
@@ -799,6 +811,7 @@ async def media_upload(
                         if _up_attempt == 0 and had_cached_proxy_session and up_res.get("stage") == "INIT":
                             need_up_rewarm = True
                     elif up_res.pop("_proxy_err", False):
+                        await SessionStore.get().invalidate(auth_token, all_proxies=False)
                         await ClientPool.get().invalidate(auth_token, all_proxies=False)
                 if not need_up_rewarm:
                     return up_res

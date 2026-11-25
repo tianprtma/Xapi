@@ -271,6 +271,16 @@ async def warm_session(
             no_retry=(final_home_st in (402, 407)),
         )
 
+    home_url = getattr(home_resp, "url", None)
+    if isinstance(home_url, str) and home_url.startswith(("http://", "https://")):
+        home_host = (_urlparse(home_url).hostname or "").strip().lower().rstrip(".")
+        if home_host and home_host not in ("x.com", "twitter.com") and not home_host.endswith((".x.com", ".twitter.com")):
+            await ClientPool.get().invalidate(auth_token, all_proxies=False)
+            raise WarmNetworkError(
+                f"GET {HOMEPAGE_URL} redirected off-domain by proxy/captive-portal",
+                http_status=502,
+            )
+
     # X kasih ct0 server-issued di domain .x.com (leading dot). Placeholder lokal
     # nyantol di domain="" atau "x.com" tanpa leading dot. Strategy: prefer ct0
     # dari .x.com, kalau ada → drop semua ct0 lain.
@@ -297,11 +307,12 @@ async def warm_session(
         if (
             proxy_for_token(auth_token)
             and not server_ct0_value
+            and not jar.get("guest_id")
             and isinstance(home_txt, str)
             and home_txt.strip()
             and not any(
                 m in home_txt.lower()
-                for m in ("x.com", "twitter", "twimg.com", "ondemand.s", "loading-x-anim")
+                for m in ("twimg.com", "ondemand.s", "loading-x-anim", "twitter-site-verification", "__initial_state__")
             )
         ):
             await ClientPool.get().invalidate(auth_token, all_proxies=False)

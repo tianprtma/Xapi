@@ -245,6 +245,14 @@ class TIDProvider:
                                     await ContextPool.get().invalidate(auth_token, all_proxies=(resp_st == 401))
                                 log.warning("TID home fetch via browser: HTTP %s", resp_st)
                                 return None
+                            page_url = getattr(page, "url", None)
+                            if isinstance(page_url, str) and page_url.startswith(("http://", "https://")):
+                                from urllib.parse import urlparse as _up
+                                p_host = (_up(page_url).hostname or "").strip().lower().rstrip(".")
+                                if p_host and p_host not in ("x.com", "twitter.com") and not p_host.endswith((".x.com", ".twitter.com")):
+                                    await ContextPool.get().invalidate(auth_token, all_proxies=False)
+                                    log.warning("TID home fetch via browser redirected off-domain — skipping")
+                                    return None
                             txt = await resp.text()
                             if not txt or ("ondemand.s" not in txt and "loading-x-anim" not in txt and "abs.twimg.com" not in txt):
                                 await ContextPool.get().invalidate(auth_token, all_proxies=False)
@@ -310,7 +318,7 @@ class TIDProvider:
                     if not match:
                         continue
                     resp = sess.get(match.group(0), timeout=10)
-                    if resp.status_code in (402, 407):
+                    if resp.status_code in (402, 407) or (bool(sess.proxies) and resp.status_code in (403, 502, 503, 504)):
                         raise RuntimeError(f"proxy ondemand HTTP {resp.status_code}")
                     if resp.status_code == 200 and _is_valid_js(resp.content):
                         log.info(
@@ -319,6 +327,8 @@ class TIDProvider:
                         )
                         return resp.content
                 except Exception as e:  # noqa: BLE001
+                    if bool(sess.proxies) and str(e).startswith("proxy "):
+                        raise
                     from app.config import redact_proxy_creds
                     log.warning("TID script index fetch gagal: %s", redact_proxy_creds(str(e)))
             raise RuntimeError("ondemand.s tidak dapat ditemukan")

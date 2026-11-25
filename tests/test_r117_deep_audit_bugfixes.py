@@ -2735,3 +2735,119 @@ async def test_pass45_ssrf_cloud_imds_private_proxy_comma_password_and_router_fa
         r_acc = await _accept_dm_conversation("1-2", tok, 0)
     assert r_acc.status_code == 404
     assert dm_spy.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_pass46_captive_portal_echo_url_offdomain_nonjson_and_octet_dm_media():
+    """Pass 46: captive portal echoing `https://x.com/home` or redirecting off-domain raises
+    WarmNetworkError(502) instead of false 401 InvalidTokenError; `is_dead_proxy_error_result`
+    recognizes `non-JSON` & 502 gateway HTML (blocking browser fallbacks); 200 non-JSON evicts
+    `SessionStore`; and `v2_dm_media_proxy` rejects HTML disguised as `application/octet-stream`."""
+    from contextlib import asynccontextmanager
+    from app.auth import WarmNetworkError, warm_session
+    from app.clients import _graphql_call_once, is_dead_proxy_error_result
+    from app.config import reset_request_proxy, set_request_proxy
+    from app.routers.dm import v2_dm_media_proxy
+    from app.routers.tweets import v2_tweets_search_recent
+
+    tok = "a" * 40
+    px_tok = set_request_proxy("http://31.6.46.27:12323")
+    try:
+        # 1a. Captive portal echoing `<input name="orig_url" value="https://x.com/home">` -> 502 WarmNetworkError, NOT 401!
+        cap_echo_client = MagicMock()
+        cap_echo_client.cookies = MagicMock()
+        cap_echo_client.cookies.jar = MagicMock(__iter__=lambda self: iter([]), clear=MagicMock())
+        cap_echo_client.get = AsyncMock(return_value=MagicMock(
+            status_code=200,
+            url="https://x.com/home",
+            text='<html><body>Login to continue to <input value="https://x.com/home"></body></html>',
+        ))
+        with (
+            patch("app.auth.SessionStore.get", return_value=MagicMock(lookup=AsyncMock(return_value=None))),
+            patch("app.auth.ClientPool.get", return_value=MagicMock(invalidate=AsyncMock())),
+        ):
+            with pytest.raises(WarmNetworkError) as exc_echo:
+                await warm_session(cap_echo_client, tok)
+        assert exc_echo.value.http_status == 502
+
+        # 1b. Off-domain captive portal redirect -> 502 WarmNetworkError
+        cap_redir_client = MagicMock()
+        cap_redir_client.cookies = MagicMock()
+        cap_redir_client.cookies.jar = MagicMock(__iter__=lambda self: iter([]), clear=MagicMock())
+        cap_redir_client.get = AsyncMock(return_value=MagicMock(
+            status_code=200,
+            url="http://portal.isp.example/login",
+            text="<html><script src='https://abs.twimg.com/x.js'></script></html>",
+        ))
+        with (
+            patch("app.auth.SessionStore.get", return_value=MagicMock(lookup=AsyncMock(return_value=None))),
+            patch("app.auth.ClientPool.get", return_value=MagicMock(invalidate=AsyncMock())),
+        ):
+            with pytest.raises(WarmNetworkError) as exc_redir:
+                await warm_session(cap_redir_client, tok)
+        assert exc_redir.value.http_status == 502
+    finally:
+        reset_request_proxy(px_tok)
+
+    # 2. is_dead_proxy_error_result recognizes non-JSON & 502 HTML gateway -> blocks Playwright search fallback
+    non_json_err = {"status": "error", "http_status": 502, "error": "non-JSON response", "data": None}
+    gw_502_err = {"status": "error", "http_status": 502, "error": "<html><title>502 Bad Gateway</title></html>", "data": None}
+    assert is_dead_proxy_error_result(non_json_err) is True
+    assert is_dead_proxy_error_result(gw_502_err) is True
+    pw_search_spy = AsyncMock()
+    with (
+        patch("app.routers.tweets.graphql_call", AsyncMock(return_value=non_json_err)),
+        patch("app.routers.tweets.search_via_browser", pw_search_spy),
+    ):
+        r_srch = await v2_tweets_search_recent(query="test", max_results=10, next_token=None, type="Latest", authorization=f"Bearer {tok}", auth_token=None, raw=0)
+    assert r_srch.status_code == 502
+    assert pw_search_spy.await_count == 0
+
+    # 3. _graphql_call_once evicts BOTH SessionStore and ClientPool on 200 non-JSON
+    ss_inv = AsyncMock()
+    cp_inv = AsyncMock()
+    fake_gql_client = MagicMock(get=AsyncMock(return_value=MagicMock(
+        status_code=200,
+        text="<html>Captive</html>",
+        json=MagicMock(side_effect=json.JSONDecodeError("err", "<html>", 0)),
+    )))
+
+    @asynccontextmanager
+    async def _fake_pool_46(_t):
+        yield fake_gql_client
+
+    with (
+        patch("app.clients.SessionStore.get", return_value=MagicMock(lookup=AsyncMock(return_value=None), invalidate=ss_inv)),
+        patch("app.clients.ClientPool.get", return_value=MagicMock(invalidate=cp_inv)),
+        patch("app.clients.pooled_client", _fake_pool_46),
+        patch("app.clients.warm_session", AsyncMock(return_value=("ct0_46", {}))),
+        patch("app.clients.TIDProvider.get", return_value=MagicMock(generate=AsyncMock(return_value="tid"))),
+    ):
+        gql_46 = await _graphql_call_once("UserByRestId", {"userId": "1"}, tok)
+    assert gql_46["http_status"] == 502
+    ss_inv.assert_awaited_once_with(tok, all_proxies=False)
+    cp_inv.assert_awaited_once_with(tok, all_proxies=False)
+
+    # 4. v2_dm_media_proxy rejects HTML disguised as application/octet-stream
+    octet_html_resp = MagicMock(
+        status_code=200,
+        headers={"content-type": "application/octet-stream"},
+        content=b"<html><body>Captive Portal</body></html>",
+    )
+    dm_media_client = MagicMock(
+        get=AsyncMock(return_value=octet_html_resp),
+        cookies=MagicMock(set=MagicMock()),
+    )
+
+    @asynccontextmanager
+    async def _dm_pool_46(_t):
+        yield dm_media_client
+
+    with (
+        patch("app.routers.dm.SessionStore.get", return_value=MagicMock(lookup=AsyncMock(return_value=None), invalidate=AsyncMock())),
+        patch("app.client_pool.ClientPool.get", return_value=MagicMock(invalidate=AsyncMock())),
+        patch("app.client_pool.pooled_client", _dm_pool_46),
+        patch("app.routers.dm.warm_session", AsyncMock(return_value=("ct0_46", {}))),
+    ):
+        r_dmm = await v2_dm_media_proxy(dm_id="111", media_id="222", resource_id="img.jpg", authorization=f"Bearer {tok}", auth_token=None)
+    assert r_dmm.status_code == 502

@@ -214,12 +214,18 @@ class PlaywrightPool:
             if self._browser is not None and self._browser.is_connected():
                 return self._browser
             if self._browser is not None:
-                # Clear pooled contexts bound to the dead/restarting browser
-                # so ContextPool.acquire() never hands back orphaned contexts.
+                # Clear pooled contexts bound to the dead/restarting browser/driver
+                # so ContextPool/XChatContextPool never hand back orphaned contexts.
+                if XChatContextPool._instance is not None:
+                    try:
+                        await XChatContextPool._instance.close_all()
+                    except Exception:  # noqa: BLE001
+                        pass
                 if ContextPool._instance is not None:
-                    ContextPool._instance._ctxs.clear()
-                    ContextPool._instance._ctx_use.clear()
-                    ContextPool._instance._dropped.clear()
+                    try:
+                        await ContextPool._instance.close_all()
+                    except Exception:  # noqa: BLE001
+                        pass
                 try:
                     await self._browser.close()
                 except Exception:  # noqa: BLE001

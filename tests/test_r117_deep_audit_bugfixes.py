@@ -1671,3 +1671,60 @@ def test_pass24_fuzzer_redaction_cloud_metadata_ssrf_and_hostport_canon():
     assert normalize_proxy_input("31.6.46.27:08080:user:pass") == "http://user:pass@31.6.46.27:8080"
     assert normalize_proxy_input("[2606:4700::ABCD]:08080:user:pass") == "http://user:pass@[2606:4700::abcd]:8080"
     assert normalize_proxy_input("http://user:pass@EXAMPLE.COM.:08080/") == "http://user:pass@example.com:8080"
+
+
+# ── 35. Pass 26: XChat page.goto>=400 eviction, schemeless user:pass@host:port redaction, & TID captive-portal HTML rejection ──
+
+@pytest.mark.asyncio
+async def test_pass26_xchat_nav_407_eviction_schemeless_at_redaction_and_tid_captive_portal(monkeypatch):
+    from app.config import redact_proxy_creds
+    from app.xchat_e2ee import send_xchat_dm_via_browser, unlock_and_read_xchat_inbox
+    from tid_provider import TIDProvider
+
+    tok = "c" * 40
+
+    # 1. Schemeless user:pass@host:port & user:pass@[ipv6]:port redacted without touching emails
+    assert redact_proxy_creds("err usr:secretpass@31.6.46.27:12323 and usr:sec2@[2606:4700::1]:8080") == (
+        "err ***@31.6.46.27:12323 and ***@[2606:4700::1]:8080"
+    )
+    assert redact_proxy_creds("contact alice@example.com") == "contact alice@example.com"
+
+    # 2. XChat inbox & send_xchat_dm_via_browser evict XChatContextPool immediately on HTTP 407 page.goto
+    x_page = MagicMock(goto=AsyncMock(return_value=MagicMock(status=407)), close=AsyncMock())
+    x_ctx = MagicMock(new_page=AsyncMock(return_value=x_page))
+    x_inv = AsyncMock()
+    with (
+        patch("app.xchat_e2ee.PlaywrightPool.get", return_value=MagicMock(semaphore=asyncio.Semaphore(1))),
+        patch("app.xchat_e2ee.XChatContextPool.get", return_value=MagicMock(acquire=AsyncMock(return_value=x_ctx), invalidate=x_inv, release=AsyncMock())),
+    ):
+        inbox_res = await unlock_and_read_xchat_inbox(tok, "1234", my_user_id="1")
+        send_res = await send_xchat_dm_via_browser(tok, "1234", "1-2", "hi")
+    assert inbox_res == []
+    assert send_res["status"] == "error"
+    assert send_res["http_status"] == 502
+    assert x_inv.await_count == 2
+
+    # 3. TIDProvider skips proxy captive-portal 200 HTML missing X shell markers and falls back to requests
+    import playwright_search as _pws
+    monkeypatch.setattr(_pws, "PLAYWRIGHT_ENABLED", False)
+    tp = TIDProvider()
+    captive_cffi = MagicMock()
+    captive_cffi.get = AsyncMock(return_value=MagicMock(status_code=200, text="<html><body>Captive Portal Login</body></html>"))
+    captive_cffi.close = AsyncMock()
+    with (
+        patch("curl_cffi.requests.AsyncSession", return_value=captive_cffi),
+        patch("tid_provider.handle_x_migration", return_value="<html><svg id='loading-x-anim-0'></svg></html>"),
+        patch("tid_provider.ClientTransaction", return_value="CT_AFTER_CAPTIVE"),
+        patch("tid_provider._BoundedSession") as mock_bs,
+    ):
+        sess_inst = MagicMock()
+        sess_inst.__enter__.return_value = sess_inst
+        sess_inst.get.return_value = MagicMock(
+            status_code=200,
+            text="https://abs.twimg.com/responsive-web/client-web/ondemand.s.1234abcda.js",
+            content=b"console.log(1)",
+            raise_for_status=MagicMock(),
+        )
+        mock_bs.return_value = sess_inst
+        await tp._refresh(tok)
+    assert tp._ct == "CT_AFTER_CAPTIVE"

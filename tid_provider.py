@@ -153,7 +153,11 @@ class TIDProvider:
                             resp.status_code,
                         )
                         return None
-                    return resp.text
+                    txt = resp.text
+                    if not txt or ("ondemand.s" not in txt and "loading-x-anim" not in txt and "abs.twimg.com" not in txt):
+                        log.warning("TID home fetch via client returned non-X shell HTML — skipping")
+                        return None
+                    return txt
                 finally:
                     try:
                         await sess.close()
@@ -202,7 +206,12 @@ class TIDProvider:
                                     await ContextPool.get().invalidate(auth_token, all_proxies=(resp_st == 401))
                                 log.warning("TID home fetch via browser: HTTP %s", resp_st)
                                 return None
-                            return await resp.text()
+                            txt = await resp.text()
+                            if not txt or ("ondemand.s" not in txt and "loading-x-anim" not in txt and "abs.twimg.com" not in txt):
+                                await ContextPool.get().invalidate(auth_token, all_proxies=False)
+                                log.warning("TID home fetch via browser returned non-X shell HTML — skipping")
+                                return None
+                            return txt
                         except Exception:
                             await ContextPool.get().invalidate(auth_token, all_proxies=False)
                             raise

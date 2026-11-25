@@ -19,7 +19,6 @@ import os
 import re
 import secrets
 import time
-import urllib.request
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -392,6 +391,20 @@ async def _ensure_pin_unlocked(page: Any, dm_pin: Optional[str]) -> bool:
         return "/pin/" not in page.url
 
 
+async def _handle_xchat_nav_status(auth_token: str, nav_resp: Any) -> Optional[int]:
+    """Return HTTP status >= 400 when `page.goto` hit a proxy/WAF/auth error page,
+    evicting `XChatContextPool` immediately so poisoned contexts never linger."""
+    nav_st = getattr(nav_resp, "status", None) if nav_resp is not None else None
+    if not isinstance(nav_st, int) or nav_st < 400:
+        return None
+    if nav_st == 401:
+        from .response_cache import ResponseCache
+        ResponseCache.get().invalidate_token(auth_token)
+    if nav_st in (401, 402, 403, 407) or nav_st >= 500:
+        await XChatContextPool.get().invalidate(auth_token)
+    return nav_st
+
+
 async def unlock_and_read_xchat_inbox(
     auth_token: str,
     dm_pin: Optional[str],
@@ -409,7 +422,11 @@ async def unlock_and_read_xchat_inbox(
         try:
             context = await XChatContextPool.get().acquire(auth_token)
             page = await context.new_page()
-            await page.goto("https://x.com/i/chat", wait_until="domcontentloaded", timeout=30000)
+            nav_resp = await page.goto("https://x.com/i/chat", wait_until="domcontentloaded", timeout=30000)
+            bad_nav = await _handle_xchat_nav_status(auth_token, nav_resp)
+            if bad_nav is not None:
+                log.warning("unlock_and_read_xchat_inbox navigation HTTP %s", bad_nav)
+                return []
 
             # R88: JALUR UTAMA — daftar percakapan dari OPFS sqlite (sama
             # dengan R87). Sinkronisasi websocket sudah berjalan dari /i/chat;
@@ -441,7 +458,8 @@ async def unlock_and_read_xchat_inbox(
                             return rows[:max_results]
                         log.debug("R88: OPFS sqlite kosong — lanjut jalur DOM")
                 except Exception as opfs_exc:  # noqa: BLE001
-                    log.debug("R88: baca OPFS sqlite gagal (%s) — lanjut DOM", opfs_exc)
+                    from .config import redact_proxy_creds
+                    log.debug("R88: baca OPFS sqlite gagal (%s) — lanjut DOM", redact_proxy_creds(str(opfs_exc)))
 
             unlocked = await _ensure_pin_unlocked(page, dm_pin)
             if not unlocked:
@@ -1603,11 +1621,15 @@ async def unlock_and_read_xchat_conversation(
             ctx_warmed = getattr(context, "_xchat_embed_warmed", False)
             if not ctx_warmed:
                 try:
-                    await page.goto(
+                    warm_resp = await page.goto(
                         "https://x.com/i/chat",
                         wait_until="domcontentloaded",
                         timeout=25000,
                     )
+                    bad_warm = await _handle_xchat_nav_status(auth_token, warm_resp)
+                    if bad_warm is not None:
+                        log.warning("unlock_and_read_xchat_conversation(%s) warmup HTTP %s", norm_conv_id, bad_warm)
+                        return []
                     try:
                         await page.wait_for_function(
                             """() => {
@@ -1635,7 +1657,11 @@ async def unlock_and_read_xchat_conversation(
                         # cache JS chunk; coba lagi nanti di fetch berikutnya.
                         pass
                 except Exception as warm_exc:  # noqa: BLE001
-                    log.debug("Warmup /i/chat gagal (dilanjutkan): %s", warm_exc)
+                    from .config import redact_proxy_creds
+                    w_err = redact_proxy_creds(str(warm_exc))
+                    if any(t in w_err for t in ("ERR_PROXY", "ERR_SOCKS", "ERR_TUNNEL", "_PROXY_", "SUPPORTED_PROXIES")):
+                        raise
+                    log.debug("Warmup /i/chat gagal (dilanjutkan): %s", w_err)
 
             # R87: JALUR UTAMA BARU — baca SQLite OPFS (sinkron websocket,
             # plain_text terdekripsi). Halaman /i/chat cukup untuk mengaktifkan
@@ -1767,10 +1793,15 @@ async def unlock_and_read_xchat_conversation(
                             conn.close()
                             os.unlink(tmp_path)
                 except Exception as opfs_exc:  # noqa: BLE001
-                    log.debug("R87: baca OPFS sqlite gagal (%s) — lanjut DOM", opfs_exc)
+                    from .config import redact_proxy_creds
+                    log.debug("R87: baca OPFS sqlite gagal (%s) — lanjut DOM", redact_proxy_creds(str(opfs_exc)))
 
             url = f"https://x.com/i/chat/{norm_conv_id}"
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            nav_resp = await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            bad_nav = await _handle_xchat_nav_status(auth_token, nav_resp)
+            if bad_nav is not None:
+                log.warning("unlock_and_read_xchat_conversation(%s) navigation HTTP %s", norm_conv_id, bad_nav)
+                return []
             unlocked = await _ensure_pin_unlocked(page, dm_pin)
             if not unlocked:
                 return []
@@ -2122,7 +2153,14 @@ async def send_xchat_dm_via_browser(
             context = await XChatContextPool.get().acquire(auth_token)
             page = await context.new_page()
             url = f"https://x.com/i/chat/{norm_conv_id}"
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            nav_resp = await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            bad_nav = await _handle_xchat_nav_status(auth_token, nav_resp)
+            if bad_nav is not None:
+                return {
+                    "status": "invalid" if bad_nav == 401 else "error",
+                    "http_status": 502 if bad_nav in (402, 407) else bad_nav,
+                    "error": f"XChat navigation HTTP {bad_nav}",
+                }
             unlocked = await _ensure_pin_unlocked(page, dm_pin)
             if not unlocked:
                 return {"status": "error", "error": "XChat PIN unlock failed"}

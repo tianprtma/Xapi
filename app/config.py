@@ -318,6 +318,9 @@ _PROXY_CREDS_RE = _re.compile(
 _PROXY_SHORTHAND_CREDS_RE = _re.compile(
     r"((?<![A-Za-z0-9._/-])(?:\[[0-9a-fA-F:]+\]|[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+):\d{1,5}):[^\s,'\";\]})]+:[^\s,'\";\]})]+"
 )
+_PROXY_SCHEMELESS_AT_RE = _re.compile(
+    r"(?:(?<=[\s'\"(<\[,;={])|^)[^\s/:'\"<>@=]+:(?!//)(?:(?!://)[^\s'\"<>])+@(?=(?:\[[0-9a-fA-F:]+\]|[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+):\d{1,5}(?:[\s/'\"<>),;\]}]|$))"
+)
 _DISALLOWED_PROXY_HOSTS = frozenset({
     "localhost",
     "localhost.localdomain",
@@ -449,6 +452,8 @@ def redact_proxy_creds(text: str) -> str:
     if not text:
         return text
     out = _PROXY_CREDS_RE.sub(r"\1***@", text) if "://" in text else text
+    if "@" in out and ":" in out:
+        out = _PROXY_SCHEMELESS_AT_RE.sub("***@", out)
     if ":" in out:
         out = _PROXY_SHORTHAND_CREDS_RE.sub(r"\1:***", out)
     return out

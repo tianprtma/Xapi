@@ -50,6 +50,7 @@ from ..clients import (
     dm_call,
     dm_conv_id_for,
     graphql_call,
+    is_dead_proxy_error_result,
     media_upload,
     rest_call,
 )
@@ -243,7 +244,7 @@ async def v2_tweets_search_recent(
     if (
         gql.get("status") == "invalid"
         or next_token
-        or str(gql.get("error") or "").startswith("warm-up failed:")
+        or is_dead_proxy_error_result(gql)
     ):
         return finalize(gql, fmt, raw=bool(raw))
     # fallback Playwright bila GraphQL gagal (rate limit / challenge)

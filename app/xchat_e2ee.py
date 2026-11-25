@@ -392,6 +392,30 @@ async def _ensure_pin_unlocked(page: Any, dm_pin: Optional[str]) -> bool:
         return "/pin/" not in page.url
 
 
+def _is_xchat_proxy_nav_exc(err_s: str, auth_token: str) -> bool:
+    """True bila exception Playwright pada XChat berasal dari kegagalan tunnel/TCP proxy."""
+    if any(
+        t in err_s
+        for t in (
+            "ERR_PROXY",
+            "ERR_SOCKS",
+            "ERR_TUNNEL",
+            "_PROXY_",
+            "SUPPORTED_PROXIES",
+            "ERR_CONNECTION_REFUSED",
+            "ERR_CONNECTION_RESET",
+            "ERR_CONNECTION_CLOSED",
+            "ERR_TIMED_OUT",
+            "ERR_EMPTY_RESPONSE",
+        )
+    ):
+        return True
+    if "Page.goto: Timeout" in err_s:
+        from .config import proxy_for_token
+        return bool(proxy_for_token(auth_token))
+    return False
+
+
 async def _handle_xchat_nav_status(auth_token: str, nav_resp: Any, *, page: Any = None) -> Optional[int]:
     """Return HTTP status >= 400 when `page.goto` hit a proxy/WAF/auth error page or
     captive-portal off-domain redirect, evicting `XChatContextPool` immediately."""
@@ -720,7 +744,7 @@ async def unlock_and_read_xchat_inbox(
         except Exception as exc:
             from .config import redact_proxy_creds
             err_s = redact_proxy_creds(str(exc))
-            if any(t in err_s for t in ("ERR_PROXY", "ERR_SOCKS", "ERR_TUNNEL", "_PROXY_", "SUPPORTED_PROXIES")):
+            if _is_xchat_proxy_nav_exc(err_s, auth_token):
                 await XChatContextPool.get().invalidate(auth_token)
             log.warning("unlock_and_read_xchat_inbox error: %s", err_s)
             return []
@@ -2139,7 +2163,7 @@ async def unlock_and_read_xchat_conversation(
         except Exception as exc:
             from .config import redact_proxy_creds
             err_s = redact_proxy_creds(str(exc))
-            if any(t in err_s for t in ("ERR_PROXY", "ERR_SOCKS", "ERR_TUNNEL", "_PROXY_", "SUPPORTED_PROXIES")):
+            if _is_xchat_proxy_nav_exc(err_s, auth_token):
                 await XChatContextPool.get().invalidate(auth_token)
             log.warning("unlock_and_read_xchat_conversation(%s) failed: %s", norm_conv_id, err_s)
             return []
@@ -2338,7 +2362,7 @@ async def send_xchat_dm_via_browser(
         except Exception as exc:
             from .config import redact_proxy_creds
             err_s = redact_proxy_creds(str(exc))
-            if any(t in err_s for t in ("ERR_PROXY", "ERR_SOCKS", "ERR_TUNNEL", "_PROXY_", "SUPPORTED_PROXIES")):
+            if _is_xchat_proxy_nav_exc(err_s, auth_token):
                 await XChatContextPool.get().invalidate(auth_token)
             log.warning("send_xchat_dm_via_browser(%s) failed: %s", norm_conv_id, err_s)
             return {"status": "error", "http_status": 502, "error": err_s}

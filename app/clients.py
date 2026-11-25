@@ -75,6 +75,21 @@ def fanout_semaphore() -> _asyncio.Semaphore:
 
 
 
+def is_dead_proxy_error_result(res: Any) -> bool:
+    """True bila error berasal dari kegagalan koneksi/auth/kuota proxy (bukan 403 CF challenge),
+    sehingga peluncuran fallback browser/endpoint di atas proxy yang sama pasti gagal."""
+    if not isinstance(res, dict) or res.get("status") != "error":
+        return False
+    if res.get("http_status") == 403:
+        return False
+    err_s = str(res.get("error") or "")
+    return bool(res.get("_no_retry")) or err_s.startswith((
+        "warm-up failed:",
+        "upstream request failed:",
+        "rejected by proxy/upstream",
+    ))
+
+
 async def graphql_call(
     operation: str,
     variables: dict[str, Any],
@@ -190,10 +205,16 @@ async def _graphql_call_once(
                 await ClientPool.get().invalidate(auth_token, all_proxies=False)
             if not need_rewarm:
                 out_st = 502 if is_proxy_auth_or_quota or resp.status_code < 400 else resp.status_code
+                raw_err_txt = redact_proxy_creds(resp.text[:900])
+                err_msg = (
+                    f"rejected by proxy/upstream (HTTP {resp.status_code}): {raw_err_txt}".rstrip(": ")
+                    if is_proxy_auth_or_quota
+                    else redact_proxy_creds(resp.text[:1000])
+                )
                 err_out: dict[str, Any] = {
                     "status": "error",
                     "http_status": out_st,
-                    "error": redact_proxy_creds(resp.text[:1000]),
+                    "error": err_msg,
                     "data": None,
                 }
                 if is_proxy_auth_or_quota:
@@ -329,10 +350,16 @@ async def _rest_call_once(
             elif is_proxy_auth_or_quota:
                 await ClientPool.get().invalidate(auth_token, all_proxies=False)
             if not need_rewarm:
+                raw_err_txt = redact_proxy_creds(resp.text[:900])
+                err_msg = (
+                    f"rejected by proxy/upstream (HTTP {resp.status_code}): {raw_err_txt}".rstrip(": ")
+                    if is_proxy_auth_or_quota
+                    else redact_proxy_creds(resp.text[:1000])
+                )
                 err_out = {
                     "status": "error",
                     "http_status": 502 if is_proxy_auth_or_quota else resp.status_code,
-                    "error": redact_proxy_creds(resp.text[:1000]),
+                    "error": err_msg,
                     "data": None,
                 }
                 if is_proxy_auth_or_quota:
@@ -503,7 +530,11 @@ async def _dm_call_once(
                 err_out = {
                     "status": "error",
                     "http_status": 502 if is_proxy_auth_or_quota else resp.status_code,
-                    "error": payload,
+                    "error": (
+                        f"rejected by proxy/upstream (HTTP {resp.status_code})"
+                        if is_proxy_auth_or_quota
+                        else payload
+                    ),
                     "data": None,
                 }
                 if is_proxy_auth_or_quota:
@@ -833,7 +864,9 @@ async def _upload_chunks(
     try:
         init_json = init_resp.json()
     except json.JSONDecodeError:
-        return _upload_error(init_resp, "INIT")
+        return _upload_error(init_resp, "INIT", proxy_err=True)
+    if not isinstance(init_json, dict):
+        return _upload_error(init_resp, "INIT", proxy_err=True)
     media_id = init_json.get("media_id_string") or str(init_json.get("media_id") or "")
     if not media_id:
         return _upload_error(init_resp, "INIT")
@@ -864,6 +897,9 @@ async def _upload_chunks(
             mime.close()
         if ap_resp.status_code >= 400:
             return _upload_error(ap_resp, f"APPEND[{seg}]", media_id=media_id)
+        ap_txt = getattr(ap_resp, "text", None)
+        if isinstance(ap_txt, str) and ap_txt.lstrip()[:32].lower().startswith(("<!doctype", "<html", "<head", "<body")):
+            return _upload_error(ap_resp, f"APPEND[{seg}]", media_id=media_id, proxy_err=True)
         seg += 1
 
     # 3. FINALIZE
@@ -877,7 +913,12 @@ async def _upload_chunks(
     try:
         fin_json = fin_resp.json()
     except json.JSONDecodeError:
-        return _upload_error(fin_resp, "FINALIZE", media_id=media_id)
+        return _upload_error(fin_resp, "FINALIZE", media_id=media_id, proxy_err=True)
+    if not isinstance(fin_json, dict) or (
+        not (fin_json.get("media_id_string") or fin_json.get("media_id"))
+        and (fin_json.get("errors") or fin_json.get("error"))
+    ):
+        return _upload_error(fin_resp, "FINALIZE", media_id=media_id, proxy_err=not isinstance(fin_json, dict))
 
     # 4. STATUS polling kalau processing async (dibatasi max_poll_seconds)
     info = fin_json.get("processing_info")
@@ -903,7 +944,9 @@ async def _upload_chunks(
         try:
             fin_json = st_resp.json()
         except json.JSONDecodeError:
-            return _upload_error(st_resp, "STATUS", media_id=media_id)
+            return _upload_error(st_resp, "STATUS", media_id=media_id, proxy_err=True)
+        if not isinstance(fin_json, dict):
+            return _upload_error(st_resp, "STATUS", media_id=media_id, proxy_err=True)
         info = fin_json.get("processing_info")
 
     if info and info.get("state") == "failed":
@@ -931,18 +974,20 @@ def _invalid_token_response(e: InvalidTokenError, auth_token: str) -> dict[str, 
     }
 
 
-def _upload_error(resp: Any, stage: str, *, media_id: Optional[str] = None) -> dict[str, Any]:
+def _upload_error(resp: Any, stage: str, *, media_id: Optional[str] = None, proxy_err: bool = False) -> dict[str, Any]:
     raw_st = getattr(resp, "status_code", None)
     norm_st = 502 if (not isinstance(raw_st, int) or raw_st < 400 or raw_st in (402, 407)) else raw_st
+    raw_txt = getattr(resp, "text", None)
+    safe_txt = redact_proxy_creds(raw_txt[:1000]) if isinstance(raw_txt, str) else ""
     err: dict[str, Any] = {
         "status": "error",
         "http_status": norm_st,
-        "error": redact_proxy_creds(resp.text[:1000]),
+        "error": safe_txt or ("non-JSON HTML response from proxy/upstream" if proxy_err else f"upload {stage} failed"),
         "stage": stage,
         "data": None,
     }
     if media_id:
         err["media_id"] = media_id
-    if isinstance(raw_st, int) and raw_st in (402, 407):
+    if proxy_err or (isinstance(raw_st, int) and raw_st in (402, 407, 502, 503, 504)):
         err["_proxy_err"] = True
     return err

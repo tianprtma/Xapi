@@ -2567,3 +2567,73 @@ async def test_pass37_captive_portal_warm_tid_client_direct_fallback_and_chat_me
     assert "31.6.46.27:12323:***" in rendered_43
     assert redact_proxy_creds("err via http://u:p,a:s@31.6.46.27:12323/: refused") == "err via http://***@31.6.46.27:12323/: refused"
     assert redact_proxy_creds("PROXY_LIST=31.6.46.27:12323:u1:sec1,u2:sec2@1.2.3.4:8080") == "PROXY_LIST=31.6.46.27:12323:***,***@1.2.3.4:8080"
+
+    # 10) Pass 44: login_with_auth_token rejects HTTP 200 captive-portal HTML without poisoning viewer cache,
+    #     post-warmup dead-proxy (`upstream request failed:` / 407 `rejected by proxy/upstream`) skips Chromium
+    #     in v2_tweets_search / v2_dm_send / v2_chat_messages, and XChatContextPool evicts on ERR_CONNECTION_RESET.
+    from app.auth import login_with_auth_token
+    from app.routers.dm import DMSendBody, v2_dm_send
+    from app.routers.tweets import v2_tweets_search_recent
+    from app.xchat_e2ee import _is_xchat_proxy_nav_exc
+
+    assert _is_xchat_proxy_nav_exc("Page.goto: net::ERR_CONNECTION_RESET at https://x.com/i/chat", tok) is True
+
+    pw_search_spy_44 = AsyncMock()
+    with (
+        patch("app.routers.tweets.graphql_call", AsyncMock(return_value={
+            "status": "error",
+            "http_status": 502,
+            "error": "upstream request failed: ProxyError: tunnel dead",
+            "data": None,
+        })),
+        patch("app.routers.tweets.search_via_browser", pw_search_spy_44),
+    ):
+        r_srch_44 = await v2_tweets_search_recent(query="tes", max_results=10, next_token=None, type="Latest", authorization=f"Bearer {tok}", auth_token=None, raw=0)
+    assert r_srch_44.status_code == 502
+    assert pw_search_spy_44.await_count == 0
+
+    pw_dm_spy_44 = AsyncMock()
+    with (
+        patch("app.routers.dm._resolve_me_or_error", AsyncMock(return_value=("999", None))),
+        patch("app.routers.dm.dm_call", AsyncMock(return_value={
+            "status": "error",
+            "http_status": 502,
+            "error": "rejected by proxy/upstream (HTTP 407)",
+            "data": None,
+        })),
+        patch("app.routers.dm.send_xchat_dm_via_browser", pw_dm_spy_44),
+    ):
+        r_dms_44 = await v2_dm_send(participant_id="111", body=DMSendBody(text="hi"), dm_pin=None, x_dm_pin="1234", authorization=f"Bearer {tok}", auth_token=None, raw=0)
+    assert r_dms_44.status_code == 502
+    assert pw_dm_spy_44.await_count == 0
+
+    store_44 = MagicMock(
+        lookup_viewer=AsyncMock(return_value=None),
+        lookup=AsyncMock(return_value=None),
+        invalidate=AsyncMock(),
+        store_viewer=AsyncMock(),
+    )
+    cp_44 = MagicMock(invalidate=AsyncMock())
+    html_v_resp = MagicMock(status_code=200, text="<html><body>Captive Portal</body></html>")
+    mock_v_client = MagicMock(get=AsyncMock(return_value=html_v_resp))
+    mock_v_client.cookies.jar = []
+
+    @asynccontextmanager
+    async def _v_pool_44(_t):
+        yield mock_v_client
+
+    with (
+        patch("app.auth.SessionStore.get", return_value=store_44),
+        patch("app.auth.ClientPool.get", return_value=cp_44),
+        patch("app.auth.pooled_client", _v_pool_44),
+        patch("app.auth.warm_session", AsyncMock(return_value=("ct0_44", {}))),
+    ):
+        login_44 = await login_with_auth_token(tok)
+    assert login_44["status"] == "error" and login_44["http_status"] == 502
+    store_44.store_viewer.assert_not_awaited()
+    cp_44.invalidate.assert_awaited_once_with(tok, all_proxies=False)
+    rec_clean_44 = _logging.getLogger("xapi.clean44").makeRecord(
+        "xapi.clean44", _logging.INFO, "f.py", 1, "check %s", ("http://u:sec44@31.6.46.27:8080",), None
+    )
+    json_clean_44 = jfmt.format(rec_clean_44)
+    assert "getMessage" not in json_clean_44 and "sec44" not in json_clean_44

@@ -121,8 +121,8 @@ async def v2_chat_members(conversation_id: str = PathParam(..., pattern=r"^\d+$"
 def _is_fatal_proxy_or_auth_err(res: Any) -> bool:
     """True bila panggilan pertama sudah membuktikan `auth_token` invalid (401)
     atau kegagalan di tingkat proxy/jaringan (`warm-up failed:`, `upstream request failed:`,
-    `non-JSON`, atau 402/407 `_no_retry`), sehingga fallback beruntun ke endpoint lain
-    hanya akan menggandakan hang."""
+    `rejected by proxy/upstream`, `non-JSON`, atau 402/407 `_no_retry`), sehingga fallback
+    beruntun ke endpoint lain hanya akan menggandakan hang."""
     if not isinstance(res, dict):
         return False
     if res.get("status") == "invalid":
@@ -132,7 +132,7 @@ def _is_fatal_proxy_or_auth_err(res: Any) -> bool:
     if res.get("_no_retry"):
         return True
     err_s = str(res.get("error") or "")
-    return err_s.startswith(("warm-up failed:", "upstream request failed:", "non-JSON"))
+    return err_s.startswith(("warm-up failed:", "upstream request failed:", "rejected by proxy/upstream", "non-JSON"))
 
 
 def _is_dead_proxy_err(res: Any) -> bool:
@@ -143,7 +143,12 @@ def _is_dead_proxy_err(res: Any) -> bool:
     if res.get("http_status") == 403:
         return False
     err_s = str(res.get("error") or "")
-    return bool(res.get("_no_retry")) or err_s.startswith(("warm-up failed:", "upstream request failed:"))
+    return bool(res.get("_no_retry")) or err_s.startswith((
+        "warm-up failed:",
+        "upstream request failed:",
+        "rejected by proxy/upstream",
+        "non-JSON",
+    ))
 
 
 async def _resolve_me_or_error(
@@ -225,10 +230,7 @@ async def v2_chat_messages(
     if (
         pin
         and result.get("status") != "invalid"
-        and not (
-            str(result.get("error") or "").startswith("warm-up failed:")
-            and result.get("http_status") != 403
-        )
+        and not _is_dead_proxy_err(result)
     ):
         pw_res = await send_xchat_dm_via_browser(tok, pin, norm_conv_id, body.text)
         if pw_res.get("status") == "ok":
@@ -1637,10 +1639,7 @@ async def v2_dm_send(
     if (
         pin
         and result.get("status") != "invalid"
-        and not (
-            str(result.get("error") or "").startswith("warm-up failed:")
-            and result.get("http_status") != 403
-        )
+        and not _is_dead_proxy_err(result)
     ):
         conv_id = dm_conv_id_for(me, participant_id)
         pw_res = await send_xchat_dm_via_browser(tok, pin, conv_id, body.text)
@@ -1701,10 +1700,7 @@ async def v2_dm_send_to_conv(
     if (
         pin
         and result.get("status") != "invalid"
-        and not (
-            str(result.get("error") or "").startswith("warm-up failed:")
-            and result.get("http_status") != 403
-        )
+        and not _is_dead_proxy_err(result)
     ):
         pw_res = await send_xchat_dm_via_browser(tok, pin, norm_conv_id, body.text)
         if pw_res.get("status") == "ok":

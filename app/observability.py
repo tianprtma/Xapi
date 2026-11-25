@@ -36,6 +36,7 @@ class _JSONFormatter(logging.Formatter):
     _BUILTIN_ATTRS = frozenset(logging.LogRecord("", 0, "", 0, "", (), None).__dict__.keys()) | {
         "message",
         "asctime",
+        "getMessage",
     }
 
     def format(self, record: logging.LogRecord) -> str:
@@ -82,12 +83,14 @@ def install_proxy_log_record_factory() -> None:
         from .config import redact_proxy_creds
 
         rec = cur_factory(*args, **kwargs)
-        orig_get_message = rec.getMessage
-
-        def _safe_get_message() -> str:
-            return redact_proxy_creds(orig_get_message())
-
-        rec.getMessage = _safe_get_message  # type: ignore[method-assign]
+        try:
+            rendered = rec.getMessage()
+            if "://" in rendered or "@" in rendered or ":" in rendered:
+                rec.msg = redact_proxy_creds(rendered)
+                rec.args = ()
+        except Exception:  # noqa: BLE001
+            if isinstance(getattr(rec, "msg", None), str):
+                rec.msg = redact_proxy_creds(rec.msg)
         if rec.exc_info and rec.exc_info[0] and not rec.exc_text:
             import traceback
 

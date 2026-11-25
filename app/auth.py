@@ -418,30 +418,50 @@ async def login_with_auth_token(auth_token: str, *, _rewarm_retry: bool = False)
             "lang": None,
         }
 
+        viewer_parse_failed = False
         if viewer_resp.status_code == 200:
-            try:
-                v = viewer_resp.json()
-                user_result = (
-                    v.get("data", {})
-                    .get("viewer", {})
-                    .get("user_results", {})
-                    .get("result", {})
-                )
-                legacy = user_result.get("legacy", {}) or {}
-                core = user_result.get("core", {}) or {}
-                user_data.update({
-                    "id": user_result.get("rest_id") or user_data["id"],
-                    "screen_name": core.get("screen_name") or legacy.get("screen_name"),
-                    "name": core.get("name") or legacy.get("name"),
-                    "followers_count": legacy.get("followers_count"),
-                    "friends_count": legacy.get("friends_count"),
-                    "statuses_count": legacy.get("statuses_count"),
-                    "verified": user_result.get("is_blue_verified") or legacy.get("verified"),
-                    "protected": legacy.get("protected"),
-                    "created_at": core.get("created_at") or legacy.get("created_at"),
-                })
-            except (json.JSONDecodeError, KeyError, AttributeError):
-                pass
+            raw_v_txt = getattr(viewer_resp, "text", None)
+            if isinstance(raw_v_txt, str) and raw_v_txt.lstrip()[:32].lower().startswith(("<!doctype", "<html", "<head", "<body")):
+                if hasattr(store, "invalidate"):
+                    await store.invalidate(auth_token, all_proxies=False)
+                await ClientPool.get().invalidate(auth_token, all_proxies=False)
+                if had_cached_session and not _rewarm_retry:
+                    need_rewarm = True
+                else:
+                    return {
+                        "status": "error",
+                        "http_status": 502,
+                        "error": "non-JSON HTML response from proxy/upstream",
+                        "cookies": jar,
+                        "tokens": {"bearer": WEB_BEARER, "ct0": ct0, "auth_token": auth_token},
+                        "user": None,
+                    }
+            else:
+                try:
+                    v = viewer_resp.json()
+                    if inspect.isawaitable(v):
+                        v = await v
+                    user_result = (
+                        v.get("data", {})
+                        .get("viewer", {})
+                        .get("user_results", {})
+                        .get("result", {})
+                    )
+                    legacy = user_result.get("legacy", {}) or {}
+                    core = user_result.get("core", {}) or {}
+                    user_data.update({
+                        "id": user_result.get("rest_id") or user_data["id"],
+                        "screen_name": core.get("screen_name") or legacy.get("screen_name"),
+                        "name": core.get("name") or legacy.get("name"),
+                        "followers_count": legacy.get("followers_count"),
+                        "friends_count": legacy.get("friends_count"),
+                        "statuses_count": legacy.get("statuses_count"),
+                        "verified": user_result.get("is_blue_verified") or legacy.get("verified"),
+                        "protected": legacy.get("protected"),
+                        "created_at": core.get("created_at") or legacy.get("created_at"),
+                    })
+                except (json.JSONDecodeError, ValueError, KeyError, AttributeError):
+                    viewer_parse_failed = True
         elif viewer_resp.status_code == 401:
             from .response_cache import ResponseCache
             ResponseCache.get().invalidate_token(auth_token)
@@ -491,7 +511,8 @@ async def login_with_auth_token(auth_token: str, *, _rewarm_retry: bool = False)
                 "tokens": {"bearer": WEB_BEARER, "ct0": ct0, "auth_token": auth_token},
                 "user": user_data,
             }
-            await store.store_viewer(auth_token, result)
+            if not (viewer_parse_failed and not user_data.get("screen_name")):
+                await store.store_viewer(auth_token, result)
             return result
 
     return await login_with_auth_token(auth_token, _rewarm_retry=True)

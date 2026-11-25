@@ -295,14 +295,14 @@ class TIDProvider:
                 ondemand_url = None
             if ondemand_url:
                 resp = sess.get(ondemand_url, timeout=10)
-                if resp.status_code in (402, 407):
+                if resp.status_code in (402, 407) or (bool(sess.proxies) and resp.status_code in (403, 502, 503, 504)):
                     raise RuntimeError(f"proxy ondemand HTTP {resp.status_code}")
                 if resp.status_code == 200 and _is_valid_js(resp.content):
                     return resp.content
             for idx_url in SCRIPT_INDEX_URLS:
                 try:
                     idx = sess.get(idx_url, timeout=10)
-                    if idx.status_code in (402, 407):
+                    if idx.status_code in (402, 407) or (bool(sess.proxies) and idx.status_code in (403, 502, 503, 504)):
                         raise RuntimeError(f"proxy script index HTTP {idx.status_code}")
                     if idx.status_code != 200:
                         continue

@@ -53,6 +53,7 @@ from ..clients import (
     dm_call,
     dm_conv_id_for,
     graphql_call,
+    is_dead_proxy_error_result,
     media_upload,
     rest_call,
 )
@@ -359,7 +360,7 @@ async def v2_users_search(
             "error": None,
         }
         return finalize(result, lambda g: format_tweet_collection(g, item="user"), raw=bool(raw))
-    if gql.get("status") == "invalid" or str(gql.get("error") or "").startswith("warm-up failed:"):
+    if gql.get("status") == "invalid" or is_dead_proxy_error_result(gql):
         return finalize(gql, lambda g: format_tweet_collection(g, item="user"), raw=bool(raw))
     try:
         pw = await search_via_browser(auth_token=tok, q=query, search_type="People")
@@ -507,7 +508,7 @@ async def v2_user_by_id(
         # dan proxy tidak sedang mati pada tahap warm_session.
         if (
             os.environ.get("PLAYWRIGHT_FALLBACK", "0") == "1"
-            and not str(result.get("error") or "").startswith("warm-up failed:")
+            and not is_dead_proxy_error_result(result)
         ):
             try:
                 pw = await fetch_via_browser(
@@ -631,7 +632,7 @@ async def v2_user_followers(
         result["status"] == "ok"
         or result.get("status") == "invalid"
         or pagination_token
-        or str(result.get("error") or "").startswith("warm-up failed:")
+        or is_dead_proxy_error_result(result)
     ):
         return finalize(result, lambda g: format_tweet_collection(g, item="user"), raw=bool(raw))
     try:
@@ -913,7 +914,7 @@ async def v2_user_tweets_replies(
         result["status"] == "ok"
         or result.get("status") == "invalid"
         or pagination_token
-        or str(result.get("error") or "").startswith("warm-up failed:")
+        or is_dead_proxy_error_result(result)
     ):
         return finalize(result, format_tweet_collection, raw=bool(raw))
     try:

@@ -70,8 +70,44 @@ class _JSONFormatter(logging.Formatter):
         return json.dumps(base, default=str, ensure_ascii=False)
 
 
+def install_proxy_log_record_factory() -> None:
+    """Pasang LogRecordFactory idempoten agar semua logger (termasuk child logger
+    dan `uvicorn.error` dengan `propagate=False`) me-redact kredensial proxy pada
+    `getMessage()` maupun `exc_text`."""
+    cur_factory = logging.getLogRecordFactory()
+    if getattr(cur_factory, "_xapi_proxy_redacting", False):
+        return
+
+    def _redacting_factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
+        from .config import redact_proxy_creds
+
+        rec = cur_factory(*args, **kwargs)
+        orig_get_message = rec.getMessage
+
+        def _safe_get_message() -> str:
+            return redact_proxy_creds(orig_get_message())
+
+        rec.getMessage = _safe_get_message  # type: ignore[method-assign]
+        if rec.exc_info and rec.exc_info[0] and not rec.exc_text:
+            import traceback
+
+            rec.exc_text = redact_proxy_creds(
+                "".join(traceback.format_exception(*rec.exc_info))
+            ).rstrip("\n")
+        elif isinstance(rec.exc_text, str):
+            rec.exc_text = redact_proxy_creds(rec.exc_text)
+        return rec
+
+    _redacting_factory._xapi_proxy_redacting = True  # type: ignore[attr-defined]
+    logging.setLogRecordFactory(_redacting_factory)
+
+
+install_proxy_log_record_factory()
+
+
 def _setup_logging() -> None:
     """Route all loggers to stdout as structured JSON."""
+    install_proxy_log_record_factory()
     root = logging.getLogger()
     root.setLevel(getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO))
     handler = logging.StreamHandler(sys.stdout)

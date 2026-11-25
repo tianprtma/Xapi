@@ -2517,3 +2517,53 @@ async def test_pass37_captive_portal_warm_tid_client_direct_fallback_and_chat_me
     assert xc_st_42 == 502
     cp_inv_42.assert_awaited_once_with(tok, all_proxies=False)
     xc_inv_42.assert_awaited_once_with(tok)
+
+    # 9) Pass 43: SSRF local/wildcard-DNS hostnames (ip6-localhost, ip6-loopback, host.docker.internal,
+    #    *.nip.io, *.sslip.io, localtest.me, *.internal, local hostname) blocked while http://squid:3128 preserved;
+    #    and LogRecordFactory redacts child loggers & non-propagating loggers (e.g. uvicorn.error) + tracebacks.
+    import io
+    import logging as _logging
+    import socket as _socket
+    from app.config import validate_proxy_url
+    from app.observability import install_proxy_log_record_factory
+
+    assert validate_proxy_url("http://squid:3128") == "http://squid:3128"
+    local_hn_43 = (_socket.gethostname() or "").strip().lower().rstrip(".")
+    bad_hosts_43 = [
+        "http://ip6-localhost:8080",
+        "http://ip6-loopback:8080",
+        "http://host.docker.internal:8080",
+        "http://127.0.0.1.nip.io:8080",
+        "http://127-0-0-1.sslip.io:8080",
+        "http://sub.localtest.me:8080",
+        "http://svc.internal:8080",
+        "http://mybox.local:8080",
+    ]
+    if local_hn_43 and local_hn_43 != "squid":
+        bad_hosts_43.append(f"http://{local_hn_43}:8000")
+    for bh in bad_hosts_43:
+        with pytest.raises(ValueError):
+            validate_proxy_url(bh)
+
+    install_proxy_log_record_factory()
+    buf_43 = io.StringIO()
+    nonprop_log = _logging.getLogger("uvicorn.error.test_pass43")
+    nonprop_log.propagate = False
+    nonprop_log.setLevel(_logging.INFO)
+    h_43 = _logging.StreamHandler(buf_43)
+    h_43.setFormatter(_logging.Formatter("%(message)s"))
+    nonprop_log.addHandler(h_43)
+    try:
+        try:
+            raise RuntimeError("tunnel failed http://usr:uvsecret43@31.6.46.27:12323")
+        except RuntimeError:
+            nonprop_log.exception("worker err %s", "31.6.46.27:12323:usr:uvshort43")
+    finally:
+        nonprop_log.removeHandler(h_43)
+    rendered_43 = buf_43.getvalue()
+    assert "uvsecret43" not in rendered_43
+    assert "uvshort43" not in rendered_43
+    assert "***@31.6.46.27:12323" in rendered_43
+    assert "31.6.46.27:12323:***" in rendered_43
+    assert redact_proxy_creds("err via http://u:p,a:s@31.6.46.27:12323/: refused") == "err via http://***@31.6.46.27:12323/: refused"
+    assert redact_proxy_creds("PROXY_LIST=31.6.46.27:12323:u1:sec1,u2:sec2@1.2.3.4:8080") == "PROXY_LIST=31.6.46.27:12323:***,***@1.2.3.4:8080"

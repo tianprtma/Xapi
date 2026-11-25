@@ -309,28 +309,72 @@ _REQUEST_PROXY_VAR: contextvars.ContextVar[Optional[str]] = contextvars.ContextV
 )
 
 
+_NEXT_PROXY_LIST_ENTRY_RE = (
+    r"(?:(?:https?|socks(?:4a?|5h?)?)://|(?:direct|none)\b"
+    r"|(?:[^\s/:'\"<>@=,]+(?::[^\s'\"<>,]+)?|\*{3})@(?:\[[0-9a-fA-F:]+\]|[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.?):\d{1,5}\b"
+    r"|(?:\[[0-9a-fA-F:]+\]|[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+\.?):\d{1,5}\b)"
+)
 _PROXY_CREDS_RE = _re.compile(
     r"((?:https?|socks(?:4a?|5h?)?)://)"
-    r"(?:[^\s/?#:'\"<>,]+:(?![0-9]{1,5}[/?#,])(?:(?!://)[^\s,])*?|[^\s/?#'\"<>,]+)@"
+    r"(?:[^\s/?#:'\"<>,]+:(?![0-9]{1,5}(?:[/?#,]|$)|//)(?:(?!://)[^\s'\"<>])*?|[^\s/?#'\"<>,]+)@"
     r"(?=(?:\[[0-9a-fA-F:]+\]|[a-zA-Z0-9.-]+)(?::\d{1,5})?(?:[\s/'\"<>),;\]}.!?#]|:(?!\d)|$))",
     _re.IGNORECASE,
 )
 _PROXY_SHORTHAND_CREDS_RE = _re.compile(
-    r"((?<![A-Za-z0-9._/-])(?:\[[0-9a-fA-F:]+\]|[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+\.?):\d{1,5}):[^\s,'\";\]})]+:[^\s,'\";\]})]+"
+    r"((?<![A-Za-z0-9._/-])(?:\[[0-9a-fA-F:]+\]|[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+\.?):\d{1,5}):[^\s,'\";\]})]+:(?:(?![,.:!?](?:\s|$)|," + _NEXT_PROXY_LIST_ENTRY_RE + r")[^\s'\";\]})])+"
 )
 _PROXY_SCHEMELESS_AT_RE = _re.compile(
-    r"(?:(?<=[\s'\"(<\[,;={])|^)[^\s/:'\"<>@=,]+:(?!//)(?:(?!://)[^\s'\"<>,])+@(?=(?:\[[0-9a-fA-F:]+\]|[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.?):\d{1,5}(?:[\s/'\"<>),;\]}.!?#]|:(?!\d)|$))"
+    r"(?:(?<=[\s'\"(<\[,;={])|^)(?!(?:\[[0-9a-fA-F:]+\]|[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+\.?):\d{1,5}:)[^\s/:'\"<>@=,]+:(?!//|[0-9]{1,5}(?:[/?#,\s]|$))(?:(?!://)[^\s'\"<>])+?@(?=(?:\[[0-9a-fA-F:]+\]|[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.?):\d{1,5}(?:[\s/'\"<>),;\]}.!?#]|:(?!\d)|$))"
 )
+def _detect_local_self_hosts() -> frozenset[str]:
+    out: set[str] = set()
+    try:
+        hn = (socket.gethostname() or "").strip().lower().rstrip(".")
+    except Exception:  # noqa: BLE001
+        hn = ""
+    for cand in (hn, hn.split(".", 1)[0] if hn else ""):
+        if cand and cand != "squid":
+            out.add(cand)
+    return frozenset(out)
+
+
 _DISALLOWED_PROXY_HOSTS = frozenset({
     "localhost",
     "localhost.localdomain",
+    "ip6-localhost",
+    "ip6-loopback",
+    "ip6-allnodes",
+    "ip6-allrouters",
+    "broadcasthost",
+    "host.docker.internal",
+    "gateway.docker.internal",
+    "kubernetes.default",
+    "kubernetes.default.svc",
+    "kubernetes.default.svc.cluster.local",
+    "localtest.me",
+    "lvh.me",
+    "vcap.me",
+    "nip.io",
+    "sslip.io",
+    "xip.io",
     "metadata",
     "metadata.goog",
     "metadata.google.internal",
     "metadata.azure.internal",
     "instance-data",
     "instance-data.ec2.internal",
-})
+}) | _detect_local_self_hosts()
+_DISALLOWED_PROXY_HOST_SUFFIXES = (
+    ".localhost",
+    ".local",
+    ".internal",
+    ".nip.io",
+    ".sslip.io",
+    ".xip.io",
+    ".localtest.me",
+    ".lvh.me",
+    ".vcap.me",
+)
 _VALID_PROXY_HOST_RE = _re.compile(r"^[a-z0-9.:-]+$")
 _HEX_LABEL_RE = _re.compile(r"^0x[0-9a-f]+$")
 _PCT_HEX_RE = _re.compile(r"%[0-9A-Fa-f]{2}")
@@ -561,7 +605,7 @@ def validate_proxy_url(raw: str) -> str:
         raise ValueError("host proxy tidak valid")
     if "%" in host_clean or not _VALID_PROXY_HOST_RE.match(host_clean):
         raise ValueError("host proxy mengandung karakter/encoding tidak valid")
-    if host_clean in _DISALLOWED_PROXY_HOSTS or host_clean.endswith(".localhost"):
+    if host_clean in _DISALLOWED_PROXY_HOSTS or host_clean.endswith(_DISALLOWED_PROXY_HOST_SUFFIXES):
         raise ValueError("host proxy loopback/metadata internal tidak diizinkan")
     ip_candidate = host_clean
     parsed_ip = None

@@ -204,7 +204,7 @@ async def main() -> int:
         try:
             proxy_ctx_tok = set_request_proxy(validate_proxy_url(normalize_proxy_input(args.proxy)))
         except ValueError as exc:
-            print(f"ERROR: --proxy tidak valid: {exc}", file=sys.stderr)
+            print(f"ERROR: --proxy tidak valid: {redact_proxy_creds(str(exc))}", file=sys.stderr)
             return 2
 
     try:

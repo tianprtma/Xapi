@@ -618,6 +618,7 @@ class XChatContextPool:
     def __init__(self) -> None:
         self._ctxs: OrderedDict[str, BrowserContext] = OrderedDict()  # key = hash
         self._ctx_use: dict[int, int] = {}   # id(ctx) -> jumlah holder
+        self._ctx_keys: dict[int, str] = {}  # id(ctx) -> key (untuk drain close_all)
         self._ctx_proxy: dict[str, Optional[str]] = {}  # key -> proxy URL aktif
         self._closing_count: dict[str, int] = {}  # key -> context yg sedang drain/close (anti SingletonLock race)
         self._idle_events: dict[str, asyncio.Event] = {}  # key -> notif saat context idle/closed
@@ -795,6 +796,7 @@ class XChatContextPool:
 
                     self._ctxs[key] = ctx
                     self._ctx_proxy[key] = desired_proxy
+                    self._ctx_keys[id(ctx)] = key
                     self._ctx_use[id(ctx)] = self._ctx_use.get(id(ctx), 0) + 1
 
                     # Evict LRU idle bila melebihi cap (persistent: aman, state di disk)
@@ -808,6 +810,7 @@ class XChatContextPool:
                         old = self._ctxs.pop(evict_key)
                         self._ctx_proxy.pop(evict_key, None)
                         self._ctx_use.pop(id(old), None)
+                        self._ctx_keys.pop(id(old), None)
                         self._dropped.discard(old)
                         try:
                             await old.close()
@@ -839,7 +842,7 @@ class XChatContextPool:
             dropped = ctx in self._dropped
             if dropped:
                 self._dropped.discard(ctx)
-            else:
+            elif self._closing_count.get(key, 0) == 0:
                 ev = self._idle_events.pop(key, None)
                 if ev is not None:
                     ev.set()
@@ -850,6 +853,7 @@ class XChatContextPool:
                 pass
             finally:
                 async with self._lock:
+                    self._ctx_keys.pop(id(ctx), None)
                     rem = max(0, self._closing_count.get(key, 0) - 1)
                     if rem == 0:
                         self._closing_count.pop(key, None)
@@ -866,6 +870,7 @@ class XChatContextPool:
             self._ctx_proxy.pop(key, None)
             if ctx is None:
                 return
+            self._ctx_keys[id(ctx)] = key
             if self._ctx_use.get(id(ctx), 0) > 0:
                 self._dropped.add(ctx)
                 self._closing_count[key] = self._closing_count.get(key, 0) + 1
@@ -878,6 +883,7 @@ class XChatContextPool:
             pass
         finally:
             async with self._lock:
+                self._ctx_keys.pop(id(ctx), None)
                 rem = max(0, self._closing_count.get(key, 0) - 1)
                 if rem == 0:
                     self._closing_count.pop(key, None)
@@ -889,20 +895,39 @@ class XChatContextPool:
 
     async def close_all(self) -> None:
         async with self._lock:
-            ctxs = list(self._ctxs.values())
+            closing_pairs: list[tuple[str, BrowserContext]] = list(self._ctxs.items())
+            for d_ctx in self._dropped:
+                d_key = self._ctx_keys.get(id(d_ctx), "")
+                closing_pairs.append((d_key, d_ctx))
             self._ctxs.clear()
             self._ctx_proxy.clear()
             self._ctx_use.clear()
+            self._ctx_keys.clear()
+            self._dropped.clear()
             self._closing_count.clear()
-            for ev in self._idle_events.values():
-                ev.set()
-            self._idle_events.clear()
-            dropped, self._dropped = list(self._dropped), set()
-        for ctx in ctxs + dropped:
-            try:
-                await ctx.close()
-            except Exception:  # noqa: BLE001
-                pass
+            for k, _ in closing_pairs:
+                if k:
+                    self._closing_count[k] = self._closing_count.get(k, 0) + 1
+        try:
+            for _, ctx in closing_pairs:
+                try:
+                    await ctx.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        finally:
+            async with self._lock:
+                for k, _ in closing_pairs:
+                    if not k:
+                        continue
+                    rem = max(0, self._closing_count.get(k, 0) - 1)
+                    if rem == 0:
+                        self._closing_count.pop(k, None)
+                    else:
+                        self._closing_count[k] = rem
+                for k in [k for k in list(self._idle_events) if self._closing_count.get(k, 0) == 0]:
+                    ev = self._idle_events.pop(k, None)
+                    if ev is not None:
+                        ev.set()
 
     def stats(self) -> dict[str, int]:
         return {
@@ -1036,9 +1061,12 @@ async def _click_action_via_browser_impl(
             return {"status": "error", "error": "no response captured", "data": None}
 
         if captured.get("status", 0) >= 400:
+            cap_st = int(captured.get("status") or 502)
+            if cap_st in (401, 403, 402, 407):
+                await ContextPool.get().invalidate(auth_token, all_proxies=(cap_st == 401))
             return {
-                "status": "error",
-                "http_status": captured.get("status"),
+                "status": "invalid" if cap_st == 401 else "error",
+                "http_status": 502 if cap_st in (402, 407) else cap_st,
                 "error": captured.get("data") or captured.get("raw"),
                 "data": None,
             }
@@ -1145,9 +1173,11 @@ async def _action_via_browser_impl(
         payload = result.get("body")
 
         if status_code >= 400:
+            if status_code in (401, 403, 402, 407):
+                await ContextPool.get().invalidate(auth_token, all_proxies=(status_code == 401))
             return {
-                "status": "error",
-                "http_status": status_code,
+                "status": "invalid" if status_code == 401 else "error",
+                "http_status": 502 if status_code in (402, 407) else status_code,
                 "error": payload,
                 "data": None,
             }
@@ -1266,24 +1296,35 @@ async def _fetch_via_browser_impl(
             await asyncio.sleep(0.2)
 
         if "data" not in captured:
+            raw_st = captured.get("status")
+            if isinstance(raw_st, int) and raw_st in (401, 403, 402, 407):
+                await ContextPool.get().invalidate(auth_token, all_proxies=(raw_st == 401))
+            norm_raw_st = (
+                502
+                if (not isinstance(raw_st, int) or raw_st < 400 or raw_st in (402, 407))
+                else raw_st
+            )
             err_msg = (
-                f"upstream non-JSON response ({captured.get('status')})"
+                f"upstream non-JSON response ({raw_st})"
                 if "raw" in captured
                 else f"timeout: response {match_path} tidak ter-capture"
             )
             return {
-                "status": "error",
+                "status": "invalid" if raw_st == 401 else "error",
                 "error": err_msg,
                 "captured_url": captured.get("url"),
-                "http_status": captured.get("status"),
+                "http_status": norm_raw_st if "raw" in captured else raw_st,
                 "raw": captured.get("raw"),
                 "data": None,
             }
 
         if captured.get("status", 0) >= 400:
+            cap_st = int(captured.get("status") or 502)
+            if cap_st in (401, 403, 402, 407):
+                await ContextPool.get().invalidate(auth_token, all_proxies=(cap_st == 401))
             return {
-                "status": "error",
-                "http_status": captured.get("status"),
+                "status": "invalid" if cap_st == 401 else "error",
+                "http_status": 502 if cap_st in (402, 407) else cap_st,
                 "captured_url": captured.get("url"),
                 "error": captured.get("data") or captured.get("raw"),
                 "data": None,
@@ -1400,24 +1441,35 @@ async def _search_via_browser_impl(
             await asyncio.sleep(0.2)
 
         if "data" not in captured:
+            raw_st = captured.get("status")
+            if isinstance(raw_st, int) and raw_st in (401, 403, 402, 407):
+                await ContextPool.get().invalidate(auth_token, all_proxies=(raw_st == 401))
+            norm_raw_st = (
+                502
+                if (not isinstance(raw_st, int) or raw_st < 400 or raw_st in (402, 407))
+                else raw_st
+            )
             err_msg = (
-                f"upstream non-JSON response ({captured.get('status')})"
+                f"upstream non-JSON response ({raw_st})"
                 if "raw" in captured
                 else "timeout: response SearchTimeline/adaptive.json tidak ter-capture"
             )
             return {
-                "status": "error",
+                "status": "invalid" if raw_st == 401 else "error",
                 "error": err_msg,
                 "captured_url": captured.get("url"),
-                "http_status": captured.get("status"),
+                "http_status": norm_raw_st if "raw" in captured else raw_st,
                 "raw": captured.get("raw"),
                 "data": None,
             }
 
         if captured.get("status", 0) >= 400:
+            cap_st = int(captured.get("status") or 502)
+            if cap_st in (401, 403, 402, 407):
+                await ContextPool.get().invalidate(auth_token, all_proxies=(cap_st == 401))
             return {
-                "status": "error",
-                "http_status": captured.get("status"),
+                "status": "invalid" if cap_st == 401 else "error",
+                "http_status": 502 if cap_st in (402, 407) else cap_st,
                 "captured_url": captured.get("url"),
                 "error": captured.get("data") or captured.get("raw"),
                 "data": None,

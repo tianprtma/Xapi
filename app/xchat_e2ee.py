@@ -694,7 +694,7 @@ async def unlock_and_read_xchat_inbox(
         except Exception as exc:
             from .config import redact_proxy_creds
             err_s = redact_proxy_creds(str(exc))
-            if any(t in err_s for t in ("ERR_PROXY", "ERR_SOCKS", "ERR_TUNNEL")):
+            if any(t in err_s for t in ("ERR_PROXY", "ERR_SOCKS", "ERR_TUNNEL", "_PROXY_", "SUPPORTED_PROXIES")):
                 await XChatContextPool.get().invalidate(auth_token)
             log.warning("unlock_and_read_xchat_inbox error: %s", err_s)
             return []
@@ -2087,7 +2087,7 @@ async def unlock_and_read_xchat_conversation(
         except Exception as exc:
             from .config import redact_proxy_creds
             err_s = redact_proxy_creds(str(exc))
-            if any(t in err_s for t in ("ERR_PROXY", "ERR_SOCKS", "ERR_TUNNEL")):
+            if any(t in err_s for t in ("ERR_PROXY", "ERR_SOCKS", "ERR_TUNNEL", "_PROXY_", "SUPPORTED_PROXIES")):
                 await XChatContextPool.get().invalidate(auth_token)
             log.warning("unlock_and_read_xchat_conversation(%s) failed: %s", norm_conv_id, err_s)
             return []
@@ -2265,7 +2265,7 @@ async def send_xchat_dm_via_browser(
         except Exception as exc:
             from .config import redact_proxy_creds
             err_s = redact_proxy_creds(str(exc))
-            if any(t in err_s for t in ("ERR_PROXY", "ERR_SOCKS", "ERR_TUNNEL")):
+            if any(t in err_s for t in ("ERR_PROXY", "ERR_SOCKS", "ERR_TUNNEL", "_PROXY_", "SUPPORTED_PROXIES")):
                 await XChatContextPool.get().invalidate(auth_token)
             log.warning("send_xchat_dm_via_browser(%s) failed: %s", norm_conv_id, err_s)
             return {"status": "error", "error": err_s}

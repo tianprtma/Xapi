@@ -63,6 +63,7 @@ from ..config import (
     SearchType,
     UPLOAD_BASE,
     WEB_BEARER,
+    redact_proxy_creds,
 )
 from ..playwright_helpers import resolve_screen_name, tweet_author_handle
 from ..responses import batch_finalize, finalize, stub_501, wrap, write_finalize
@@ -113,7 +114,7 @@ async def v2_tweets_bulk(
     results = await asyncio.gather(*[_one(t) for t in id_list], return_exceptions=True)
 
     if raw:
-        return JSONResponse(status_code=200, content={"data": [r if isinstance(r, dict) else str(r) for r in results]})
+        return JSONResponse(status_code=200, content={"data": [r if isinstance(r, dict) else redact_proxy_creds(str(r)) for r in results]})
 
     data: list[dict] = []
     users: dict[str, dict] = {}
@@ -137,7 +138,7 @@ async def v2_tweets_bulk(
             errors.append({
                 "id": tid,
                 "title": title,
-                "detail": str(r.get("error") if isinstance(r, dict) else r)[:200],
+                "detail": redact_proxy_creds(str(r.get("error") if isinstance(r, dict) else r))[:200],
                 "type": err_type,
                 "status": http_st,
             })

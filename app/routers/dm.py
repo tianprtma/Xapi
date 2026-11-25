@@ -1350,50 +1350,65 @@ async def v2_dm_media_proxy(
         return Response(content=raw_bytes, media_type=mime)
 
     url = f"https://ton.x.com/1.1/ton/data/dm/{dm_id}/{media_id.strip('/')}/{resource_id}"
-    async with pooled_client(tok) as client:
-        try:
-            ct0, cookies = await warm_session(client, tok)
-        except InvalidTokenError as e:
-            return JSONResponse(
-                status_code=401,
-                content=format_error("Unauthorized", e.message, "unauthorized", 401),
-            )
-        except WarmNetworkError as e:
-            st = getattr(e, "http_status", 502)
-            st = st if isinstance(st, int) and st >= 400 else 502
-            return JSONResponse(
-                status_code=st,
-                content=format_error("Upstream Error", f"warm-up failed: {e.message}", "upstream_error", st),
-            )
-        for k, v in cookies.items():
-            client.cookies.set(k, v, domain=".x.com")
-            client.cookies.set(k, v, domain=".twitter.com")
-        hdrs = {**api_headers(ct0, tok), "referer": "https://x.com/messages"}
-        hdrs.pop("content-type", None)
-        try:
-            resp = await client.get(url, headers=hdrs)
-        except Exception as exc:  # noqa: BLE001
-            from ..client_pool import ClientPool
-            await ClientPool.get().invalidate(tok, all_proxies=False)
-            return JSONResponse(
-                status_code=502,
-                content=format_error("Media Fetch Error", f"Upstream ton.x.com error: {type(exc).__name__}", "upstream_error", 502),
-            )
-        if resp.status_code != 200:
+    from ..client_pool import ClientPool
+
+    resp = None
+    last_exc: Optional[Exception] = None
+    for _attempt in range(2):
+        had_cached_session = (await SessionStore.get().lookup(tok)) is not None
+        async with pooled_client(tok) as client:
+            try:
+                ct0, cookies = await warm_session(client, tok)
+            except InvalidTokenError as e:
+                return JSONResponse(
+                    status_code=401,
+                    content=format_error("Unauthorized", e.message, "unauthorized", 401),
+                )
+            except WarmNetworkError as e:
+                st = getattr(e, "http_status", 502)
+                st = st if isinstance(st, int) and st >= 400 else 502
+                return JSONResponse(
+                    status_code=st,
+                    content=format_error("Upstream Error", f"warm-up failed: {e.message}", "upstream_error", st),
+                )
+            for k, v in cookies.items():
+                client.cookies.set(k, v, domain=".x.com")
+                client.cookies.set(k, v, domain=".twitter.com")
+            hdrs = {**api_headers(ct0, tok), "referer": "https://x.com/messages"}
+            hdrs.pop("content-type", None)
+            try:
+                resp = await client.get(url, headers=hdrs)
+                last_exc = None
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                await ClientPool.get().invalidate(tok, all_proxies=False)
+                if _attempt == 0:
+                    continue
+                return JSONResponse(
+                    status_code=502,
+                    content=format_error("Media Fetch Error", f"Upstream ton.x.com error: {type(exc).__name__}", "upstream_error", 502),
+                )
+            if resp.status_code == 200:
+                content_type = resp.headers.get("content-type") or "application/octet-stream"
+                return Response(content=resp.content, media_type=content_type)
             if resp.status_code in (401, 403):
-                from ..client_pool import ClientPool
                 all_p = resp.status_code == 401
                 await SessionStore.get().invalidate(tok, all_proxies=all_p)
                 await ClientPool.get().invalidate(tok, all_proxies=all_p)
-            elif resp.status_code in (402, 407):
-                from ..client_pool import ClientPool
+                if _attempt == 0 and had_cached_session:
+                    continue
+            elif resp.status_code in (402, 407, 502, 503, 504):
                 await ClientPool.get().invalidate(tok, all_proxies=False)
-            return JSONResponse(
-                status_code=resp.status_code if resp.status_code in (401, 403, 404, 429) else 502,
-                content=format_error("Media Fetch Error", f"Upstream ton.x.com returned {resp.status_code}", "upstream_error", resp.status_code),
-            )
-        content_type = resp.headers.get("content-type") or "application/octet-stream"
-        return Response(content=resp.content, media_type=content_type)
+                if _attempt == 0 and resp.status_code in (502, 503, 504):
+                    continue
+            break
+
+    raw_code = resp.status_code if resp is not None else 502
+    out_st = raw_code if raw_code in (401, 403, 404, 429) else 502
+    return JSONResponse(
+        status_code=out_st,
+        content=format_error("Media Fetch Error", f"Upstream ton.x.com returned {raw_code}", "upstream_error", out_st),
+    )
 
 
 @router.post("/2/dm_conversations")

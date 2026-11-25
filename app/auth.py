@@ -128,6 +128,14 @@ def make_client(auth_token: str) -> AsyncSession:
     )
     if proxy:
         kwargs["proxies"] = {"http": proxy, "https": proxy}
+    import asyncio as _asyncio
+    try:
+        _asyncio.get_running_loop()
+    except RuntimeError:
+        try:
+            _asyncio.get_event_loop()
+        except RuntimeError:
+            _asyncio.set_event_loop(_asyncio.new_event_loop())
     return AsyncSession(**kwargs)
 
 
@@ -265,17 +273,28 @@ async def warm_session(
 # ──────────────────────────── Login flow ────────────────────────────
 
 
-async def login_with_auth_token(auth_token: str) -> dict[str, Any]:
+async def login_with_auth_token(auth_token: str, *, _rewarm_retry: bool = False) -> dict[str, Any]:
     """Validate auth_token + fetch viewer profile.
 
     Fast path: cached viewer dari SessionStore (TTL 5 min) — skip upstream call.
 
     Returns dict: {status: valid|invalid, http_status, cookies, tokens, user}
     """
+    import asyncio as _asyncio
+
     store = SessionStore.get()
     cached = await store.lookup_viewer(auth_token)
     if cached:
         return cached
+
+    had_cached_session = False
+    if not _rewarm_retry:
+        _lk = getattr(store, "lookup", None)
+        if callable(_lk):
+            _cand = _lk(auth_token)
+            if _asyncio.iscoroutine(_cand):
+                had_cached_session = (await _cand) is not None
+    need_rewarm = False
 
     async with pooled_client(auth_token) as client:
         try:
@@ -374,44 +393,53 @@ async def login_with_auth_token(auth_token: str) -> dict[str, Any]:
             if hasattr(store, "invalidate"):
                 await store.invalidate(auth_token, all_proxies=True)
             await ClientPool.get().invalidate(auth_token, all_proxies=True)
-            return {
-                "status": "invalid",
-                "http_status": 401,
-                "error": viewer_resp.text[:500],
-                "cookies": jar,
-                "tokens": {"bearer": WEB_BEARER, "ct0": ct0, "auth_token": auth_token},
-                "user": None,
-            }
+            if had_cached_session:
+                need_rewarm = True
+            else:
+                return {
+                    "status": "invalid",
+                    "http_status": 401,
+                    "error": viewer_resp.text[:500],
+                    "cookies": jar,
+                    "tokens": {"bearer": WEB_BEARER, "ct0": ct0, "auth_token": auth_token},
+                    "user": None,
+                }
         else:
             raw_v_st = viewer_resp.status_code
             if raw_v_st == 403:
                 if hasattr(store, "invalidate"):
                     await store.invalidate(auth_token, all_proxies=False)
                 await ClientPool.get().invalidate(auth_token, all_proxies=False)
+                if had_cached_session:
+                    need_rewarm = True
                 err_st = 403
             elif raw_v_st in (402, 407):
                 await ClientPool.get().invalidate(auth_token, all_proxies=False)
                 err_st = 502
             else:
                 err_st = raw_v_st if raw_v_st >= 400 else 502
-            return {
-                "status": "error",
-                "http_status": err_st,
-                "error": viewer_resp.text[:500],
+            if not need_rewarm:
+                return {
+                    "status": "error",
+                    "http_status": err_st,
+                    "error": viewer_resp.text[:500],
+                    "cookies": jar,
+                    "tokens": {"bearer": WEB_BEARER, "ct0": ct0, "auth_token": auth_token},
+                    "user": None,
+                }
+
+        if not need_rewarm:
+            result = {
+                "status": "valid",
+                "http_status": 200,
                 "cookies": jar,
                 "tokens": {"bearer": WEB_BEARER, "ct0": ct0, "auth_token": auth_token},
-                "user": None,
+                "user": user_data,
             }
+            await store.store_viewer(auth_token, result)
+            return result
 
-        result = {
-            "status": "valid",
-            "http_status": 200,
-            "cookies": jar,
-            "tokens": {"bearer": WEB_BEARER, "ct0": ct0, "auth_token": auth_token},
-            "user": user_data,
-        }
-        await store.store_viewer(auth_token, result)
-        return result
+    return await login_with_auth_token(auth_token, _rewarm_retry=True)
 
 
 async def resolve_me_id(auth_token: str) -> Optional[str]:

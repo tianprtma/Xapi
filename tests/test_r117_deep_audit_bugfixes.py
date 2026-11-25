@@ -1257,3 +1257,236 @@ async def test_pass18_xchat_singleton_lock_wait_on_dropped_close_and_static_prox
     assert acquired is new_ctx
     # launch_new MUST strictly happen AFTER close_done (never overlapping SingletonLock!)
     assert events_order == ["close_start", "close_done", "launch_new"]
+
+
+# ── 32. Pass 20: Rotating-proxy __cf_bm GET auto-rewarm, RFC 3986 userinfo/IPv6/brackets, JSON log redaction, browser 401/403/407 eviction, TID proxy, XChat close_all drain ──
+
+@pytest.mark.asyncio
+async def test_pass20_proxy_algorithms_rewarm_userinfo_redaction_browser_and_tid():
+    import logging
+    from contextlib import asynccontextmanager
+    from app.auth import InvalidTokenError, WarmNetworkError
+    from app.clients import _graphql_call_once, media_upload
+    from app.config import (
+        normalize_proxy_input,
+        redact_proxy_creds,
+        reset_request_proxy,
+        set_request_proxy,
+        validate_proxy_url,
+    )
+    from app.observability import _JSONFormatter
+    from playwright_search import XChatContextPool
+
+    tok = "a" * 40
+
+    # 1. Input normalization + cross-Python (3.9..3.15) bracket/percent validation + uppercase/slash redaction
+    assert normalize_proxy_input("http://usr:p[a]ss@31.6.46.27:12323") == "http://usr:p%5Ba%5Dss@31.6.46.27:12323"
+    assert validate_proxy_url(normalize_proxy_input("http://usr:p[a]ss@31.6.46.27:12323")) == "http://usr:p%5Ba%5Dss@31.6.46.27:12323"
+    assert normalize_proxy_input("http://usr:100%ok%40x@31.6.46.27:12323") == "http://usr:100%25ok%40x@31.6.46.27:12323"
+    assert normalize_proxy_input("http://usr:p@s/s#1@31.6.46.27:12323/") == "http://usr:p%40s%2Fs%231@31.6.46.27:12323"
+    assert normalize_proxy_input("usr:p[a]s@s@31.6.46.27:12323") == "http://usr:p%5Ba%5Ds%40s@31.6.46.27:12323"
+    assert normalize_proxy_input("tok123@31.6.46.27:12323") == "http://tok123@31.6.46.27:12323"
+    assert normalize_proxy_input("[2606:4700::1]:8080:u:p@1") == "http://u:p%401@[2606:4700::1]:8080"
+    with pytest.raises(ValueError):
+        validate_proxy_url("http://usr:p[a]ss@31.6.46.27:12323")
+    with pytest.raises(ValueError):
+        validate_proxy_url("http://usr:100%zz@31.6.46.27:12323")
+
+    assert redact_proxy_creds("HTTP://usr:p/a@ss@31.6.46.27:12323 and SOCKS5H://tok@1.2.3.4:1080") == (
+        "HTTP://***@31.6.46.27:12323 and SOCKS5H://***@1.2.3.4:1080"
+    )
+    assert redact_proxy_creds("https://x.com/@jack and http://x.com:8080/@jack") == (
+        "https://x.com/@jack and http://x.com:8080/@jack"
+    )
+    rec = logging.LogRecord("xapi.test", logging.WARNING, __file__, 1, "err http://u:secret123@31.6.46.27:12323", (), None)
+    rec.proxy_detail = "socks5://u:secret456@31.6.46.27:1080"
+    fmt_out = _JSONFormatter().format(rec)
+    assert "secret123" not in fmt_out and "secret456" not in fmt_out
+    assert "http://***@31.6.46.27:12323" in fmt_out
+
+    # 2. Rotating-proxy __cf_bm / stale cached session auto-rewarm on GraphQL GET:
+    #    First call uses cached session -> gets 403 (IP rotated) -> invalidates & rewarms once -> 200 OK!
+    gql_calls = 0
+
+    class _RotSess:
+        async def get(self, url, headers=None, params=None):
+            nonlocal gql_calls
+            gql_calls += 1
+            if gql_calls == 1:
+                return MagicMock(status_code=403, text="CF __cf_bm IP mismatch")
+            resp_ok = MagicMock(status_code=200, text='{"data":{"user":{}}}')
+            resp_ok.json = MagicMock(return_value={"data": {"user": {"rest_id": "1"}}})
+            return resp_ok
+
+    @asynccontextmanager
+    async def _rot_pool(_t):
+        yield _RotSess()
+
+    lookup_calls = 0
+
+    async def _fake_lookup(_t):
+        nonlocal lookup_calls
+        lookup_calls += 1
+        return ("ct0_cached", {"__cf_bm": "old"}) if lookup_calls == 1 else None
+
+    inv_ss = AsyncMock()
+    inv_cp = AsyncMock()
+    with (
+        patch("app.clients.SessionStore.get", return_value=MagicMock(lookup=_fake_lookup, invalidate=inv_ss)),
+        patch("app.clients.ClientPool.get", return_value=MagicMock(invalidate=inv_cp)),
+        patch("app.clients.pooled_client", _rot_pool),
+        patch("app.clients.warm_session", AsyncMock(side_effect=[("ct0_cached", {}), ("ct0_fresh", {})])),
+        patch("app.clients.TIDProvider.get", return_value=MagicMock(generate=AsyncMock(return_value="tid"))),
+    ):
+        gql_res = await _graphql_call_once("UserByRestId", {"userId": "1"}, tok, method="GET")
+    assert gql_res["status"] == "ok"
+    assert gql_calls == 2
+    inv_ss.assert_awaited_once_with(tok, all_proxies=False)
+
+    # 2b. Cached session + revoked token -> GET returns 401 -> rewarm raises InvalidTokenError -> status='invalid' (401)!
+    class _RevokedSess:
+        async def get(self, url, headers=None, params=None):
+            return MagicMock(status_code=401, text='{"errors":[{"code":89}]}')
+
+    @asynccontextmanager
+    async def _rev_pool(_t):
+        yield _RevokedSess()
+
+    with (
+        patch("app.clients.SessionStore.get", return_value=MagicMock(lookup=AsyncMock(return_value=("ct0_old", {})), invalidate=AsyncMock())),
+        patch("app.clients.ClientPool.get", return_value=MagicMock(invalidate=AsyncMock())),
+        patch("app.clients.pooled_client", _rev_pool),
+        patch("app.clients.warm_session", AsyncMock(side_effect=[("ct0_old", {}), InvalidTokenError(401, "token dead", {}, "ct0")])),
+        patch("app.clients.TIDProvider.get", return_value=MagicMock(generate=AsyncMock(return_value="tid"))),
+    ):
+        rev_res = await _graphql_call_once("UserByRestId", {"userId": "1"}, tok, method="GET")
+    assert rev_res["status"] == "invalid"
+    assert rev_res["http_status"] == 401
+
+    # 3. media_upload does NOT re-warm dead proxy a second time when proxy_warm_ok is False and direct returns 429
+    t_ctx = set_request_proxy("http://31.6.46.27:12323")
+    try:
+        warm_tags = []
+
+        async def _warm_tag(sess, _t):
+            tag = getattr(sess, "tag", "proxy")
+            warm_tags.append(tag)
+            if tag == "proxy":
+                raise WarmNetworkError("proxy timeout", http_status=502)
+            return ("ct0_d", {"twid": "u%3D1"})
+
+        class _TS:
+            def __init__(self, tag):
+                self.tag = tag
+                self.cookies = MagicMock(jar=[])
+                self.timeout = 20.0
+            async def close(self):
+                pass
+
+        @asynccontextmanager
+        async def _p_pool(_t):
+            yield _TS("proxy")
+
+        with (
+            patch("app.clients.MEDIA_PROXY_EXEMPT", True),
+            patch("app.clients.pooled_client", _p_pool),
+            patch("app.clients.warm_session", side_effect=_warm_tag),
+            patch("app.clients.ClientPool.get", return_value=MagicMock(invalidate=AsyncMock())),
+            patch("app.clients._direct_session", side_effect=lambda *a, **kw: _TS("direct")),
+            patch("app.clients._upload_chunks", AsyncMock(return_value={"status": "error", "http_status": 429, "error": "rate limit", "data": None})),
+        ):
+            m_res = await media_upload(tok, b"img", "image/jpeg")
+    finally:
+        reset_request_proxy(t_ctx)
+    assert m_res["http_status"] == 429
+    assert warm_tags == ["proxy", "direct"]
+
+    # 4. XChatContextPool.close_all holds _closing_count until ctx.close() completes (even for dropped in-use contexts)
+    xpool = XChatContextPool()
+    order_close = []
+
+    async def _slow_c():
+        order_close.append("closing_start")
+        await asyncio.sleep(0.05)
+        order_close.append("closing_end")
+
+    d_ctx = MagicMock(pages=[], close=AsyncMock(side_effect=_slow_c))
+    n_ctx = MagicMock(pages=[], add_init_script=AsyncMock(), add_cookies=AsyncMock(), close=AsyncMock())
+    import hashlib as _hl
+    xkey = _hl.sha256(f"xchat:{tok}".encode()).hexdigest()[:16]
+    xpool._ctxs[xkey] = d_ctx
+    xpool._ctx_keys[id(d_ctx)] = xkey
+    xpool._ctx_use[id(d_ctx)] = 1
+    await xpool.invalidate(tok)  # moves d_ctx into _dropped
+
+    async def _mk_ctx(*a, **kw):
+        order_close.append("launch_after_close_all")
+        return n_ctx
+
+    f_drv = MagicMock()
+    f_drv.chromium.launch_persistent_context = AsyncMock(side_effect=_mk_ctx)
+    with (
+        patch("playwright_search.PlaywrightPool.get", return_value=MagicMock(driver=AsyncMock(return_value=f_drv))),
+        patch("playwright_search._apply_session_cookies", AsyncMock()),
+    ):
+        t_close_all = asyncio.create_task(xpool.close_all())
+        await asyncio.sleep(0.01)
+        got_ctx = await xpool.acquire(tok)
+        await t_close_all
+    assert got_ctx is n_ctx
+    assert order_close == ["closing_start", "closing_end", "launch_after_close_all"]
+
+    # 5. v2_dm_media_proxy retries cached-session 403 once (rotating proxy recovery) and maps 407 -> 502 consistently
+    from app.routers.dm import v2_dm_media_proxy
+    ton_calls = 0
+
+    class _TonSess:
+        def __init__(self):
+            self.cookies = MagicMock()
+        async def get(self, url, headers=None):
+            nonlocal ton_calls
+            ton_calls += 1
+            if ton_calls == 1:
+                return MagicMock(status_code=403, text="CF mismatch", headers={})
+            return MagicMock(status_code=200, content=b"JPGDATA", headers={"content-type": "image/jpeg"})
+
+    @asynccontextmanager
+    async def _ton_pool(_t):
+        yield _TonSess()
+
+    ton_lks = 0
+    async def _ton_lk(_t):
+        nonlocal ton_lks
+        ton_lks += 1
+        return ("ct0_c", {}) if ton_lks == 1 else None
+
+    with (
+        patch("app.routers.dm.SessionStore.get", return_value=MagicMock(lookup=_ton_lk, invalidate=AsyncMock())),
+        patch("app.client_pool.ClientPool.get", return_value=MagicMock(invalidate=AsyncMock())),
+        patch("app.client_pool.pooled_client", _ton_pool),
+        patch("app.routers.dm.warm_session", AsyncMock(side_effect=[("ct0_c", {}), ("ct0_f", {})])),
+    ):
+        ton_resp = await v2_dm_media_proxy("111", "222", "img.jpg", authorization=f"Bearer {tok}", auth_token=None)
+    assert ton_resp.status_code == 200
+    assert ton_resp.body == b"JPGDATA"
+    assert ton_calls == 2
+
+    class _Ton407Sess:
+        def __init__(self):
+            self.cookies = MagicMock()
+        async def get(self, url, headers=None):
+            return MagicMock(status_code=407, text="Proxy Auth Required", headers={})
+
+    @asynccontextmanager
+    async def _ton407_pool(_t):
+        yield _Ton407Sess()
+
+    with (
+        patch("app.routers.dm.SessionStore.get", return_value=MagicMock(lookup=AsyncMock(return_value=None), invalidate=AsyncMock())),
+        patch("app.client_pool.ClientPool.get", return_value=MagicMock(invalidate=AsyncMock())),
+        patch("app.client_pool.pooled_client", _ton407_pool),
+        patch("app.routers.dm.warm_session", AsyncMock(return_value=("ct0_f", {}))),
+    ):
+        ton_407 = await v2_dm_media_proxy("111", "222", "img.jpg", authorization=f"Bearer {tok}", auth_token=None)
+    assert ton_407.status_code == 502
+    assert b'"status":502' in ton_407.body or b'"status": 502' in ton_407.body

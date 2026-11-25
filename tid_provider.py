@@ -197,6 +197,9 @@ class TIDProvider:
                             if resp is None:
                                 return None
                             return await resp.text()
+                        except Exception:
+                            await ContextPool.get().invalidate(auth_token, all_proxies=False)
+                            raise
                         finally:
                             await page.close()
                     finally:
@@ -247,22 +250,39 @@ class TIDProvider:
                         )
                         return resp.content
                 except Exception as e:  # noqa: BLE001
-                    log.warning("TID script index fetch gagal: %s", e)
+                    from app.config import redact_proxy_creds
+                    log.warning("TID script index fetch gagal: %s", redact_proxy_creds(str(e)))
             raise RuntimeError("ondemand.s tidak dapat ditemukan")
 
-        def _do() -> ClientTransaction:
-            with _BoundedSession() as sess:
-                sess.trust_env = False
-                sess.headers["User-Agent"] = (
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36"
-                )
-                content = _fetch_ondemand_content(sess)
+        def _do(proxy: Optional[str] = None) -> ClientTransaction:
+            def _fetch_with(use_proxy: Optional[str]) -> bytes:
+                with _BoundedSession() as sess:
+                    sess.trust_env = False
+                    if use_proxy:
+                        sess.proxies = {"http": use_proxy, "https": use_proxy}
+                    sess.headers["User-Agent"] = (
+                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0.0.0 Safari/537.36"
+                    )
+                    return _fetch_ondemand_content(sess)
+
+            content: Optional[bytes] = None
+            if proxy:
+                try:
+                    content = _fetch_with(proxy)
+                except Exception as exc:  # noqa: BLE001
+                    from app.config import redact_proxy_creds
+                    log.warning(
+                        "TID ondemand fetch via proxy failed (%s) — fallback direct",
+                        redact_proxy_creds(str(exc)),
+                    )
+            if content is None:
+                content = _fetch_with(None)
             ondemand = bs4.BeautifulSoup(content, "html.parser")
             return ClientTransaction(home, ondemand)
 
-        self._ct = await loop.run_in_executor(None, _do)
+        self._ct = await loop.run_in_executor(None, lambda: _do(active_proxy))
         self._loaded_at = time.time()
 
     async def generate(self, method: str, path: str, auth_token: Optional[str] = None) -> str:

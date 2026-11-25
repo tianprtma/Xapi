@@ -63,6 +63,7 @@ from ..config import (
     SearchType,
     UPLOAD_BASE,
     WEB_BEARER,
+    redact_proxy_creds,
 )
 from ..playwright_helpers import resolve_screen_name, tweet_author_handle
 from ..responses import finalize, stub_501, wrap, write_finalize
@@ -106,7 +107,7 @@ async def v2_spaces_lookup(
     if raw:
         return JSONResponse(
             status_code=200,
-            content={"results": [r if isinstance(r, dict) else {"status": "error", "error": str(r)} for r in results]},
+            content={"results": [r if isinstance(r, dict) else {"status": "error", "error": redact_proxy_creds(str(r))} for r in results]},
         )
     data: list[Any] = []
     errors: list[dict[str, Any]] = []
@@ -123,7 +124,7 @@ async def v2_spaces_lookup(
             errors.append({
                 "id": sid,
                 "title": "Unauthorized" if http_st == 401 else ("Too Many Requests" if http_st == 429 else "Space Lookup Failed"),
-                "detail": str(r.get("error") if isinstance(r, dict) else r)[:200],
+                "detail": redact_proxy_creds(str(r.get("error") if isinstance(r, dict) else r))[:200],
                 "type": err_type,
                 "status": http_st,
             })

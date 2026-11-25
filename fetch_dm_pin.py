@@ -40,7 +40,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from app.auth import api_headers, login_with_auth_token, resolve_me_id, warm_session  # noqa: E402
 from app.client_pool import pooled_client  # noqa: E402
 from app.clients import dm_call, graphql_call  # noqa: E402
-from app.config import reset_request_proxy, set_request_proxy, validate_proxy_url  # noqa: E402
+from app.config import normalize_proxy_input, reset_request_proxy, set_request_proxy, validate_proxy_url  # noqa: E402
 from app.xchat_e2ee import (  # noqa: E402
     get_cached_e2ee_media,
     resolve_dm_pin,
@@ -147,7 +147,7 @@ async def main() -> int:
     proxy_ctx_tok = None
     if (args.proxy or "").strip():
         try:
-            proxy_ctx_tok = set_request_proxy(validate_proxy_url(args.proxy))
+            proxy_ctx_tok = set_request_proxy(validate_proxy_url(normalize_proxy_input(args.proxy)))
         except ValueError as exc:
             print(f"ERROR: --proxy tidak valid: {exc}", file=sys.stderr)
             return 2

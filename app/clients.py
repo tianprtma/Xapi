@@ -103,6 +103,8 @@ async def _graphql_call_once(
     variables: dict[str, Any],
     auth_token: str,
     method: str = "GET",
+    *,
+    _rewarm_retry: bool = False,
 ) -> dict[str, Any]:
     """Single GraphQL request — no retry, no cache (used by `graphql_call`)."""
     meta = GQL_META.get(operation)
@@ -110,6 +112,14 @@ async def _graphql_call_once(
         raise HTTPException(status_code=500, detail=f"unknown GraphQL op: {operation}")
 
     url = f"{GRAPHQL_BASE}/{meta['queryId']}/{operation}"
+    had_cached_session = False
+    if method == "GET" and not _rewarm_retry:
+        _lk = getattr(SessionStore.get(), "lookup", None)
+        if callable(_lk):
+            _cand = _lk(auth_token)
+            if asyncio.iscoroutine(_cand):
+                had_cached_session = (await _cand) is not None
+    need_rewarm = False
 
     async with pooled_client(auth_token) as client:
         try:
@@ -163,33 +173,41 @@ async def _graphql_call_once(
                 all_p = resp.status_code == 401
                 await SessionStore.get().invalidate(auth_token, all_proxies=all_p)
                 await ClientPool.get().invalidate(auth_token, all_proxies=all_p)
+                if had_cached_session:
+                    need_rewarm = True
             elif resp.status_code in (402, 407):
                 await ClientPool.get().invalidate(auth_token, all_proxies=False)
-            out_st = 502 if resp.status_code in (402, 407) or resp.status_code < 400 else resp.status_code
+            if not need_rewarm:
+                out_st = 502 if resp.status_code in (402, 407) or resp.status_code < 400 else resp.status_code
+                return {
+                    "status": "error",
+                    "http_status": out_st,
+                    "error": resp.text[:1000],
+                    "data": None,
+                }
+
+        if not need_rewarm:
+            try:
+                payload = resp.json()
+            except json.JSONDecodeError:
+                return {
+                    "status": "error",
+                    "http_status": 502,
+                    "error": "non-JSON response",
+                    "raw": resp.text[:1000],
+                    "data": None,
+                }
+
             return {
-                "status": "error",
-                "http_status": out_st,
-                "error": resp.text[:1000],
-                "data": None,
+                "status": "ok",
+                "http_status": 200,
+                "operation": operation,
+                "data": payload,
             }
 
-        try:
-            payload = resp.json()
-        except json.JSONDecodeError:
-            return {
-                "status": "error",
-                "http_status": 502,
-                "error": "non-JSON response",
-                "raw": resp.text[:1000],
-                "data": None,
-            }
-
-        return {
-            "status": "ok",
-            "http_status": 200,
-            "operation": operation,
-            "data": payload,
-        }
+    return await _graphql_call_once(
+        operation, variables, auth_token, method, _rewarm_retry=True
+    )
 
 
 # ──────────────────────────── REST 1.1 ────────────────────────────
@@ -224,9 +242,18 @@ async def _rest_call_once(
     data: Optional[dict[str, Any]] = None,
     json_body: Optional[dict[str, Any]] = None,
     base: str = REST_BASE,
+    _rewarm_retry: bool = False,
 ) -> dict[str, Any]:
     """Single REST 1.1 request — used by `rest_call` (no retry/cache)."""
     url = f"{base}/{path.lstrip('/')}"
+    had_cached_session = False
+    if method == "GET" and not _rewarm_retry:
+        _lk = getattr(SessionStore.get(), "lookup", None)
+        if callable(_lk):
+            _cand = _lk(auth_token)
+            if asyncio.iscoroutine(_cand):
+                had_cached_session = (await _cand) is not None
+    need_rewarm = False
 
     async with pooled_client(auth_token) as client:
         try:
@@ -257,6 +284,8 @@ async def _rest_call_once(
             if json_body is not None:
                 headers["content-type"] = "application/json"
                 resp = await client.request(method, url, headers=headers, json=json_body)
+            elif method == "GET" and data is None:
+                resp = await client.request(method, url, headers=headers)
             else:
                 headers["content-type"] = "application/x-www-form-urlencoded"
                 resp = await client.request(method, url, headers=headers, data=data or {})
@@ -274,25 +303,39 @@ async def _rest_call_once(
                 all_p = resp.status_code == 401
                 await SessionStore.get().invalidate(auth_token, all_proxies=all_p)
                 await ClientPool.get().invalidate(auth_token, all_proxies=all_p)
+                if had_cached_session:
+                    need_rewarm = True
             elif resp.status_code in (402, 407):
                 await ClientPool.get().invalidate(auth_token, all_proxies=False)
+            if not need_rewarm:
+                return {
+                    "status": "error",
+                    "http_status": 502 if resp.status_code in (402, 407) else resp.status_code,
+                    "error": resp.text[:1000],
+                    "data": None,
+                }
+
+        if not need_rewarm:
+            try:
+                payload = resp.json()
+            except json.JSONDecodeError:
+                payload = {"raw": resp.text[:1000]}
+
             return {
-                "status": "error",
-                "http_status": 502 if resp.status_code in (402, 407) else resp.status_code,
-                "error": resp.text[:1000],
-                "data": None,
+                "status": "ok",
+                "http_status": resp.status_code,
+                "data": payload,
             }
 
-        try:
-            payload = resp.json()
-        except json.JSONDecodeError:
-            payload = {"raw": resp.text[:1000]}
-
-        return {
-            "status": "ok",
-            "http_status": resp.status_code,
-            "data": payload,
-        }
+    return await _rest_call_once(
+        path,
+        auth_token,
+        method=method,
+        data=data,
+        json_body=json_body,
+        base=base,
+        _rewarm_retry=True,
+    )
 
 
 # ──────────────────────────── DM (REST 1.1 internal) ────────────────────────────
@@ -330,6 +373,7 @@ async def _dm_call_once(
     data: Optional[dict[str, Any]] = None,
     json_body: Optional[dict[str, Any]] = None,
     with_dm_defaults: bool = True,
+    _rewarm_retry: bool = False,
 ) -> dict[str, Any]:
     """Single REST 1.1 DM request — used by `dm_call` (no retry)."""
     url = f"{DM_BASE}/{path.lstrip('/')}"
@@ -339,6 +383,15 @@ async def _dm_call_once(
         final_params.update(DM_DEFAULT_PARAMS)
     if params:
         final_params.update(params)
+
+    had_cached_session = False
+    if method == "GET" and not _rewarm_retry:
+        _lk = getattr(SessionStore.get(), "lookup", None)
+        if callable(_lk):
+            _cand = _lk(auth_token)
+            if asyncio.iscoroutine(_cand):
+                had_cached_session = (await _cand) is not None
+    need_rewarm = False
 
     async with pooled_client(auth_token) as client:
         try:
@@ -398,20 +451,35 @@ async def _dm_call_once(
                 all_p = resp.status_code == 401
                 await SessionStore.get().invalidate(auth_token, all_proxies=all_p)
                 await ClientPool.get().invalidate(auth_token, all_proxies=all_p)
+                if had_cached_session:
+                    need_rewarm = True
             elif resp.status_code in (402, 407):
                 await ClientPool.get().invalidate(auth_token, all_proxies=False)
+            if not need_rewarm:
+                return {
+                    "status": "error",
+                    "http_status": 502 if resp.status_code in (402, 407) else resp.status_code,
+                    "error": payload,
+                    "data": None,
+                }
+
+        if not need_rewarm:
             return {
-                "status": "error",
-                "http_status": 502 if resp.status_code in (402, 407) else resp.status_code,
-                "error": payload,
-                "data": None,
+                "status": "ok",
+                "http_status": resp.status_code,
+                "data": payload,
             }
 
-        return {
-            "status": "ok",
-            "http_status": resp.status_code,
-            "data": payload,
-        }
+    return await _dm_call_once(
+        path,
+        auth_token,
+        method=method,
+        params=params,
+        data=data,
+        json_body=json_body,
+        with_dm_defaults=with_dm_defaults,
+        _rewarm_retry=True,
+    )
 
 
 def _safe_sort_key(x: str) -> tuple[int, str]:
@@ -486,6 +554,7 @@ async def media_upload(
     # proxy mati dan MEDIA_PROXY_EXEMPT aktif, warm ulang via direct —
     # session upload memang direct, jadi konsisten.
     has_proxy = bool(proxy_for_token(auth_token))
+    proxy_warm_ok = False
     jar: dict[str, str] = {}
     ct0: Optional[str] = None
     warm_err_status: int = 502
@@ -494,6 +563,7 @@ async def media_upload(
         async with pooled_client(auth_token) as client:
             try:
                 ct0, _ = await warm_session(client, auth_token)
+                proxy_warm_ok = True
             except InvalidTokenError as e:
                 return {
                     "status": "invalid",
@@ -565,6 +635,7 @@ async def media_upload(
             direct_res.pop("_proxy_err", None)
             if (
                 direct_res.get("status") == "ok"
+                or not proxy_warm_ok
                 or direct_res.get("http_status") not in (401, 403, 429, 500, 502, 503, 504)
             ):
                 return direct_res
@@ -573,6 +644,13 @@ async def media_upload(
                 direct_res.get("http_status"),
             )
         except Exception as exc:  # noqa: BLE001
+            if not proxy_warm_ok:
+                return {
+                    "status": "error",
+                    "http_status": 502,
+                    "error": redact_proxy_creds(f"upload failed (proxy & direct): {type(exc).__name__}: {exc}"),
+                    "data": None,
+                }
             logging.getLogger("xapi.upload").warning(
                 "upload direct gagal (%s: %s) — fallback ke proxy",
                 type(exc).__name__, redact_proxy_creds(str(exc)))

@@ -309,9 +309,105 @@ _REQUEST_PROXY_VAR: contextvars.ContextVar[Optional[str]] = contextvars.ContextV
 )
 
 
-_PROXY_CREDS_RE = _re.compile(r"((?:https?|socks5h?)://)([^@/\s]+)@")
+_PROXY_CREDS_RE = _re.compile(
+    r"((?:https?|socks5h?)://)"
+    r"(?:[^\s/:'\"<>]+:(?![0-9]{1,5}/)[^\s'\"<>]*?|[^\s/?#'\"<>]+)@"
+    r"(?=(?:\[[0-9a-fA-F:]+\]|[a-zA-Z0-9.-]+)(?::\d{1,5})?(?:[\s/'\"<>),;\]}]|$))",
+    _re.IGNORECASE,
+)
 _VALID_PROXY_HOST_RE = _re.compile(r"^[a-z0-9.:-]+$")
 _HEX_LABEL_RE = _re.compile(r"^0x[0-9a-f]+$")
+_PCT_HEX_RE = _re.compile(r"%[0-9A-Fa-f]{2}")
+_BAD_PCT_RE = _re.compile(r"%(?![0-9A-Fa-f]{2})")
+_SAFE_USERINFO_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+)
+
+
+def _encode_userinfo_component(raw_part: str) -> str:
+    """Encode komponen user/pass sesuai RFC 3986 tanpa meng-encode ulang %XX yang sudah valid."""
+    out: list[str] = []
+    i = 0
+    n = len(raw_part)
+    while i < n:
+        ch = raw_part[i]
+        if ch == "%" and i + 2 < n and _PCT_HEX_RE.match(raw_part, i):
+            out.append(raw_part[i : i + 3])
+            i += 3
+            continue
+        if ch in _SAFE_USERINFO_CHARS:
+            out.append(ch)
+        else:
+            for b in ch.encode("utf-8"):
+                out.append(f"%{b:02X}")
+        i += 1
+    return "".join(out)
+
+
+def _encode_userinfo(userinfo: str) -> str:
+    if ":" in userinfo:
+        u, p = userinfo.split(":", 1)
+        return f"{_encode_userinfo_component(u)}:{_encode_userinfo_component(p)}"
+    return _encode_userinfo_component(userinfo)
+
+
+def normalize_proxy_input(raw: str) -> str:
+    """Normalisasi input proxy dari CLI / env (`PROXY_LIST`, `--proxy`):
+    dukung URL penuh, `direct`/`none`, `user:pass@host:port`, `[ipv6]:port[:user:pass]`,
+    serta shorthand provider `host:port:user:pass` / `host:port`."""
+    from urllib.parse import quote as _quote
+
+    val = (raw or "").strip().strip('"').strip("'").strip()
+    if not val:
+        return ""
+    if val.lower() in ("direct", "none"):
+        return val.lower()
+    if "://" in val:
+        scheme, rest = val.split("://", 1)
+        if "@" in rest:
+            userinfo, _, hostport = rest.rpartition("@")
+            if hostport.endswith("/") and "/" not in hostport[:-1]:
+                hostport = hostport[:-1]
+            if userinfo and hostport and "/" not in hostport and "?" not in hostport and "#" not in hostport:
+                return f"{scheme}://{_encode_userinfo(userinfo)}@{hostport}"
+        else:
+            if rest.endswith("/") and "/" not in rest[:-1]:
+                rest = rest[:-1]
+        return f"{scheme}://{rest}"
+    if val.startswith("["):
+        host_bracket, bsep, tail = val.partition("]")
+        if bsep and tail.startswith(":"):
+            rest_parts = tail[1:].split(":", 2)
+            if len(rest_parts) == 1 and rest_parts[0].isdigit() and 1 <= int(rest_parts[0]) <= 65535:
+                return f"http://{host_bracket}]:{rest_parts[0]}"
+            if len(rest_parts) == 3 and rest_parts[0].isdigit() and 1 <= int(rest_parts[0]) <= 65535:
+                port_s, u_s, p_s = rest_parts
+                return f"http://{_quote(u_s, safe='')}:{_quote(p_s, safe='')}@{host_bracket}]:{port_s}"
+        return val
+    parts = val.split(":", 3)
+    if (
+        len(parts) == 4
+        and parts[0]
+        and all(c not in parts[0] for c in "/@#?")
+        and parts[1].isdigit()
+        and 1 <= int(parts[1]) <= 65535
+    ):
+        return f"http://{_quote(parts[2], safe='')}:{_quote(parts[3], safe='')}@{parts[0]}:{parts[1]}"
+    if (
+        len(parts) == 2
+        and parts[0]
+        and all(c not in parts[0] for c in "/@#?")
+        and parts[1].isdigit()
+        and 1 <= int(parts[1]) <= 65535
+    ):
+        return f"http://{parts[0]}:{parts[1]}"
+    if "@" in val:
+        userinfo, sep, hostport = val.rpartition("@")
+        if hostport.endswith("/") and "/" not in hostport[:-1]:
+            hostport = hostport[:-1]
+        if sep and userinfo and hostport and "/" not in hostport and "?" not in hostport and "#" not in hostport:
+            return f"http://{_encode_userinfo(userinfo)}@{hostport}"
+    return val
 
 
 def redact_proxy_creds(text: str) -> str:
@@ -354,7 +450,10 @@ def validate_proxy_url(raw: str) -> str:
         raise ValueError("proxy URL mengandung karakter terlarang")
     if val.lower() in ("direct", "none"):
         return _DIRECT_PROXY_SENTINEL
-    parsed = urlparse(val)
+    try:
+        parsed = urlparse(val)
+    except ValueError as exc:
+        raise ValueError("format URL proxy tidak valid") from exc
     scheme = (parsed.scheme or "").lower()
     if scheme not in _ALLOWED_PROXY_SCHEMES:
         raise ValueError("skema proxy harus http, https, socks5, atau socks5h")
@@ -395,8 +494,8 @@ def validate_proxy_url(raw: str) -> str:
     if sep:
         if not userinfo or userinfo == ":":
             raise ValueError("kredensial userinfo proxy kosong")
-        if "@" in userinfo:
-            raise ValueError("userinfo proxy mengandung '@' tak ter-encode (gunakan %40)")
+        if "@" in userinfo or "[" in userinfo or "]" in userinfo or _BAD_PCT_RE.search(userinfo):
+            raise ValueError("userinfo proxy mengandung karakter/encoding tak valid")
     # Ekstrak raw port secara ketat (hanya digit ASCII, tolak `+8080` atau `:`)
     if hostport.startswith("["):
         if not isinstance(parsed_ip, ipaddress.IPv6Address):
@@ -428,18 +527,11 @@ def validate_proxy_url(raw: str) -> str:
 
 def _canon_static_proxy(raw: str) -> str:
     """Kanonikalisasi entry PROXY_LIST (dukung shorthand `host:port:user:pass`,
-    lowercase skema/host, tanpa trailing `/`, tolak entry tidak valid/loopback)."""
-    from urllib.parse import quote as _quote
-
-    val = (raw or "").strip().strip('"').strip("'").strip()
-    if not val:
+    `user:pass@host:port`, `[ipv6]:port`, lowercase skema/host, tanpa trailing `/`,
+    serta tolak entry tidak valid/loopback)."""
+    val = normalize_proxy_input(raw)
+    if not val or val in ("direct", "none"):
         return ""
-    if "://" not in val and val.lower() not in ("direct", "none") and not val.startswith("["):
-        parts = val.split(":", 3)
-        if len(parts) == 4 and parts[0] and "/" not in parts[0] and "@" not in parts[0] and parts[1].isdigit():
-            val = f"http://{_quote(parts[2], safe='')}:{_quote(parts[3], safe='')}@{parts[0]}:{parts[1]}"
-        elif len(parts) == 2 and parts[0] and "/" not in parts[0] and "@" not in parts[0] and parts[1].isdigit():
-            val = f"http://{parts[0]}:{parts[1]}"
     try:
         canon = validate_proxy_url(val)
         return "" if canon == _DIRECT_PROXY_SENTINEL else canon

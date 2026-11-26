@@ -106,6 +106,21 @@ async def _download_ton(tok: str, url: str):
                     continue
                 return None, redact_proxy_creds(f"{type(exc).__name__}: {exc}")
             if resp.status_code == 200:
+                final_url = getattr(resp, "url", None)
+                if isinstance(final_url, str) and final_url.startswith(("http://", "https://")):
+                    from urllib.parse import urlparse as _up_ton
+
+                    r_host = (_up_ton(final_url).hostname or "").strip().lower().rstrip(".")
+                    if (
+                        not final_url.lower().startswith("https://")
+                        or not r_host
+                        or not any(r_host == d or r_host.endswith("." + d) for d in ("x.com", "twitter.com", "twimg.com"))
+                    ):
+                        await SessionStore.get().invalidate(tok, all_proxies=False)
+                        await ClientPool.get().invalidate(tok, all_proxies=False)
+                        if _attempt == 0:
+                            continue
+                        return None, "HTTP 502: Upstream ton.x.com redirected off-domain by proxy/captive-portal"
                 ctype_raw = (resp.headers.get("content-type") or "").lower()
                 ctype_base = ctype_raw.split(";", 1)[0].strip()
                 head_low = (resp.content or b"").lstrip()[:32].lower()

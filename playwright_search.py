@@ -330,11 +330,12 @@ class _Socks5AuthRelayPool:
     `socks5://127.0.0.1:<port>` tanpa auth (dengan remote DNS ATYP=0x03).
     """
 
-    MAX_RELAYS = 32
+    MAX_RELAYS = 128
     _instance: "_Socks5AuthRelayPool | None" = None
 
     def __init__(self) -> None:
         self._servers: "OrderedDict[tuple[str, int, str, str], asyncio.AbstractServer]" = OrderedDict()
+        self._active_conns: dict[tuple[str, int, str, str], int] = {}
         self._lock = asyncio.Lock()
 
     @classmethod
@@ -360,18 +361,54 @@ class _Socks5AuthRelayPool:
             except Exception:  # noqa: BLE001
                 pass
 
-    @classmethod
+    @staticmethod
+    async def _resolve_safe_upstream_host(up_host: str, up_port: int) -> str:
+        """Cegah DNS-rebinding SSRF pada relay SOCKS5: bila `up_host` adalah domain
+        (bukan literal IP), resolve via DNS dan pastikan semua IP hasil resolusi bukan
+        loopback/private/link-local/metadata sebelum terkoneksi langsung ke IP tersebut."""
+        import ipaddress
+        import socket
+
+        host_clean = up_host.strip("[]")
+        try:
+            ipaddress.ip_address(host_clean)
+            return host_clean
+        except ValueError:
+            pass
+        from app.config import _is_disallowed_proxy_ip
+
+        infos = await asyncio.get_running_loop().getaddrinfo(
+            host_clean, up_port, type=socket.SOCK_STREAM
+        )
+        safe_ips: list[str] = []
+        for info in infos:
+            sockaddr = info[4]
+            if not sockaddr:
+                continue
+            raw_ip = str(sockaddr[0]).split("%", 1)[0]
+            ip_obj = ipaddress.ip_address(raw_ip)
+            if _is_disallowed_proxy_ip(ip_obj):
+                raise ValueError(f"DNS proxy SOCKS5 mengarah ke IP terlarang: {raw_ip}")
+            if raw_ip not in safe_ips:
+                safe_ips.append(raw_ip)
+        if not safe_ips:
+            raise OSError("DNS proxy SOCKS5 tidak menghasilkan alamat IP")
+        return safe_ips[0]
+
     async def _handle_client(
-        cls,
+        self,
         client_r: asyncio.StreamReader,
         client_w: asyncio.StreamWriter,
         up_host: str,
         up_port: int,
         username: str,
         password: str,
+        relay_key: Optional[tuple[str, int, str, str]] = None,
     ) -> None:
         up_r: Optional[asyncio.StreamReader] = None
         up_w: Optional[asyncio.StreamWriter] = None
+        if relay_key is not None:
+            self._active_conns[relay_key] = self._active_conns.get(relay_key, 0) + 1
         try:
             greet = await asyncio.wait_for(client_r.readexactly(2), timeout=10.0)
             if greet[0] != 0x05:
@@ -403,7 +440,12 @@ class _Socks5AuthRelayPool:
                 return
 
             try:
-                up_r, up_w = await asyncio.wait_for(asyncio.open_connection(up_host, up_port), timeout=15.0)
+                connect_host = await asyncio.wait_for(
+                    self._resolve_safe_upstream_host(up_host, up_port), timeout=10.0
+                )
+                up_r, up_w = await asyncio.wait_for(
+                    asyncio.open_connection(connect_host, up_port), timeout=15.0
+                )
             except Exception:  # noqa: BLE001
                 client_w.write(b"\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00")
                 await client_w.drain()
@@ -433,10 +475,16 @@ class _Socks5AuthRelayPool:
 
             up_w.write(req_head + addr_port)
             await up_w.drain()
-            await asyncio.gather(cls._pump(client_r, up_w), cls._pump(up_r, client_w))
+            await asyncio.gather(self._pump(client_r, up_w), self._pump(up_r, client_w))
         except Exception:  # noqa: BLE001
             pass
         finally:
+            if relay_key is not None:
+                rem = self._active_conns.get(relay_key, 0) - 1
+                if rem > 0:
+                    self._active_conns[relay_key] = rem
+                else:
+                    self._active_conns.pop(relay_key, None)
             for w in (up_w, client_w):
                 if w is not None:
                     try:
@@ -472,18 +520,26 @@ class _Socks5AuthRelayPool:
                 return {"server": f"socks5://127.0.0.1:{port}"}
             if existing is not None:
                 self._servers.pop(key, None)
+                self._active_conns.pop(key, None)
                 try:
                     existing.close()
                 except Exception:  # noqa: BLE001
                     pass
 
             server = await asyncio.start_server(
-                lambda r, w: self._handle_client(r, w, up_host, int(up_port), username, password),
+                lambda r, w: self._handle_client(r, w, up_host, int(up_port), username, password, key),
                 host="127.0.0.1",
                 port=0,
             )
             while len(self._servers) >= self.MAX_RELAYS:
-                _, old_srv = self._servers.popitem(last=False)
+                idle_key = next(
+                    (k for k in self._servers if self._active_conns.get(k, 0) == 0),
+                    None,
+                )
+                if idle_key is None:
+                    break
+                old_srv = self._servers.pop(idle_key)
+                self._active_conns.pop(idle_key, None)
                 try:
                     old_srv.close()
                 except Exception:  # noqa: BLE001
@@ -496,6 +552,7 @@ class _Socks5AuthRelayPool:
         async with self._lock:
             servers = list(self._servers.values())
             self._servers.clear()
+            self._active_conns.clear()
         for s in servers:
             try:
                 s.close()
@@ -504,7 +561,15 @@ class _Socks5AuthRelayPool:
                 pass
 
 
-async def _new_context(browser: Browser, auth_token: str) -> BrowserContext:
+_PW_PROXY_UNSET = object()
+
+
+async def _new_context(
+    browser: Browser,
+    auth_token: str,
+    *,
+    _resolved_pw_proxy: Any = _PW_PROXY_UNSET,
+) -> BrowserContext:
     from app.config import gen_ct0, playwright_proxy_for_token, profile_for_token
 
     prof = profile_for_token(auth_token)
@@ -521,8 +586,12 @@ async def _new_context(browser: Browser, auth_token: str) -> BrowserContext:
             "sec-ch-ua-platform": prof["sec_ch_ua_platform"],
         },
     }
-    pw_proxy = await _Socks5AuthRelayPool.get().resolve_playwright_proxy(
-        playwright_proxy_for_token(auth_token)
+    pw_proxy = (
+        await _Socks5AuthRelayPool.get().resolve_playwright_proxy(
+            playwright_proxy_for_token(auth_token)
+        )
+        if _resolved_pw_proxy is _PW_PROXY_UNSET
+        else _resolved_pw_proxy
     )
     if pw_proxy:
         ctx_kwargs["proxy"] = pw_proxy
@@ -531,6 +600,10 @@ async def _new_context(browser: Browser, auth_token: str) -> BrowserContext:
     except Exception as exc:  # noqa: BLE001
         from app.config import redact_proxy_creds
         raise RuntimeError(redact_proxy_creds(f"browser.new_context failed: {type(exc).__name__}: {exc}")) from exc
+    try:
+        setattr(context, "_xapi_pw_server", (pw_proxy or {}).get("server"))
+    except Exception:  # noqa: BLE001
+        pass
     try:
         # Stealth init script: sembunyikan indikator headless Chrome / Playwright
         await context.add_init_script(
@@ -629,27 +702,48 @@ class ContextPool:
 
     async def acquire(self, auth_token: str) -> BrowserContext:
         import time as _t
+        from app.config import playwright_proxy_for_token
+
         ctx_key = self._ctx_key(auth_token)
+        eff_pw_proxy = await _Socks5AuthRelayPool.get().resolve_playwright_proxy(
+            playwright_proxy_for_token(auth_token)
+        )
+        eff_server = (eff_pw_proxy or {}).get("server")
+        stale_ctx_to_close: Optional[BrowserContext] = None
         async with self._lock:
             entry = self._ctxs.get(ctx_key)
             if entry:
                 ctx, _ = entry
-                # health check: verify browser is still connected (ctx.pages alone
-                # returns [] on a closed context/browser without raising).
-                try:
-                    _ = ctx.pages
-                    br = getattr(ctx, "browser", None)
-                    if br is not None and hasattr(br, "is_connected") and not br.is_connected():
-                        raise RuntimeError("browser disconnected")
-                    self._ctxs[ctx_key] = (ctx, _t.time())
-                    self._ctx_use[id(ctx)] = self._ctx_use.get(id(ctx), 0) + 1
-                    return ctx
-                except Exception:  # noqa: BLE001
+                if hasattr(ctx, "_xapi_pw_server") and getattr(ctx, "_xapi_pw_server", None) != eff_server:
                     self._ctxs.pop(ctx_key, None)
-                    self._ctx_use.pop(id(ctx), None)
+                    if self._ctx_use.get(id(ctx), 0) > 0:
+                        self._dropped.add(ctx)
+                    else:
+                        self._ctx_use.pop(id(ctx), None)
+                        stale_ctx_to_close = ctx
+                else:
+                    # health check: verify browser is still connected (ctx.pages alone
+                    # returns [] on a closed context/browser without raising).
+                    try:
+                        _ = ctx.pages
+                        br = getattr(ctx, "browser", None)
+                        if br is not None and hasattr(br, "is_connected") and not br.is_connected():
+                            raise RuntimeError("browser disconnected")
+                        self._ctxs[ctx_key] = (ctx, _t.time())
+                        self._ctx_use[id(ctx)] = self._ctx_use.get(id(ctx), 0) + 1
+                        return ctx
+                    except Exception:  # noqa: BLE001
+                        self._ctxs.pop(ctx_key, None)
+                        self._ctx_use.pop(id(ctx), None)
+
+            if stale_ctx_to_close is not None:
+                try:
+                    await stale_ctx_to_close.close()
+                except Exception:  # noqa: BLE001
+                    pass
 
             browser = await PlaywrightPool.get().ensure()
-            ctx = await _new_context(browser, auth_token)
+            ctx = await _new_context(browser, auth_token, _resolved_pw_proxy=eff_pw_proxy)
 
             while len(self._ctxs) >= self.MAX:
                 # Evict context idle terlama — skip yang sedang dipakai;
@@ -865,6 +959,8 @@ class XChatContextPool:
         ct0_file = profile_dir / "ct0.txt"
         desired_proxy = proxy_for_token(auth_token)
         pw_proxy = playwright_proxy_for_token(auth_token)
+        eff_pw_proxy = await _Socks5AuthRelayPool.get().resolve_playwright_proxy(pw_proxy) if pw_proxy else None
+        eff_server = (eff_pw_proxy or {}).get("server")
 
         deadline = asyncio.get_running_loop().time() + 30.0
         while True:
@@ -892,7 +988,10 @@ class XChatContextPool:
                     if wait_ev is None or wait_ev.is_set():
                         wait_ev = asyncio.Event()
                         self._idle_events[key] = wait_ev
-                elif ctx is not None and self._ctx_proxy.get(key) != desired_proxy:
+                elif ctx is not None and (
+                    self._ctx_proxy.get(key) != desired_proxy
+                    or (hasattr(ctx, "_xapi_pw_server") and getattr(ctx, "_xapi_pw_server", None) != eff_server)
+                ):
                     if self._ctx_use.get(id(ctx), 0) > 0:
                         # Context sedang dipakai dengan proxy berbeda — tunggu
                         # holder selesai agar tidak pernah membocorkan IP salah.
@@ -966,8 +1065,8 @@ class XChatContextPool:
                             "--disable-dev-shm-usage",
                         ],
                     }
-                    if pw_proxy:
-                        launch_kwargs["proxy"] = await _Socks5AuthRelayPool.get().resolve_playwright_proxy(pw_proxy)
+                    if eff_pw_proxy:
+                        launch_kwargs["proxy"] = eff_pw_proxy
                     try:
                         ctx = await driver.chromium.launch_persistent_context(
                             str(profile_dir),
@@ -981,6 +1080,10 @@ class XChatContextPool:
                             f"bareng?) atau Chromium gagal launch: {type(exc).__name__}: "
                             f"{redact_proxy_creds(str(exc))}"
                         ) from exc
+                    try:
+                        setattr(ctx, "_xapi_pw_server", eff_server)
+                    except Exception:  # noqa: BLE001
+                        pass
                     try:
                         await ctx.add_init_script(
                             """

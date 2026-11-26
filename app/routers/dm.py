@@ -1454,6 +1454,7 @@ async def v2_dm_media_proxy(
     """
     from ..auth import WarmNetworkError, api_headers
     from ..client_pool import pooled_client
+    from ..config import redact_proxy_creds
 
     if ".." in media_id or ".." in resource_id:
         return JSONResponse(
@@ -1490,14 +1491,14 @@ async def v2_dm_media_proxy(
                 await ClientPool.get().invalidate(tok, all_proxies=True)
                 return JSONResponse(
                     status_code=401,
-                    content=format_error("Unauthorized", e.message, "unauthorized", 401),
+                    content=format_error("Unauthorized", redact_proxy_creds(e.message), "unauthorized", 401),
                 )
             except WarmNetworkError as e:
                 st = getattr(e, "http_status", 502)
                 st = st if isinstance(st, int) and st >= 400 else 502
                 return JSONResponse(
                     status_code=st,
-                    content=format_error("Upstream Error", f"warm-up failed: {e.message}", "upstream_error", st),
+                    content=format_error("Upstream Error", redact_proxy_creds(f"warm-up failed: {e.message}"), "upstream_error", st),
                 )
             for k, v in cookies.items():
                 client.cookies.set(k, v, domain=".x.com")
@@ -1517,6 +1518,29 @@ async def v2_dm_media_proxy(
                     content=format_error("Media Fetch Error", f"Upstream ton.x.com error: {type(exc).__name__}", "upstream_error", 502),
                 )
             if resp.status_code == 200:
+                final_url = getattr(resp, "url", None)
+                if isinstance(final_url, str) and final_url.startswith(("http://", "https://")):
+                    from urllib.parse import urlparse as _up_dm
+
+                    r_host = (_up_dm(final_url).hostname or "").strip().lower().rstrip(".")
+                    if (
+                        not final_url.lower().startswith("https://")
+                        or not r_host
+                        or not any(r_host == d or r_host.endswith("." + d) for d in ("x.com", "twitter.com", "twimg.com"))
+                    ):
+                        await SessionStore.get().invalidate(tok, all_proxies=False)
+                        await ClientPool.get().invalidate(tok, all_proxies=False)
+                        if _attempt == 0:
+                            continue
+                        return JSONResponse(
+                            status_code=502,
+                            content=format_error(
+                                "Media Fetch Error",
+                                "Upstream ton.x.com redirected off-domain by proxy/captive-portal",
+                                "upstream_error",
+                                502,
+                            ),
+                        )
                 content_type = resp.headers.get("content-type") or "application/octet-stream"
                 ctype_low = content_type.split(";", 1)[0].strip().lower()
                 head_low = (resp.content or b"").lstrip()[:32].lower()

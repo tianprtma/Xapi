@@ -13,6 +13,7 @@ from typing import Any, Callable, Optional
 
 from fastapi.responses import JSONResponse
 
+from app.config import redact_proxy_creds
 from app.errors import build_error
 from formatter import format_error
 
@@ -23,8 +24,16 @@ _SENSITIVE_KEYS = frozenset({"cookies", "tokens"})
 
 
 def _strip_sensitive(result: dict[str, Any]) -> dict[str, Any]:
-    """Remove sensitive fields from result dict — never send auth_token/cookies to client."""
-    return {k: v for k, v in result.items() if k not in _SENSITIVE_KEYS}
+    """Remove sensitive fields from result dict — never send auth_token/cookies/proxy creds to client."""
+    out: dict[str, Any] = {}
+    for k, v in result.items():
+        if k in _SENSITIVE_KEYS:
+            continue
+        if isinstance(v, str) and k in ("error", "raw", "detail", "reason"):
+            out[k] = redact_proxy_creds(v)
+        else:
+            out[k] = v
+    return out
 
 
 def wrap(result: dict[str, Any]) -> JSONResponse:
@@ -56,25 +65,27 @@ def finalize(
     if result.get("status") == "invalid":
         http_status = result.get("http_status") or 401
         error_key = "UPSTREAM_AUTH_REJECTED" if http_status == 403 else "AUTH_TOKEN_EXPIRED"
+        raw_err = redact_proxy_creds(str(result.get("error") or ""))
         return JSONResponse(
             status_code=401,
             content=build_error(
                 error_key,
-                detail=result.get("error"),
+                detail=raw_err or None,
                 http_status=str(http_status),
-                reason=str(result.get("error", "auth_token invalid/expired"))[:200],
+                reason=(raw_err or "auth_token invalid/expired")[:200],
             ),
         )
 
     upstream_http = result.get("http_status")
     out_status = 429 if upstream_http == 429 else 502
+    safe_err = redact_proxy_creds(str(result.get("error") or ""))
     return JSONResponse(
         status_code=out_status,
         content=build_error(
             "UPSTREAM_ERROR",
-            detail=str(result.get("error") or "GraphQL call failed")[:500],
+            detail=(safe_err or "GraphQL call failed")[:500],
             http_status=str(upstream_http or "unknown"),
-            reason=str(result.get("error") or "upstream failure")[:200],
+            reason=(safe_err or "upstream failure")[:200],
         ),
     )
 
@@ -135,7 +146,7 @@ def _upstream_error_status(error: dict[str, Any]) -> int:
 
 def _upstream_error_response(error: dict[str, Any]) -> JSONResponse:
     status = _upstream_error_status(error)
-    detail = str(error.get("message") or error)[:1000]
+    detail = redact_proxy_creds(str(error.get("message") or error))[:1000]
     content = build_error(
         "UPSTREAM_ERROR",
         detail=detail,
@@ -165,13 +176,14 @@ def write_finalize(
     if result.get("status") == "invalid":
         http_status = result.get("http_status") or 401
         error_key = "UPSTREAM_AUTH_REJECTED" if http_status == 403 else "AUTH_TOKEN_EXPIRED"
+        safe_err = redact_proxy_creds(str(result.get("error") or ""))
         return JSONResponse(
             status_code=401,
             content=build_error(
                 error_key,
-                detail=str(result.get("error") or "")[:500],
+                detail=safe_err[:500],
                 http_status=str(http_status),
-                reason=str(result.get("error") or "session invalid")[:200],
+                reason=(safe_err or "session invalid")[:200],
             ),
         )
     raw_st = result.get("http_status")
@@ -180,13 +192,14 @@ def write_finalize(
         if (not isinstance(raw_st, int) or raw_st < 400 or raw_st in (402, 407))
         else raw_st
     )
+    safe_err = redact_proxy_creds(str(result.get("error") or ""))
     return JSONResponse(
         status_code=err_status,
         content=build_error(
             "UPSTREAM_ERROR",
-            detail=str(result.get("error") or "")[:1000],
+            detail=safe_err[:1000],
             http_status=str(raw_st or "unknown"),
-            reason=str(result.get("error") or "upstream failure")[:200],
+            reason=(safe_err or "upstream failure")[:200],
         ),
     )
 

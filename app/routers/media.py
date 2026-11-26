@@ -142,17 +142,21 @@ async def v2media_upload(
             },
         )
     if result["status"] == "invalid":
+        from ..config import redact_proxy_creds
+
         return JSONResponse(
             status_code=401,
-            content=format_error("Unauthorized", str(result.get("error"))[:500], "unauthorized", 401),
+            content=format_error("Unauthorized", redact_proxy_creds(str(result.get("error")))[:500], "unauthorized", 401),
         )
+    from ..config import redact_proxy_creds
+
     raw_st = result.get("http_status")
     err_status = raw_st if isinstance(raw_st, int) and raw_st >= 400 else 502
     return JSONResponse(
         status_code=err_status,
         content=format_error(
             "Upload Failed",
-            str(result.get("error"))[:1000],
+            redact_proxy_creds(str(result.get("error")))[:1000],
             "upload_error",
             err_status,
         ),

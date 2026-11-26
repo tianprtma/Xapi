@@ -3175,3 +3175,136 @@ async def test_opfs_multi_media_upgrades_partial_photo_when_videos_arrive(monkey
     assert ev["_xchat_media_recovered"] == 3
     assert [a["kind"] for a in ev["_xapi_attachments"]] == ["photo", "video", "video"]
     assert xee._is_recent_incomplete_media(ev, now_ms=now_ms) is False
+
+
+# ──────────────────────────── Pass 50 Proxy Audit ────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_pass50_socks5_relay_dns_rebinding_and_stale_port_recovery(monkeypatch):
+    import playwright_search as pws
+
+    pool = pws._Socks5AuthRelayPool()
+
+    # 1. Literal 127.0.0.1 stays allowed for local loopback relay unit tests
+    assert await pool._resolve_safe_upstream_host("127.0.0.1", 1080) == "127.0.0.1"
+
+    # 2. Domain resolving to private/metadata IP is blocked (DNS-rebinding SSRF)
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(
+        loop,
+        "getaddrinfo",
+        AsyncMock(return_value=[(2, 1, 6, "", ("169.254.169.254", 1080))]),
+    )
+    with pytest.raises(ValueError, match="IP terlarang"):
+        await pool._resolve_safe_upstream_host("evil-rebind.example", 1080)
+
+    # 3. Domain resolving to public IP returns the pinned IP (preventing connect() TOCTOU)
+    monkeypatch.setattr(
+        loop,
+        "getaddrinfo",
+        AsyncMock(return_value=[(2, 1, 6, "", ("93.184.216.34", 1080))]),
+    )
+    assert await pool._resolve_safe_upstream_host("proxy.public.example", 1080) == "93.184.216.34"
+
+    # 4. ContextPool recreates BrowserContext if SOCKS5 loopback relay port changed
+    cp = pws.ContextPool()
+    created_ctxs = []
+
+    class _FakeBrowser:
+        def is_connected(self):
+            return True
+
+        async def new_context(self, **kw):
+            c = MagicMock()
+            c.pages = []
+            c.browser = self
+            c.kw = kw
+            c.close = AsyncMock()
+            c.add_init_script = AsyncMock()
+            c.add_cookies = AsyncMock()
+            created_ctxs.append(c)
+            return c
+
+    fake_br = _FakeBrowser()
+    monkeypatch.setattr(pws.PlaywrightPool.get(), "ensure", AsyncMock(return_value=fake_br))
+    monkeypatch.setattr("app.config.proxy_for_token", lambda _t: "socks5://u:p@93.184.216.34:1080")
+    monkeypatch.setattr(
+        "app.config.playwright_proxy_for_token",
+        lambda _t: {"server": "socks5://93.184.216.34:1080", "username": "u", "password": "p"},
+    )
+    ports = iter([51001, 51001, 51002])
+    monkeypatch.setattr(
+        pws._Socks5AuthRelayPool.get(),
+        "resolve_playwright_proxy",
+        AsyncMock(side_effect=lambda _p: {"server": f"socks5://127.0.0.1:{next(ports)}"}),
+    )
+
+    c1 = await cp.acquire("tok_p50_1234567890")
+    await cp.release("tok_p50_1234567890", c1)
+    c2 = await cp.acquire("tok_p50_1234567890")
+    assert c2 is c1  # same port 51001 -> reused!
+    await cp.release("tok_p50_1234567890", c2)
+
+    c3 = await cp.acquire("tok_p50_1234567890")
+    assert c3 is not c1  # port rotated to 51002 -> stale context closed & recreated!
+    c1.close.assert_awaited_once()
+    assert c3.kw["proxy"] == {"server": "socks5://127.0.0.1:51002"}
+    await cp.release("tok_p50_1234567890", c3)
+
+
+@pytest.mark.asyncio
+async def test_pass50_dm_media_captive_portal_redirect_and_response_redaction(monkeypatch):
+    from app.responses import finalize, wrap, write_finalize
+    from app.routers.dm import v2_dm_media_proxy
+    import tid_provider as tp
+
+    # 1. TIDProvider URL guard rejects HTTP downgrade & off-domain captive portals
+    assert tp._is_allowed_https_url("https://x.com/home", ("x.com", "twitter.com")) is True
+    assert tp._is_allowed_https_url("https://abs.twimg.com/ondemand.s.1a.js", ("twimg.com",)) is True
+    assert tp._is_allowed_https_url("http://x.com/home", ("x.com",)) is False
+    assert tp._is_allowed_https_url("https://portal.isp.example/login?next=https://x.com", ("x.com",)) is False
+
+    # 2. Output-boundary redaction in wrap / finalize / write_finalize
+    r_wrap = wrap({"status": "error", "error": "proxy failed http://usr:S3cr3tP50@31.6.46.27:12323"})
+    assert b"S3cr3tP50" not in r_wrap.body
+    assert b"http://***@31.6.46.27:12323" in r_wrap.body
+
+    r_fin = finalize({"status": "error", "error": "socks5://u:S3cr3tP50@31.6.46.27:1080 down"}, lambda d: d, raw=False)
+    assert b"S3cr3tP50" not in r_fin.body
+
+    r_wfin = write_finalize({"status": "error", "error": "http://tokP50@31.6.46.27:8080 timeout"}, raw=False)
+    assert b"tokP50" not in r_wfin.body
+
+    # 3. v2_dm_media_proxy rejects 200 image/png redirected off-domain to ISP splash image
+    fake_resp = MagicMock()
+    fake_resp.status_code = 200
+    fake_resp.url = "https://portal.isp.example/splash.png"
+    fake_resp.headers = {"content-type": "image/png"}
+    fake_resp.content = b"\x89PNG\r\n\x1a\nsplash"
+
+    fake_client = MagicMock()
+    fake_client.cookies = MagicMock()
+    fake_client.get = AsyncMock(return_value=fake_resp)
+
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def _fake_pooled(_tok):
+        yield fake_client
+
+    monkeypatch.setattr("app.client_pool.pooled_client", _fake_pooled)
+    monkeypatch.setattr("app.routers.dm.warm_session", AsyncMock(return_value=("ct0_50", {})))
+    monkeypatch.setattr("session_cache.SessionStore.lookup", AsyncMock(return_value=None))
+    monkeypatch.setattr("session_cache.SessionStore.invalidate", AsyncMock())
+    monkeypatch.setattr("app.client_pool.ClientPool.invalidate", AsyncMock())
+
+    resp = await v2_dm_media_proxy(
+        dm_id="111-222",
+        media_id="333",
+        resource_id="photo.png",
+        authorization="Bearer " + ("a" * 40),
+        auth_token=None,
+    )
+    assert resp.status_code == 502
+    assert b"redirected off-domain" in resp.body

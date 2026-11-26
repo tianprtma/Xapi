@@ -52,6 +52,21 @@ ONDEMAND_URL_RE = re.compile(
 )
 
 
+def _is_allowed_https_url(url_val: Any, allowed_domains: tuple[str, ...]) -> bool:
+    """True bila `url_val` bukan URL HTTP/HTTPS (mis. mock test) ATAU tetap `https://`
+    pada domain yang diizinkan (tolak redirect captive-portal / downgrade HTTP)."""
+    if not isinstance(url_val, str) or not url_val.startswith(("http://", "https://")):
+        return True
+    if not url_val.lower().startswith("https://"):
+        return False
+    from urllib.parse import urlparse as _up
+
+    host = (_up(url_val).hostname or "").strip().lower().rstrip(".")
+    if not host:
+        return False
+    return any(host == d or host.endswith("." + d) for d in allowed_domains)
+
+
 class TIDProvider:
     """Singleton ClientTransaction holder. Refresh setiap TTL_SECONDS."""
 
@@ -98,6 +113,8 @@ class TIDProvider:
                                 st = getattr(r, "status_code", 200)
                                 if isinstance(st, int) and st >= 400:
                                     raise RuntimeError(f"proxy home HTTP {st}")
+                                if not _is_allowed_https_url(getattr(r, "url", None), ("x.com", "twitter.com", "twimg.com")):
+                                    raise RuntimeError("proxy home redirected off-domain")
                                 return r
                             sess.request = _checked_req  # type: ignore[method-assign]
                     sess.headers["User-Agent"] = (
@@ -178,6 +195,12 @@ class TIDProvider:
                                 " (proxy)" if use_px else "",
                                 resp.status_code,
                             )
+                            if use_px:
+                                proxy_home_failed = True
+                                continue
+                            return None
+                        if not _is_allowed_https_url(getattr(resp, "url", None), ("x.com", "twitter.com", "twimg.com")):
+                            log.warning("TID home fetch via client redirected off-domain — skipping")
                             if use_px:
                                 proxy_home_failed = True
                                 continue
@@ -303,29 +326,43 @@ class TIDProvider:
                 ondemand_url = None
             if ondemand_url:
                 resp = sess.get(ondemand_url, timeout=10)
-                if resp.status_code in (402, 407) or (bool(sess.proxies) and resp.status_code in (403, 502, 503, 504)):
+                if resp.status_code in (402, 407) or (bool(sess.proxies) and resp.status_code in (403, 500, 502, 503, 504)):
                     raise RuntimeError(f"proxy ondemand HTTP {resp.status_code}")
-                if resp.status_code == 200 and _is_valid_js(resp.content):
-                    return resp.content
+                if bool(sess.proxies) and not _is_allowed_https_url(getattr(resp, "url", None), ("twimg.com", "x.com", "twitter.com")):
+                    raise RuntimeError("proxy ondemand redirected off-domain")
+                if resp.status_code == 200:
+                    if _is_valid_js(resp.content):
+                        return resp.content
+                    if bool(sess.proxies):
+                        raise RuntimeError("proxy ondemand returned non-JS")
             for idx_url in SCRIPT_INDEX_URLS:
                 try:
                     idx = sess.get(idx_url, timeout=10)
-                    if idx.status_code in (402, 407) or (bool(sess.proxies) and idx.status_code in (403, 502, 503, 504)):
+                    if idx.status_code in (402, 407) or (bool(sess.proxies) and idx.status_code in (403, 500, 502, 503, 504)):
                         raise RuntimeError(f"proxy script index HTTP {idx.status_code}")
+                    if bool(sess.proxies) and not _is_allowed_https_url(getattr(idx, "url", None), ("githubusercontent.com", "github.com")):
+                        raise RuntimeError("proxy script index redirected off-domain")
                     if idx.status_code != 200:
                         continue
                     match = ONDEMAND_URL_RE.search(idx.text)
                     if not match:
+                        if bool(sess.proxies) and not _is_valid_js(idx.content):
+                            raise RuntimeError("proxy script index returned captive-portal HTML")
                         continue
                     resp = sess.get(match.group(0), timeout=10)
-                    if resp.status_code in (402, 407) or (bool(sess.proxies) and resp.status_code in (403, 502, 503, 504)):
+                    if resp.status_code in (402, 407) or (bool(sess.proxies) and resp.status_code in (403, 500, 502, 503, 504)):
                         raise RuntimeError(f"proxy ondemand HTTP {resp.status_code}")
-                    if resp.status_code == 200 and _is_valid_js(resp.content):
-                        log.info(
-                            "TID ondemand.s dari script index: %s",
-                            match.group(0).rsplit("/", 1)[-1],
-                        )
-                        return resp.content
+                    if bool(sess.proxies) and not _is_allowed_https_url(getattr(resp, "url", None), ("twimg.com", "x.com", "twitter.com")):
+                        raise RuntimeError("proxy ondemand redirected off-domain")
+                    if resp.status_code == 200:
+                        if _is_valid_js(resp.content):
+                            log.info(
+                                "TID ondemand.s dari script index: %s",
+                                match.group(0).rsplit("/", 1)[-1],
+                            )
+                            return resp.content
+                        if bool(sess.proxies):
+                            raise RuntimeError("proxy ondemand returned non-JS")
                 except Exception as e:  # noqa: BLE001
                     if bool(sess.proxies) and str(e).startswith("proxy "):
                         raise

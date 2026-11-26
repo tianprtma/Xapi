@@ -877,6 +877,9 @@ _OPFS_DB_CTX_REFS: dict[tuple[int, str], Any] = {}
 # R99: jeda setelah membuka conv agar client sempat mengunduh media ke OPFS.
 _MEDIA_TRIGGER_WAIT_SEC = float(os.environ.get("XCHAT_MEDIA_TRIGGER_WAIT_SEC", "8"))
 _MEDIA_TRIGGER_ATTEMPTS = int(os.environ.get("XCHAT_MEDIA_TRIGGER_ATTEMPTS", "2"))
+# Tenggat singkat (detik) untuk menahan DM multi-lampiran yang baru terunduh sebagian
+# (mis. foto kecil 180 KB sudah masuk OPFS sementara video 30 MB masih diunduh).
+_PARTIAL_MEDIA_GRACE_SEC = float(os.environ.get("XCHAT_PARTIAL_MEDIA_GRACE_SEC", "90"))
 
 
 def _prune_opfs_db_cache(now_mono: float) -> None:
@@ -1441,6 +1444,22 @@ def project_dm_entries_to_events(
     return events
 
 
+def _is_recent_incomplete_media(
+    ev: dict[str, Any], *, now_ms: Optional[int] = None, max_age_minutes: float = 15.0
+) -> bool:
+    """True bila event multi-lampiran baru terpulihkan sebagian (`0 < recovered < expected`)
+    dan masih segar, sehingga perlu memicu unduhan `R99/R101` agar video besar menyusul."""
+    exp = int(ev.get("_xchat_media_expected") or 0)
+    rec = int(ev.get("_xchat_media_recovered") or 0)
+    if not (0 < rec < exp):
+        return False
+    ts_ms = _event_ts_ms(ev)
+    if ts_ms is None:
+        return False
+    ref_ms = int(time.time() * 1000) if now_ms is None else now_ms
+    return 0 <= (ref_ms - ts_ms) <= int(max_age_minutes * 60 * 1000)
+
+
 def _is_recent_pending_media(
     ev: dict[str, Any], *, now_ms: Optional[int] = None, max_age_hours: float = 48.0
 ) -> bool:
@@ -1516,7 +1535,10 @@ async def recover_opfs_media_for_events(
     # `project_dm_entries_to_events` kronologis) agar kuota `max_files` tidak
     # habis untuk foto historis berbulan-bulan lalu dan menelantarkan DM baru.
     for ev in reversed(events):
-        if not ev.get("_xchat_media_pending"):
+        prev_rec = int(ev.get("_xchat_media_recovered") or 0)
+        prev_exp = int(ev.get("_xchat_media_expected") or 0)
+        is_incomplete = 0 < prev_rec < prev_exp
+        if not ev.get("_xchat_media_pending") and not is_incomplete:
             continue
         eid = str(ev.get("id") or "")
         # R91: jumlah lampiran yang DIHARAPKAN (attachmentId dalam contents).
@@ -1524,7 +1546,7 @@ async def recover_opfs_media_for_events(
         contents = (by_id.get(eid) or {}).get("contents")
         expected = (
             contents.count(b"attachmentId")
-            if isinstance(contents, (bytes, bytearray)) else 0
+            if isinstance(contents, (bytes, bytearray)) else prev_exp
         )
         if expected > 0:
             ev["_xchat_media_expected"] = expected
@@ -1534,6 +1556,8 @@ async def recover_opfs_media_for_events(
             cols = [d[0] for d in cur.description]
             locals_ = [dict(zip(cols, r)) for r in cur.fetchall()]
         except Exception:
+            continue
+        if is_incomplete and len(locals_) <= prev_rec:
             continue
         atts: list[dict[str, Any]] = []
         for la in locals_:
@@ -1562,7 +1586,7 @@ async def recover_opfs_media_for_events(
             )
             if cached:
                 atts.append(cached)
-        if atts:
+        if len(atts) > prev_rec:
             ev["_xapi_attachments"] = atts
             ev["attachments"] = {
                 "media_keys": [
@@ -1761,7 +1785,10 @@ async def unlock_and_read_xchat_conversation(
                                 # tunggu sebentar, baca ulang db (force, bypass
                                 # cache R95) dan recover lagi — supaya media tayang
                                 # bersama menfess, bukan fallback teks setelah 45m.
-                                if any(_is_recent_pending_media(e) for e in events):
+                                if any(
+                                    _is_recent_pending_media(e) or _is_recent_incomplete_media(e)
+                                    for e in events
+                                ):
                                     # R101: trigger unduh media lebih andal —
                                     # viewport tinggi (pesan terkubur ikut
                                     # ter-render) + scroll bertahap + retry
@@ -1826,15 +1853,39 @@ async def unlock_and_read_xchat_conversation(
                                             if _is_xchat_proxy_nav_exc(trig_s, auth_token):
                                                 await XChatContextPool.get().invalidate(auth_token)
                                                 break
-                                        still = [e.get("id") for e in events if _is_recent_pending_media(e)]
+                                        still = [
+                                            e.get("id")
+                                            for e in events
+                                            if _is_recent_pending_media(e) or _is_recent_incomplete_media(e)
+                                        ]
                                         log.info("R99/R101: trigger attempt %d selesai — pending tersisa %d", _attempt + 1, len(still))
                                         if not still:
                                             break
+                                # Bila DM multi-lampiran masih sangat baru (<= _PARTIAL_MEDIA_GRACE_SEC)
+                                # dan baru sebagian file masuk OPFS (mis. foto kecil selesai duluan,
+                                # video besar masih mengunduh), tahan sebagai `pending` 1-2 siklus
+                                # agar bot tidak langsung memposting foto-saja dan membuang videonya.
+                                if _PARTIAL_MEDIA_GRACE_SEC > 0:
+                                    now_grace_ms = int(time.time() * 1000)
+                                    for ev_g in events:
+                                        if _is_recent_incomplete_media(
+                                            ev_g,
+                                            now_ms=now_grace_ms,
+                                            max_age_minutes=_PARTIAL_MEDIA_GRACE_SEC / 60.0,
+                                        ):
+                                            ev_g.pop("_xapi_attachments", None)
+                                            ev_g.pop("attachments", None)
+                                            ev_g["_xchat_media_pending"] = True
+                                            ev_g["_xchat_media_state"] = "pending"
+                                            ev_g["_xchat_partial_hold"] = True
                                 # R106: panen gambar E2EE yang SUDAH terdekripsi
                                 # & ter-render di DOM (img src=blob:) via canvas —
                                 # menutup kasus media yang tak pernah terunduh
                                 # ke OPFS (unduhan dipicu komponen chat).
-                                still_pending = [e for e in events if _is_recent_pending_media(e)]
+                                still_pending = [
+                                    e for e in events
+                                    if _is_recent_pending_media(e) and not e.get("_xchat_partial_hold")
+                                ]
                                 if still_pending:
                                     try:
                                         n106 = await _extract_rendered_media(

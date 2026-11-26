@@ -3107,3 +3107,71 @@ async def test_pass49_socks5_auth_relay_schemeless_encoded_redaction_and_browser
         await up_socks_srv.wait_closed()
         target_srv.close()
         await target_srv.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_opfs_multi_media_upgrades_partial_photo_when_videos_arrive(monkeypatch):
+    """When a user sends photo + video(s) in 1 XChat DM and the small photo enters
+    `dm_local_attachment` before the larger video(s), a subsequent `recover_opfs_media_for_events`
+    pass after `R99/R101` downloads the video(s) MUST upgrade `_xapi_attachments` from 1 (`photo`)
+    to all 3 (`photo`, `video`, `video`), and `_is_recent_incomplete_media` detects fresh partial DMs."""
+    import sqlite3
+    import time as _time
+    import app.xchat_e2ee as xee
+
+    now_ms = int(_time.time() * 1000)
+    rows = [{
+        "entry_id": "af842467",
+        "timestamp": now_ms - 10_000,
+        "sender_id": 1741081124531748864,
+        "plain_text": "/send main coc",
+        "has_attachment": 1,
+        "message_status": "Sent",
+        "deleted": 0,
+        "event_type": None,
+        "attachment_types": "media",
+        "contents": b"attachmentId\x00p1 attachmentId\x00v1 attachmentId\x00v2",
+    }]
+    events = xee.project_dm_entries_to_events(rows, "1394249284736864258-1741081124531748864")
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("""
+        CREATE TABLE dm_local_attachment (
+            attachment_id TEXT, file_number INTEGER, local_path TEXT,
+            downloaded_at INTEGER, file_size INTEGER, conversation_id TEXT,
+            message_id TEXT, attachment_type TEXT, mime_type TEXT, metadata TEXT
+        )
+    """)
+    conn.execute(
+        "INSERT INTO dm_local_attachment VALUES (?,?,?,?,?,?,?,?,?,?)",
+        ("p1", 1, "dm-files/p1.jpg", 1, 100, "1:2", "af842467", "MediaImage", None, None),
+    )
+
+    jpeg_b = b"\xff\xd8\xff\xe0" + b"\x00" * 64
+    mp4_b = b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom" + b"\x00" * 64
+    monkeypatch.setattr(
+        xee,
+        "read_xchat_opfs_file",
+        AsyncMock(side_effect=lambda _p, path, **_kw: mp4_b if path.endswith(".mp4") else jpeg_b),
+    )
+
+    # Pass 1: only photo is in OPFS -> 1/3 recovered, marked incomplete & recent!
+    await xee.recover_opfs_media_for_events(conn, None, None, rows, events)
+    ev = events[0]
+    assert ev["_xchat_media_expected"] == 3
+    assert ev["_xchat_media_recovered"] == 1
+    assert xee._is_recent_incomplete_media(ev, now_ms=now_ms) is True
+
+    # Pass 2 (after R99/R101 trigger): both videos arrive in dm_local_attachment -> upgraded to 3/3!
+    conn.execute(
+        "INSERT INTO dm_local_attachment VALUES (?,?,?,?,?,?,?,?,?,?)",
+        ("v1", 2, "dm-files/v1.mp4", 2, 200, "1:2", "af842467", "MediaVideo", None, None),
+    )
+    conn.execute(
+        "INSERT INTO dm_local_attachment VALUES (?,?,?,?,?,?,?,?,?,?)",
+        ("v2", 3, "dm-files/v2.mp4", 3, 300, "1:2", "af842467", "MediaVideo", None, None),
+    )
+    await xee.recover_opfs_media_for_events(conn, None, None, rows, events)
+    assert ev["_xchat_media_recovered"] == 3
+    assert [a["kind"] for a in ev["_xapi_attachments"]] == ["photo", "video", "video"]
+    assert xee._is_recent_incomplete_media(ev, now_ms=now_ms) is False

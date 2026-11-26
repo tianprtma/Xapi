@@ -119,7 +119,8 @@ async def v2media_upload(
         elif media_type.startswith("image/"):
             cat = "tweet_image"
 
-    result = await media_upload(tok, body, media_type=media_type, media_category=cat)
+    up_timeout = 300.0 if (cat in ("tweet_video", "dm_video") or media_type.startswith("video/")) else 120.0
+    result = await media_upload(tok, body, media_type=media_type, media_category=cat, timeout=up_timeout)
 
     if raw:
         return wrap(result)
